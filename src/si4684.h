@@ -6,7 +6,7 @@
 //   - enumerate the services in the current ensemble
 //   - select a service and start audio
 //   - decode Dynamic Label / Radiotext, PTY, ECC, time, etc.
-//   - reassemble MOT slideshow images into /slideshow.img on LittleFS
+//   - reassemble the current MOT slideshow image in RAM
 //
 // All chip status comes back via the SPI status byte + a 4 KB SPI rx buffer
 // (`SPIbuffer` in si4684.cpp). Every command goes via cts() to wait for the
@@ -16,12 +16,10 @@
 #define si4684_h
 
 #include "Arduino.h"
-#include <LittleFS.h>
-#include "Si468xROM.h"
-#include "firmware.h"
 #include <SPI.h>
 #include <cstring>
 #include <climits>
+#include "FmRegion.h"
 
 struct DABFrequencyLabel_DAB {
   uint32_t frequency;
@@ -89,10 +87,20 @@ typedef struct _Services {
   byte    ServiceType;
 } DABService;
 
+enum RadioMode : uint8_t {
+  RADIO_MODE_DAB = 0,
+  RADIO_MODE_FM = 1
+};
+
+enum RadioControlMode : uint8_t {
+  RADIO_CTRL_DETECT = 0,
+  RADIO_CTRL_INTB,
+  RADIO_CTRL_POLL
+};
+
 class DAB {
   public:
-    bool begin(uint8_t SSpin);
-    bool BufferSlideShow;
+    bool begin(uint8_t SSpin, RadioMode requestedMode = RADIO_MODE_DAB);
     bool panic(void);
     bool ServiceStart;
     bool signallock;
@@ -114,7 +122,7 @@ class DAB {
     uint16_t ecc;
     uint16_t ensembleEcc;
     bool serviceHasOwnEcc;
-    uint16_t getRSSI(void);
+    int16_t getRSSI(void);
     uint16_t samplerate;
     uint16_t Year;
     uint32_t getFreq(uint8_t freq);
@@ -135,30 +143,69 @@ class DAB {
     uint8_t ServiceIndex;
     uint8_t ServiceLabelCharset;
     uint8_t servicetype;
+    uint16_t fmFrequency10kHz;
+    int8_t fmRssi;
+    int8_t fmSnr;
+    uint8_t fmMultipath;
+    uint16_t fmPi;
+    uint8_t fmPty;
+    bool fmValid;
+    bool fmAfcRail;
+    bool fmPilot;
+    uint8_t fmStereoBlend;
+    char fmPs[9];
+    char fmRadioText[65];
     void clearData(void);
     void EnsembleInfo(void);
     void getServiceData(void);
     void ServiceInfo(void);
     void setFreq(uint8_t freq_index);
+    void setFmRegion(uint8_t region, bool applyNow = true);
+    void setFmFrequency(uint16_t frequency10kHz);
+    bool startFmSeek(bool up);
     void setService(uint8_t index);
     void Update(void);
     void vol(uint8_t vol);
+    RadioMode mode(void) const { return activeMode; }
+    bool isFm(void) const { return activeMode == RADIO_MODE_FM; }
+    uint8_t fmRegion(void) const { return activeFmRegion; }
+    const FmRegionProfile& fmProfile(void) const { return fmRegionProfile(activeFmRegion); }
+    bool isRbds(void) const { return fmProfile().rbds; }
+    RadioControlMode controlMode(void) const;
+    const char* controlModeName(void) const;
+    bool isTunePending(void) const { return tunePending; }
+    const uint8_t* slideshowData(void) const { return slideshowSegBuf; }
+    uint32_t slideshowSize(void) const { return SlideShowAvailable ? slideshowRamSize : 0; }
 
   private:
     bool SlideShowInit;
-    bool SlideShowNew;
-    bool SlideShowRecover;
+    RadioMode activeMode;
+    uint8_t activeFmRegion = static_cast<uint8_t>(FmRegion::Europe);
+    bool tunePending;
+    bool seekPending;
+    uint32_t tuneDeadline;
+    uint32_t fmRsqTimer;
+    uint32_t fmAcfTimer;
+    uint32_t fmRdsTimer;
+    uint32_t dabSignalTimer;
+    int16_t dabRssi10;
+    uint8_t fmPsMask;
+    uint16_t fmRtMask;
+    uint16_t fmRtSeenMask;
+    bool fmRtAb;
+    bool fmRtVersionB;
+    bool fmRtVersionKnown;
+    char fmPsWork[9];
+    char fmPsCandidate[9];
+    char fmRtWork[65];
     char ChipType[7];
     char FirmwVersion[6];
-    bool deleteOldestSlideshow(void);
-    bool ensureFreeSpace(size_t requiredBytes);
-    String getDynamicFilename(void);
     uint32_t componentID;
     uint32_t CurrentServiceID;
     uint32_t dataServiceCheck;
     uint32_t serviceID;
     uint32_t SlideShowByteCounter;
-    uint32_t SlideShowLengthOld;
+    uint32_t slideshowRamSize;
 
     // Segment buffering for faster slideshow assembly
     uint8_t SlideShowSegmentBitmap[32];  // Bitmap for up to 256 segments
@@ -167,19 +214,26 @@ class DAB {
     uint16_t SlideShowTransportID;        // Current transport ID
     uint32_t SlideShowLastActivity;       // millis() of last new segment received
 
-    // RAM-based segment buffer (replaces /seg_N.bin files for speed).
-    // 80 segments * 512 bytes = 40 KB. Practical DAB MOT segments are 501 bytes.
-    // Sized to leave a few KB of DRAM headroom for future Arduino-core upgrades.
-    static const uint8_t  SLS_MAX_SEGMENTS  = 80;
-    static const uint16_t SLS_MAX_SEG_SIZE  = 512;
-    uint8_t  slideshowSegBuf[SLS_MAX_SEGMENTS * SLS_MAX_SEG_SIZE];
+    // One 40 KB MOT buffer with adaptive fixed slots. Services seen in the
+    // field use 512-, 1024- or 2000-byte DSRV blocks. Large slots use the
+    // actual block size (up to 2048 B), preserving all 40960 reserved bytes.
+    static const uint8_t  SLS_MAX_SEGMENTS   = 80;
+    static const uint16_t SLS_BASE_SEG_SIZE  = 512;
+    static const uint16_t SLS_MAX_SEG_SIZE   = 2048;
+    static const size_t   SLS_BUFFER_BYTES   = 80U * 512U;
+    uint8_t  slideshowSegBuf[SLS_BUFFER_BYTES];
     uint16_t slideshowSegLen[SLS_MAX_SEGMENTS];
+    uint16_t slideshowSlotSize;
+    void beginSlideshowReception(void);
+    bool ensureSlideshowSlotSize(uint16_t dataLength);
     void clearSegmentBuffer(void);
 
     void assembleSlideshow(void);
     bool allSegmentsReceived(void);
-
-    void RecoverSlideShow(void);
+    void applyFmRegionProperties(void);
+    void clearFmData(void);
+    void processFmRds(void);
+    void updateFm(void);
 };
 
 #endif

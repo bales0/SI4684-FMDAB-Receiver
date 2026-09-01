@@ -8,6 +8,17 @@ The version in the repository is an ongoing development. It could and will conta
 Advanced DAB Tuner software for Skyworks SI4684 tuner with ESP32 board and a color LCD\
 More information: https://www.pe5pvb.nl/
 
+## Optional Si4684 INTB connection
+
+The firmware supports both hardware variants with one binary. If Si4684 INTB
+is connected to GPIO12 it is detected automatically and used for CTS/radio
+events; if it is not connected, the receiver uses bounded status polling.
+
+GPIO12 is the MTDI boot strap on the classic ESP32. A board that connects INTB
+to GPIO12 must have VDD_SDIO safely fixed at 3.3 V (by the board design or a
+correctly provisioned device). This firmware does not read, burn, or modify
+eFuse. Si4684 and ILI9341 continue to share the GPIO17 reset net.
+
 # Building instructions
 On Youtube I published a video how to build your own radio.
 
@@ -23,7 +34,17 @@ These are the libraries used for this project:
 - https://github.com/Bodmer/JPEGDecoder
 - https://github.com/bitbank2/PNGdec
 
-Use these settings in the TFT_eSPI library:
+The PlatformIO build resolves these dependencies automatically:
+
+```
+pio run -e esp32dev
+```
+
+For the current PlatformIO build the settings in `platformio.ini` are
+authoritative. In particular `TFT_RST=-1` is intentional: GPIO17 is driven by
+the application because the TFT and Si4684 share that physical reset net.
+
+Legacy Arduino-library settings were:
 ```
 #define ILI9341_DRIVER
 #define TFT_CS          5
@@ -34,8 +55,8 @@ Use these settings in the TFT_eSPI library:
 ```
 # Buttons
 A brief instruction for the buttons:
-- Top encoder: Choose frequency or memory channel
-- Bottom encoder: Choose service or set headphones volume
+- Top encoder: DAB channel/seek/preset; FM MAN ±1.0 MHz, AUTO seek, or MEM preset
+- Bottom encoder: DAB service; FM regional raster step; press for headphones volume
 - Top button: Short press: Service information, Long press: Stand-by mode.
 - Middle button: Short press: Set mode, Long press: Open menu.
 - Lower button: Toggle Slideshow view.

@@ -33,6 +33,7 @@ extern bool setvolume;
 extern bool ShowServiceInformation;
 extern bool SlideShowAvailableOld;
 extern bool SlideShowView;
+extern bool slsWaitingView;
 extern bool trysetservice;
 extern bool tuning;
 extern byte audiomodeold;
@@ -53,6 +54,11 @@ extern byte tot;
 extern byte tunemode;
 extern byte unit;
 extern byte volume;
+extern RadioMode radioMode;
+extern RadioMode requestedRadioMode;
+extern uint8_t fmRegion;
+extern uint8_t requestedFmRegion;
+extern uint16_t fmfreq;
 extern char _serviceName[17];
 extern int ActiveColor;
 extern int ActiveColorSmooth;
@@ -109,6 +115,7 @@ extern TFT_eSprite OneBigLineSprite;
 extern TFT_eSprite LongSprite;
 extern TFT_eSprite MediumSprite;
 extern TFT_eSprite ModeSprite;
+extern TFT_eSprite QualityBarSprite;
 extern TFT_eSprite ShortSprite;
 extern DAB radio;
 extern TPA6130A2 Headphones;
@@ -148,5 +155,6 @@ extern void tftReplace(int8_t offset, const String & textold, const String & tex
 extern void ShowMemoryPos(void);
 extern void loadFonts(bool option);
 extern bool IsStationEmpty(void);
+extern void MarkEepromDirty(void);
 
 #endif

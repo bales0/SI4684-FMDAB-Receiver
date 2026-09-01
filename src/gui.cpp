@@ -161,6 +161,25 @@ void ShowServiceInfo(void) {
   displayreset = true;
   tft.pushImage (0, 0, 320, 240, serviceinfobackground);
   tftPrint(0, myLanguage[language][27], 155, 4, ActiveColor, ActiveColorSmooth, 28);
+  if (radio.isFm()) {
+    const char* labels[] = {myLanguage[language][28], myLanguage[language][36], fmPsText[language], myLanguage[language][31], fmPiText[language],
+                            fmMultipathText[language], fmStereoBlendText[language], myLanguage[language][35],
+                            radio.isRbds() ? fmRbdsText[language] : fmRdsText[language]};
+    for (uint8_t i = 0; i < 9; ++i) tftPrint(-1, labels[i], 8, 36 + i * 20, ActiveColor, ActiveColorSmooth, 16);
+
+    String pi = String(radio.fmPi, HEX); pi.toUpperCase(); while (pi.length() < 4) pi = "0" + pi;
+    String ps = String(radio.fmPs); ps.trim(); if (ps.length() == 0) ps = "--------";
+    tftPrint(-1, String(fmfreq / 100) + "." + String((fmfreq % 100) / 10) + " MHz", 166, 36, PrimaryColor, PrimaryColorSmooth, 16);
+    tftPrint(-1, String(radio.fmRssi) + "/" + String(radio.fmSnr) + " dB" + (radio.fmAfcRail ? " " + String(fmAfcRailText[language]) : ""), 166, 56, PrimaryColor, PrimaryColorSmooth, 16);
+    tftPrint(-1, ps, 166, 76, PrimaryColor, PrimaryColorSmooth, 16);
+    tftPrint(-1, String(radio.fmPty) + ": " + String(myLanguage[language][37 + radio.fmPty]), 166, 96, PrimaryColor, PrimaryColorSmooth, 16);
+    tftPrint(-1, radio.fmPi ? pi : "-", 166, 116, PrimaryColor, PrimaryColorSmooth, 16);
+    tftPrint(-1, String(radio.fmMultipath) + "%", 166, 136, PrimaryColor, PrimaryColorSmooth, 16);
+    tftPrint(-1, String(radio.fmStereoBlend) + "%", 166, 156, PrimaryColor, PrimaryColorSmooth, 16);
+    tftPrint(-1, radio.fmPilot ? fmStereoText[language] : fmMonoText[language], 166, 176, PrimaryColor, PrimaryColorSmooth, 16);
+    tftPrint(-1, radio.fmPi ? myLanguage[language][23] : "-", 166, 196, PrimaryColor, PrimaryColorSmooth, 16);
+    return;
+  }
   tftPrint(-1, myLanguage[language][28], 8, 36, ActiveColor, ActiveColorSmooth, 16);
   tftPrint(-1, myLanguage[language][36], 8, 56, ActiveColor, ActiveColorSmooth, 16);
   tftPrint(-1, myLanguage[language][29], 8, 76, ActiveColor, ActiveColorSmooth, 16);
@@ -235,6 +254,25 @@ void ShowOneLine(byte position, byte item, bool selected) {
     FullLineSprite.pushImage (-8, -position - 35, 320, 240, servicelistbackground);
     if (selected) FullLineSprite.pushImage(0, 0, 304, 20, selector);
 
+    if (radio.isFm()) {
+      const uint16_t stationFrequency = static_cast<uint16_t>(radio.service[item].CompID);
+      String pi = String(radio.service[item].ServiceID & 0xFFFF, HEX); pi.toUpperCase();
+      while (pi.length() < 4) pi = "0" + pi;
+      FullLineSprite.setTextDatum(TL_DATUM);
+      FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+      FullLineSprite.drawString(String(stationFrequency / 100) + "." + String((stationFrequency % 100) / 10), 8, 3);
+      FullLineSprite.setTextDatum(TC_DATUM);
+      FullLineSprite.drawString(pi, 92, 3);
+      FullLineSprite.setTextDatum(TL_DATUM);
+      FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
+      FullLineSprite.drawString(radio.service[item].Label, 122, 3);
+      FullLineSprite.setTextDatum(TR_DATUM);
+      FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+      FullLineSprite.drawString(fmModeText[language], 300, 3);
+      FullLineSprite.pushSprite(8, 35 + position);
+      return;
+    }
+
     FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
     FullLineSprite.setTextDatum(TL_DATUM);
     FullLineSprite.drawString(String(radio.service[item].CompID & 0xFF, DEC), 12, 3);
@@ -305,13 +343,21 @@ void ShowOneLine(byte position, byte item, bool selected) {
         FullLineSprite.drawString((tot != 0 ? myLanguage[language][26] : myLanguage[language][24]), 300, 3);
         break;
 
-	  case 6:
+      case 6:
         FullLineSprite.drawString(myLanguage[language][17], 6, 3);
         FullLineSprite.setTextDatum(TR_DATUM);
         FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
-        FullLineSprite.drawString((radio.BufferSlideShow ? myLanguage[language][23] : myLanguage[language][24]), 300, 3);
+        FullLineSprite.drawString(radioModeValueText[requestedRadioMode], 300, 3);
         break;
-	  
+
+      case 7:
+        FullLineSprite.drawString(fmRegionMenuText[language], 6, 3);
+        FullLineSprite.setTextDatum(TR_DATUM);
+        FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
+        FullLineSprite.drawString(
+            fmRegionValueText[language][sanitizeFmRegion(requestedFmRegion)],
+            300, 3);
+        break;
 
       case 8:
         FullLineSprite.drawString(myLanguage[language][81], 6, 3);
@@ -325,6 +371,7 @@ void ShowOneLine(byte position, byte item, bool selected) {
 // Full redraw of the settings menu (entered by long-pressing MODE).
 void BuildMenu(void) {
   SlideShowView = false;
+  slsWaitingView = false;
   ShowServiceInformation = false;
   ChannelListView = false;
 
@@ -348,6 +395,7 @@ void BuildMenu(void) {
 // after a theme/display-orientation change.
 void BuildDisplay(void) {
   SlideShowView = false;
+  slsWaitingView = false;
   ShowServiceInformation = false;
   ChannelListView = false;
   displayreset = true;
@@ -357,16 +405,19 @@ void BuildDisplay(void) {
 
   tft.pushImage (0, 0, 320, 240, Background);
   tftPrint(1, "PR:", 84, 65, ActiveColor, ActiveColorSmooth, 16);
-  tftPrint(-1, "EID", 10, 105, ActiveColor, ActiveColorSmooth, 16);
-  tftPrint(-1, "SID", 10, 120, ActiveColor, ActiveColorSmooth, 16);
+  tftPrint(-1, radio.isFm() ? fmPiText[language] : "EID", 10, 105, ActiveColor, ActiveColorSmooth, 16);
+  tftPrint(-1, radio.isFm() ? fmPtyText[language] : "SID", 10, 120, ActiveColor, ActiveColorSmooth, 16);
   tftPrint(1, "MHz", 310, 55, ActiveColor, ActiveColorSmooth, 16);
   tftPrint(-1, "SIG:", 123, 109, ActiveColor, ActiveColorSmooth, 16);
   tftPrint(-1, unitString[unit], 183, 109, ActiveColor, ActiveColorSmooth, 16);
-  tftPrint(-1, "MER:", 237, 109, ActiveColor, ActiveColorSmooth, 16);
+  tftPrint(-1, radio.isFm() ? String(fmSnrText[language]) + ":" : "MER:", 237, 109, ActiveColor, ActiveColorSmooth, 16);
   tftPrint(1, "dB", 309, 109, ActiveColor, ActiveColorSmooth, 16);
-  tftPrint(-1, "Q", 122, 90, ActiveColor, ActiveColorSmooth, 16);
+  // The compact meter uses a single-letter M. A two-letter "MP" reaches the
+  // bar border and its clipped P looks like a stray white pixel.
+  tftPrint(-1, radio.isFm() ? "M" : "Q", 122, 90,
+           ActiveColor, ActiveColorSmooth, 16);
   tftPrint(-1, "S", 122, 127, SecondaryColor, SecondaryColorSmooth, 16);
-  tftPrint(1, "ECC", 110, 90, ActiveColor, ActiveColorSmooth, 16);
+  if (!radio.isFm()) tftPrint(1, "ECC", 110, 90, ActiveColor, ActiveColorSmooth, 16);
 
   for (byte segments = 0; segments < 13; segments++) tft.fillRect(134 + (segments * 14), 135, 2, 3, (segments < 8 ? BarInsignificantColor : BarSignificantColor));
   tft.drawLine(134, 138, 302, 138, ActiveColor);
@@ -385,10 +436,7 @@ void MenuUp(void) {
     ShowOneLine(menuoption, menuitem, false);
     menuoption += ITEM_GAP;
     menuitem++;
-    if (menuitem > 6 && menuitem < 8) {
-      menuitem = 8;
-      menuoption = ITEM9;
-    } else if (menuitem > 8) {
+    if (menuitem > 8) {
       menuitem = 0;
       menuoption = ITEM1;
     }
@@ -464,10 +512,18 @@ void MenuUp(void) {
         break;
 		
       case ITEM7:
-        radio.BufferSlideShow = !radio.BufferSlideShow;
-        OneBigLineSprite.drawString((radio.BufferSlideShow ? myLanguage[language][23] : myLanguage[language][24]), 135, 2);
+        requestedRadioMode = requestedRadioMode == RADIO_MODE_DAB ? RADIO_MODE_FM : RADIO_MODE_DAB;
+        OneBigLineSprite.drawString(radioModeValueText[requestedRadioMode], 135, 2);
         OneBigLineSprite.pushSprite(24, 118);
-        break;		
+        break;
+
+      case ITEM8:
+        requestedFmRegion = static_cast<uint8_t>(
+            (sanitizeFmRegion(requestedFmRegion) + 1U) % FM_REGION_COUNT);
+        OneBigLineSprite.drawString(
+            fmRegionValueText[language][requestedFmRegion], 135, 2);
+        OneBigLineSprite.pushSprite(24, 118);
+        break;
     }
   }
 }
@@ -478,10 +534,7 @@ void MenuDown(void) {
     ShowOneLine(menuoption, menuitem, false);
     menuoption -= ITEM_GAP;
     menuitem--;
-    if (menuitem < 8 && menuitem > 6) {
-      menuoption = ITEM7;
-      menuitem = 6;
-    } else if (menuitem > 8) {
+    if (menuitem > 8) {
       menuoption = ITEM9;
       menuitem = 8;
     }
@@ -558,10 +611,19 @@ void MenuDown(void) {
         break;
 		
       case ITEM7:
-        radio.BufferSlideShow = !radio.BufferSlideShow;
-        OneBigLineSprite.drawString((radio.BufferSlideShow ? myLanguage[language][23] : myLanguage[language][24]), 135, 2);
+        requestedRadioMode = requestedRadioMode == RADIO_MODE_DAB ? RADIO_MODE_FM : RADIO_MODE_DAB;
+        OneBigLineSprite.drawString(radioModeValueText[requestedRadioMode], 135, 2);
         OneBigLineSprite.pushSprite(24, 118);
-        break;			
+        break;
+
+      case ITEM8:
+        requestedFmRegion = sanitizeFmRegion(requestedFmRegion) == 0
+                                ? FM_REGION_COUNT - 1
+                                : sanitizeFmRegion(requestedFmRegion) - 1;
+        OneBigLineSprite.drawString(
+            fmRegionValueText[language][requestedFmRegion], 135, 2);
+        OneBigLineSprite.pushSprite(24, 118);
+        break;
     }
   }
 }
@@ -629,16 +691,26 @@ void DoMenu(void) {
 
       case ITEM7:
         Infoboxprint(myLanguage[language][17]);
-        OneBigLineSprite.drawString((radio.BufferSlideShow ? myLanguage[language][23] : myLanguage[language][24]), 135, 2);
+        OneBigLineSprite.drawString(radioModeValueText[requestedRadioMode], 135, 2);
         OneBigLineSprite.pushSprite(24, 118);
         break;
 
+      case ITEM8:
+        Infoboxprint(fmRegionMenuText[language]);
+        OneBigLineSprite.drawString(
+            fmRegionValueText[language][sanitizeFmRegion(requestedFmRegion)],
+            135, 2);
+        OneBigLineSprite.pushSprite(24, 118);
+        break;
       case ITEM9:
         tftPrint(0, myLanguage[language][79], 155, 40, ActiveColor, ActiveColorSmooth, 28);
-        tftPrint(0, "PE5PVB", 155, 72, PrimaryColor, PrimaryColorSmooth, 28);
-        tftPrint(0, myLanguage[language][80], 155, 108, ActiveColor, ActiveColorSmooth, 28);
-        tftPrint(0, "mcelliotg", 155, 138, PrimaryColor, PrimaryColorSmooth, 28);
-        tftPrint(0, "github.com/PE5PVB/SI4684-DAB-Receiver", 155, 175, SecondaryColor, SecondaryColorSmooth, 16);
+        tftPrint(0, "PE5PVB, bales", 155, 72, PrimaryColor, PrimaryColorSmooth, 28);
+        tftPrint(0, myLanguage[language][80], 155, 104, ActiveColor, ActiveColorSmooth, 28);
+        tftPrint(0, "mcelliotg", 155, 132, PrimaryColor, PrimaryColorSmooth, 28);
+        tftPrint(0, "github.com/PE5PVB/SI4684-DAB-Receiver", 155, 161, SecondaryColor, SecondaryColorSmooth, 16);
+        tftPrint(0, String(radioIrqText[language]) + ": " +
+                    radio.controlModeName(),
+                 155, 182, SecondaryColor, SecondaryColorSmooth, 16);
         break;
     }
   } else {
@@ -682,6 +754,13 @@ void Infoboxprint(const char* input) {
 // variable and only pushes its sprite/region to the TFT when something changed.
 
 void ShowFreq(void) {
+  if (radio.isFm() || radioMode == RADIO_MODE_FM) {
+    const String value = String(fmfreq / 100) + "." + String((fmfreq % 100) / 10);
+    tftReplace(0, fmModeText[language], fmModeText[language], 145, 45, PrimaryColor, PrimaryColorSmooth, BackgroundColor2, 28);
+    tftReplace(-1, dabfreqStringOld, value, 184, 43, SecondaryColor, SecondaryColorSmooth, BackgroundColor2, 52);
+    dabfreqStringOld = value;
+    return;
+  }
   tftReplace(0, radio.getChannel(dabfreqold), radio.getChannel(dabfreq), 145, 45, PrimaryColor, PrimaryColorSmooth, BackgroundColor2, 28);
   tftReplace(-1, dabfreqStringOld, String(radio.getFreq(dabfreq) / 1000) + "." + (radio.getFreq(dabfreq) % 1000 < 100 ? "0" : "") + String(radio.getFreq(dabfreq) % 1000), 184, 43, SecondaryColor, SecondaryColorSmooth, BackgroundColor2, 52);
   dabfreqStringOld = String(radio.getFreq(dabfreq) / 1000) + "." + (radio.getFreq(dabfreq) % 1000 < 100 ? "0" : "") + String(radio.getFreq(dabfreq) % 1000);
@@ -689,7 +768,8 @@ void ShowFreq(void) {
 }
 
 void ShowPTY(void) {
-  if (!radio.ServiceStart) radio.pty = 36;
+  if (radio.isFm()) radio.pty = radio.fmPty;
+  else if (!radio.ServiceStart) radio.pty = 36;
   if (radio.pty != ptyold || displayreset) {
     LongSprite.pushImage(-8, -162, 320, 240, Background);
     LongSprite.setTextDatum(TC_DATUM);
@@ -738,6 +818,18 @@ void ShowRT(void) {
 }
 
 void ShowSID(void) {
+  if (radio.isFm()) {
+    const String value = radio.fmPi ? String(radio.fmPty) : "";
+    if (value != SIDold || displayreset) {
+      ShortSprite.pushImage(-38, -120, 320, 240, Background);
+      ShortSprite.setTextDatum(TL_DATUM);
+      ShortSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+      ShortSprite.drawString(value, 0, 0);
+      ShortSprite.pushSprite(38, 120);
+      SIDold = value;
+    }
+    return;
+  }
   if (!radio.ServiceStart) radio.SID[0] = '\0';
   if (String(radio.SID) != SIDold || displayreset) {
     ShortSprite.pushImage(-38, -120, 320, 240, Background);
@@ -750,6 +842,20 @@ void ShowSID(void) {
 }
 
 void ShowEID(void) {
+  if (radio.isFm()) {
+    String value = radio.fmPi ? String(radio.fmPi, HEX) : "";
+    value.toUpperCase();
+    while (value.length() > 0 && value.length() < 4) value = "0" + value;
+    if (value != EIDold || displayreset) {
+      ShortSprite.pushImage(-38, -106, 320, 240, Background);
+      ShortSprite.setTextDatum(TL_DATUM);
+      ShortSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+      ShortSprite.drawString(value, 0, 0);
+      ShortSprite.pushSprite(38, 106);
+      EIDold = value;
+    }
+    return;
+  }
   if (tuning) radio.EID[0] = '\0';
   if (String(radio.EID) != EIDold || displayreset) {
     ShortSprite.pushImage(-38, -106, 320, 240, Background);
@@ -762,6 +868,22 @@ void ShowEID(void) {
 }
 
 void ShowPS(void) {
+  if (radio.isFm()) {
+    String value = String(radio.fmPs);
+    value.trim();
+    // The station-name field has only two visible states: placeholder while
+    // PS is unknown/acquiring, then the decoder-confirmed eight-character PS.
+    if (value.length() == 0) value = "--------";
+    if (value != PSold || displayreset) {
+      OneBigLineSprite.pushImage(-44, -185, 320, 240, Background);
+      OneBigLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+      OneBigLineSprite.setTextDatum(TC_DATUM);
+      OneBigLineSprite.drawString(value, 130, 4);
+      OneBigLineSprite.pushSprite(44, 185);
+      PSold = value;
+    }
+    return;
+  }
   if (tunemode != TUNE_MEM && !radio.ServiceStart && !tuning && !seek) {
     if (radio.signallock && !radio.ServiceStart) {
       strncpy(_serviceName, (radio.numberofservices > 0 ? myLanguage[language][74] : myLanguage[language][73]), sizeof(_serviceName));
@@ -789,6 +911,20 @@ void ShowPS(void) {
 }
 
 void ShowEN(void) {
+  if (radio.isFm()) {
+    const String value = tuning || radio.isTunePending() ? myLanguage[language][75]
+                          : (!radio.signallock ? myLanguage[language][76]
+                             : (radio.fmPi ? (radio.isRbds() ? fmRbdsText[language]
+                                                            : fmRdsText[language])
+                                           : (radio.fmPilot ? fmStereoText[language]
+                                                            : fmMonoText[language])));
+    if (value != EnsembleNameOld || displayreset) {
+      tft.fillRect(167, 162, 145, 16, BackgroundColor4);
+      tftPrint(0, value, 238, 162, SecondaryColor, SecondaryColorSmooth, 16);
+      EnsembleNameOld = value;
+    }
+    return;
+  }
   if (tuning) {
     strncpy(radio.EnsembleLabel, myLanguage[language][75], sizeof(radio.EnsembleLabel));
     radio.EnsembleLabel[sizeof(radio.EnsembleLabel) - 1] = '\0';
@@ -815,6 +951,18 @@ void ShowEN(void) {
 }
 
 void ShowProtectionlevel(void) {
+  if (radio.isFm()) {
+    const String value = String(fmBlendShortText[language]) + " " + String(radio.fmStereoBlend) + "%";
+    if (value != PLold || displayreset) {
+      MediumSprite.pushImage(-9, -90, 320, 240, Background);
+      MediumSprite.setTextDatum(TC_DATUM);
+      MediumSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
+      MediumSprite.drawString(value, 30, 0);
+      MediumSprite.pushSprite(9, 90);
+      PLold = value;
+    }
+    return;
+  }
   if (!radio.ServiceStart) radio.protectionlevel = 0;
   if (String(ProtectionText[radio.protectionlevel]) != PLold || displayreset) {
     MediumSprite.pushImage(-9, -90, 320, 240, Background);
@@ -827,6 +975,14 @@ void ShowProtectionlevel(void) {
 }
 
 void ShowAudioMode(void) {
+  if (radio.isFm()) {
+    if (displayreset || audiomodeold != radio.audiomode) {
+      tftPrint(-1, fmModeText[language], 70, 33, SecondaryColor, SecondaryColorSmooth, 16);
+      tft.pushImage(10, 4, 28, 19, radio.fmPilot ? stereoon : mono);
+      audiomodeold = radio.audiomode;
+    }
+    return;
+  }
   if (!radio.ServiceStart) radio.servicetype = 9;
   if (servicetypeold != radio.servicetype || displayreset) {
     tftPrint(-1, ServiceTypeText[4], 70, 33, GreyoutColor, BackgroundColor, 16);
@@ -848,6 +1004,7 @@ void ShowAudioMode(void) {
 }
 
 void ShowECC(void) {
+  if (radio.isFm()) return;
   if (eccold != radio.ecc || displayreset) {
     String ITU = "";
     switch (radio.serviceHasOwnEcc ? radio.SID[0] : radio.EID[0]) {
@@ -1020,7 +1177,7 @@ void ShowECC(void) {
 void ShowMemoryPos(void) {
   if (!IsStationEmpty()) {
     EEPROM.writeByte(EE_BYTE_MEMORYPOS, memorypos);
-    EEPROM.commit();
+    MarkEepromDirty();
   }
   int memposcolor = 0;
   int memposcolorsmooth = 0;
@@ -1054,94 +1211,150 @@ void ShowVolume(void) {
   tftPrint(0, String(map(volume, 0, 62, 0, 100)), 190, 68, ActiveColor, ActiveColorSmooth, 28);
   Headphones.SetVolume(volume);
   EEPROM.writeByte(EE_BYTE_VOLUME, volume);
-  EEPROM.commit();
+  MarkEepromDirty();
   VolumeTimer = millis();
 }
 
 
-// Signal-level meter (RSSI bar). 100 ms throttle so quick fluctuations don't
-// flood the SPI bus; the rest is just the standard diff-vs-old logic.
+// Signal meters are refreshed at 10 Hz. Keep raw driver values separate from
+// the displayed IIR average; feeding an already averaged CNR back into the
+// filter on every fast loop pass made the two modes drift differently.
 void ShowSignalLevel(void) {
-  if (millis() - rssiTimer >= 100) {
-    rssiTimer = millis();
-    CNR = radio.cnr;
+  if (!displayreset && millis() - rssiTimer < 100UL) return;
+  rssiTimer = millis();
+
+  const int16_t rawSignal = radio.getRSSI();
+  const int16_t rawCnr = radio.cnr;
+  if (displayreset) {
+    // A mode/tune redraw must not inherit the previous mode's filter history.
+    SAvg = rawSignal;
+    SAvg2 = rawCnr;
+  } else {
+    SAvg = static_cast<int16_t>((static_cast<int32_t>(SAvg) * 7 +
+                                static_cast<int32_t>(rawSignal) * 3) / 10);
+    SAvg2 = static_cast<int16_t>((static_cast<int32_t>(SAvg2) * 7 +
+                                 static_cast<int32_t>(rawCnr) * 3) / 10);
   }
-
-  SAvg = (((SAvg * 9) + 5) / 10) + SignalLevel;
-  SAvg2 = (((SAvg2 * 9) + 5) / 10) + CNR;
-
-  SignalLevel = SAvg / 10;
-  CNR = SAvg2 / 10;
+  SignalLevel = SAvg;
+  CNR = static_cast<int8_t>(SAvg2 < 0 ? 0 : (SAvg2 > 127 ? 127 : SAvg2));
 
   int SignalLevelprint = 0;
   if (unit == 0) SignalLevelprint = SignalLevel;
   if (unit == 1) SignalLevelprint = ((SignalLevel * 100) + 10875) / 100;
-  if (unit == 2) SignalLevelprint = round((float(SignalLevel) / 10.0 - 10.0 * log10(75) - 90.0) * 10.0);
+  if (unit == 2)
+    SignalLevelprint = round((float(SignalLevel) / 10.0 -
+                              10.0 * log10(75) - 90.0) * 10.0);
 
   if (!ShowServiceInformation) {
-    if (SignalLevelprint > (SignalLevelold + 3) || SignalLevelprint < (SignalLevelold - 3) || displayreset) {
+    if (SignalLevelprint > SignalLevelold + 3 ||
+        SignalLevelprint < SignalLevelold - 3 || displayreset) {
       ShortSprite.fillSprite(BackgroundColor3);
       ShortSprite.setTextDatum(TR_DATUM);
       ShortSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
-      ShortSprite.drawString(String(SignalLevelprint / 10) + "." + String(abs(SignalLevelprint % 10)), 35, 0);
+      ShortSprite.drawString(String(SignalLevelprint / 10) + "." +
+                                 String(abs(SignalLevelprint % 10)),
+                             35, 0);
       ShortSprite.pushSprite(146, 109);
 
-      byte segments = 0;
-      if (SignalLevel > 120) {
+      int segments = 0;
+      if (SignalLevel > 120)
         segments = map(SignalLevel, 100, 700, 0, 85);
-      }
+      if (segments < 0) segments = 0;
+      if (segments > 85) segments = 85;
 
-      byte constrainedSegments = segments;
-      byte significantSegments = segments;
-
-      if (constrainedSegments > 85) constrainedSegments = 85;
-      if (significantSegments > 85) significantSegments = 85;
-
-      int length1 = 2 * segments;
-      int length2 = 2 * (significantSegments - 56);
-      int length3 = 2 * (85 - constrainedSegments);
-
-      tft.fillRect(134, 129, length1, 6, BarInsignificantColor);
-      tft.fillRect(134 + 2 * 56, 129, length2, 6, BarSignificantColor);
-      tft.fillRect(134 + 2 * constrainedSegments, 129, length3, 6, GreyoutColor);
+      // Always clear the complete bar first and draw only positive widths.
+      // The old unsigned-byte subtraction produced a negative fillRect width
+      // below segment 56, which appeared as a full-scale flash/artifact.
+      tft.fillRect(134, 129, 170, 6, GreyoutColor);
+      const int insignificantSegments = segments < 56 ? segments : 56;
+      const int significantSegments = segments > 56 ? segments - 56 : 0;
+      if (insignificantSegments > 0)
+        tft.fillRect(134, 129, 2 * insignificantSegments, 6,
+                     BarInsignificantColor);
+      if (significantSegments > 0)
+        tft.fillRect(134 + 2 * 56, 129, 2 * significantSegments, 6,
+                     BarSignificantColor);
 
       SignalLevelold = SignalLevelprint;
     }
 
     if (CNRold != CNR || displayreset) {
       if (radio.signallock) {
-        tftPrint(1, String("--"), 289, 109, BackgroundColor, BackgroundColor3, 16);
-        tftReplace(1, String(CNRold), String(CNR), 289, 109, PrimaryColor, PrimaryColorSmooth, BackgroundColor3, 16);
+        tftPrint(1, String("--"), 289, 109,
+                 BackgroundColor, BackgroundColor3, 16);
+        tftReplace(1, String(CNRold), String(CNR), 289, 109,
+                   PrimaryColor, PrimaryColorSmooth, BackgroundColor3, 16);
       } else {
-        tftReplace(1, String(CNRold), "--", 289, 109, PrimaryColor, PrimaryColorSmooth, BackgroundColor3, 16);
+        tftReplace(1, String(CNRold), "--", 289, 109,
+                   PrimaryColor, PrimaryColorSmooth, BackgroundColor3, 16);
       }
       CNRold = CNR;
     }
 
-    if (ficold != radio.fic || displayreset) {
-      byte quality = map(radio.fic, 0, 100, 139, 0);
-      for (byte x = 0; x < 10; x++) tft.pushImage (135, 91 + x, 139, 1, QualLine);
-      tft.fillRect(274 - quality, 91, quality, 10, BackgroundColor3);
-      tftReplace(1, String(ficold) + "%", String(radio.fic) + "%", 315, 90, PrimaryColor, PrimaryColorSmooth, BackgroundColor3, 16);
-      ficold = radio.fic;
+    uint8_t rawQuality = radio.fic > 100U ? 100U : radio.fic;
+    if (!radio.isFm()) {
+      // FIC quality is commonly pinned at 100 whenever all FIBs are error-free,
+      // even while reception margin changes considerably. Q is therefore the
+      // conservative combination of FIC integrity and CNR margin. Preserve
+      // radio.fic itself for serial/API diagnostics.
+      const uint8_t cnrQuality =
+          radio.cnr >= 20U ? 100U : static_cast<uint8_t>(radio.cnr * 5U);
+      if (cnrQuality < rawQuality) rawQuality = cnrQuality;
+      if (!radio.signallock) rawQuality = 0;
     }
 
-
+    // Smooth Q/M independently from RSSI/CNR. This also suppresses display
+    // flashes if one RF-quality sample is anomalously full scale.
+    static uint16_t qualityAverage10 = 0;
+    static bool qualityAverageValid = false;
+    static bool qualityWasFm = false;
+    const bool qualityIsFm = radio.isFm();
+    if (displayreset || !qualityAverageValid || qualityWasFm != qualityIsFm) {
+      qualityAverage10 = static_cast<uint16_t>(rawQuality) * 10U;
+      qualityAverageValid = true;
+      qualityWasFm = qualityIsFm;
+    } else {
+      qualityAverage10 = static_cast<uint16_t>(
+          (static_cast<uint32_t>(qualityAverage10) * 7U +
+           static_cast<uint32_t>(rawQuality) * 30U + 5U) / 10U);
+    }
+    const uint8_t qualityValue = static_cast<uint8_t>(
+        (qualityAverage10 + 5U) / 10U);
+    if (ficold != qualityValue || displayreset) {
+      const int filledWidth = map(qualityValue, 0, 100, 0, 139);
+      // Build the final frame in RAM. Drawing the full gradient directly to TFT
+      // and clearing its unused tail afterwards exposed a brief 100% frame.
+      for (byte x = 0; x < 10; x++)
+        QualityBarSprite.pushImage(0, x, 139, 1, QualLine);
+      if (filledWidth < 139)
+        QualityBarSprite.fillRect(filledWidth, 0, 139 - filledWidth, 10,
+                                  BackgroundColor3);
+      QualityBarSprite.pushSprite(135, 91);
+      tftReplace(1, String(ficold) + "%", String(qualityValue) + "%",
+                 315, 90, PrimaryColor, PrimaryColorSmooth,
+                 BackgroundColor3, 16);
+      ficold = qualityValue;
+    }
   } else {
-    String SignalLevelString = String(String(SignalLevelprint / 10)) + "." + String(abs(SignalLevelprint % 10));
-    if ((SignalLevelString != SignalLeveloldString && !setvolume) || displayreset) {
-      tftReplace(1, SignalLeveloldString, SignalLevelString, 191, 56, PrimaryColor, PrimaryColorSmooth, BackgroundColor3, 16);
+    String SignalLevelString = String(SignalLevelprint / 10) + "." +
+                               String(abs(SignalLevelprint % 10));
+    if ((SignalLevelString != SignalLeveloldString && !setvolume) ||
+        displayreset) {
+      tftReplace(1, SignalLeveloldString, SignalLevelString, 191, 56,
+                 PrimaryColor, PrimaryColorSmooth, BackgroundColor3, 16);
       SignalLeveloldString = SignalLevelString;
     }
 
     if (((CNRold != CNR) && !setvolume) || displayreset) {
-      tftReplace(1, String(CNRold), String(CNR), 284, 56, PrimaryColor, PrimaryColorSmooth, BackgroundColor3, 16);
+      tftReplace(1, String(CNRold), String(CNR), 284, 56,
+                 PrimaryColor, PrimaryColorSmooth, BackgroundColor3, 16);
       CNRold = CNR;
     }
   }
 }
 
 void ShowBitrate(void) {
+  if (radio.isFm()) return;
   if (tuning) radio.bitrate = 0;
   if (radio.bitrate != BitrateOld || displayreset) {
     MediumSprite.pushImage(-9, -140, 320, 240, Background);
@@ -1154,7 +1367,7 @@ void ShowBitrate(void) {
 }
 
 void ShowClock(void) {
-  if (radio.signallock) setTime(radio.Hours, radio.Minutes, radio.Seconds, radio.Days, radio.Months, radio.Year);
+  if (!radio.isFm() && radio.signallock) setTime(radio.Hours, radio.Minutes, radio.Seconds, radio.Days, radio.Months, radio.Year);
   String clockstring = (hour() < 10 ? "0" : "") + String(hour()) + ":" + (minute() < 10 ? "0" : "") + String(minute());
   String datestring = (day() < 10 ? "0" : "") + String(day()) + "-" + (month() < 10 ? "0" : "") + String(month()) + "-" + String(year());
   if (clockstringOld != clockstring || displayreset) {
@@ -1177,6 +1390,11 @@ void ShowClock(void) {
 }
 
 void ShowSlideShowIcon(void) {
+  if (radio.isFm()) {
+    if (SlideShowAvailableOld || displayreset) tft.pushImage (10, 187, 30, 22, slideshowoff);
+    SlideShowAvailableOld = false;
+    return;
+  }
   if (SlideShowAvailableOld != radio.SlideShowAvailable || displayreset) {
     if (radio.SlideShowAvailable) {
       tft.pushImage (10, 187, 30, 22, slideshowon);
@@ -1222,5 +1440,5 @@ void ShowTuneMode(void) {
   }
   ModeSprite.pushSprite(6, 33);
   EEPROM.writeByte(EE_BYTE_TUNEMODE, tunemode);
-  EEPROM.commit();
+  MarkEepromDirty();
 }
