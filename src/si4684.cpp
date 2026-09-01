@@ -48,19 +48,38 @@ static volatile bool radioIntbPending = false;
 static volatile uint32_t radioIntbEdgeCount = 0;
 static RadioControlMode radioControlMode = RADIO_CTRL_DETECT;
 static bool radioIntbConfirmed = false;
+static uint32_t radioBootIrqEdgeCount = 0;
+static bool radioRuntimeIrqTracking = false;
+static bool radioRuntimeIntbConfirmed = false;
 static bool commandAwaitingCts = false;
-static bool commandSawIrq = false;
+static bool commandStatusReadTriggeredByIrq = false;
 static uint32_t commandStartedUs = 0;
 
-// This receiver's INTB is physically connected and works in the bootloader,
-// but the loaded application firmware does not assert it for every CTS even
-// after INT_CTL_ENABLE is written. Keep INTB as the fast path for real events
-// and use short, bounded safety polls so a missing application edge cannot add
-// 250 ms to every command and stall the UI.
+// AN649 PIN_CONFIG_ENABLE (0x0800) output-enable bits used by this board.
+// Keep both audio paths enabled; expose INTB only when GPIO12 was detected.
+static constexpr uint16_t RADIO_PIN_CONFIG_DACOUTEN = 1U << 0;
+static constexpr uint16_t RADIO_PIN_CONFIG_I2SOUTEN = 1U << 1;
+static constexpr uint16_t RADIO_PIN_CONFIG_INTBOUTEN = 1U << 15;
+static constexpr uint16_t RADIO_PIN_CONFIG_AUDIO =
+    RADIO_PIN_CONFIG_DACOUTEN | RADIO_PIN_CONFIG_I2SOUTEN;
+
+// Keep INTB as the fast path for real events and retain short, bounded safety
+// polls so a disconnected or faulty application IRQ cannot stall the UI.
 static constexpr uint32_t RADIO_INTB_CTS_SAFETY_US = 2000UL;
 static constexpr uint32_t RADIO_LEGACY_CTS_SAFETY_MS = 2UL;
 static constexpr uint32_t RADIO_DAB_STC_SAFETY_MS = 20UL;
 static constexpr uint32_t RADIO_DAB_STATUS_SAFETY_MS = 50UL;
+static constexpr uint32_t RADIO_FM_DIAG_INTERVAL_MS = 5000UL;
+
+// Runtime-only counters. They are reset after each image boot/reuse so the
+// rate-limited FM line compares main-screen and menu behaviour directly.
+static bool radioRuntimeDiagnosticsActive = false;
+static uint32_t diagFmBusySkipCount = 0;
+static uint32_t diagFmRsqStatusCount = 0;
+static uint32_t diagFmRdsStatusCount = 0;
+static uint32_t diagCtsIrqCompletionCount = 0;
+static uint32_t diagCtsPollCompletionCount = 0;
+static uint32_t diagFmLastReportMs = 0;
 
 // Boot diagnostics. HOST_LOAD is intentionally not logged chunk-by-chunk;
 // progress is reported roughly every 64 KiB to keep the UART readable.
@@ -80,6 +99,25 @@ static bool takeRadioIntb(void) {
   return __atomic_exchange_n(&radioIntbPending, false, __ATOMIC_ACQ_REL);
 }
 
+static uint32_t radioIntbEdges(void) {
+  return __atomic_load_n(&radioIntbEdgeCount, __ATOMIC_ACQUIRE);
+}
+
+static uint32_t radioRuntimeIntbEdges(void) {
+  return radioIntbEdges() - radioBootIrqEdgeCount;
+}
+
+static void confirmRuntimeIntb(void) {
+  if (!radioRuntimeIrqTracking || radioRuntimeIntbConfirmed ||
+      radioControlMode != RADIO_CTRL_INTB || radioRuntimeIntbEdges() == 0U)
+    return;
+
+  radioIntbConfirmed = true;
+  radioRuntimeIntbConfirmed = true;
+  Serial.printf("[RADIO/IRQ] runtime INTB active edges=%u\n",
+                static_cast<unsigned>(radioRuntimeIntbEdges()));
+}
+
 static bool radioIntbActive(void) {
   // INTB is active-low and level sources can coalesce: if another enabled
   // source already holds the line low, a new CTS condition produces no second
@@ -89,8 +127,9 @@ static bool radioIntbActive(void) {
   if (edge && !radioIntbConfirmed) {
     radioIntbConfirmed = true;
     Serial.printf("[RADIO/IRQ] GPIO12 INTB confirmed by ISR edge #%u\n",
-                  static_cast<unsigned>(radioIntbEdgeCount));
+                  static_cast<unsigned>(radioIntbEdges()));
   }
+  if (edge) confirmRuntimeIntb();
   return edge || digitalRead(SI4684_INTB_PIN) == LOW;
 }
 
@@ -104,10 +143,21 @@ static void usePollingFallback(const char* reason) {
   Serial.printf("[RADIO/IRQ] %s; polling fallback\n", reason ? reason : "INTB disabled");
 }
 
+// Runtime fallback also disables the physical INTB output. This helper is used
+// only after BOOT, when application properties are available.
+static void useRuntimePollingFallback(const char* reason) {
+  usePollingFallback(reason);
+  const si468x::Result pinConfigResult = chip.setProperty(
+      si468x::Property::PIN_CONFIG_ENABLE, RADIO_PIN_CONFIG_AUDIO);
+  Serial.printf("[RADIO/IRQ] runtime PIN_CONFIG=0x%04X fallback result=%d\n",
+                static_cast<unsigned>(RADIO_PIN_CONFIG_AUDIO),
+                static_cast<int>(pinConfigResult));
+}
+
 static bool hostWriteCommand(void*, uint8_t command, const uint8_t* args, uint16_t length) {
   diagLastCommand = command;
   commandAwaitingCts = true;
-  commandSawIrq = false;
+  commandStatusReadTriggeredByIrq = false;
   commandStartedUs = micros();
   if (command == 0x01) {
     Serial.printf("[RADIO/SPI] POWER_UP args=%u data=", length);
@@ -174,7 +224,7 @@ static bool hostReadReply(void*, uint8_t* destination, uint16_t length) {
 static uint32_t hostTimeUs(void*) { return micros(); }
 static void hostIdle(void*) {
   if (radioControlMode == RADIO_CTRL_INTB && radioIntbActive()) {
-    commandSawIrq = true;
+    if (commandAwaitingCts) commandStatusReadTriggeredByIrq = true;
     chip.notifyInterrupt();
   }
   yield();
@@ -182,15 +232,35 @@ static void hostIdle(void*) {
 
 static void statusChanged(void*, const si468x::Status& status) {
   lastStatus0 = status.status0;
+  const bool irqTriggered = commandStatusReadTriggeredByIrq;
+  // One callback corresponds to the status read caused by the most recent
+  // service decision. Do not carry its trigger into a later safety poll.
+  commandStatusReadTriggeredByIrq = false;
   if (!commandAwaitingCts || !status.cts()) return;
 
-  if (radioControlMode == RADIO_CTRL_INTB && !commandSawIrq) {
+  if (radioRuntimeDiagnosticsActive) {
+    if (radioControlMode == RADIO_CTRL_INTB && irqTriggered)
+      ++diagCtsIrqCompletionCount;
+    else
+      ++diagCtsPollCompletionCount;
+  }
+
+  if (radioControlMode == RADIO_CTRL_INTB && !irqTriggered) {
     // Keep a diagnostic for a genuinely long wait, but do not flood the UART
     // for the normal 2 ms hybrid safety poll.
     if (static_cast<uint32_t>(micros() - commandStartedUs) >= 200000UL)
       Serial.println("[RADIO/IRQ] long CTS wait resolved by status poll");
   }
   commandAwaitingCts = false;
+}
+
+static void finishCommandDiagnostics(si468x::Result result) {
+  // Pending/Busy still belong to a live operation. Every other result is
+  // terminal, including timeout/transport failures which have no CTS callback.
+  if (result == si468x::Result::Pending || result == si468x::Result::Busy)
+    return;
+  commandAwaitingCts = false;
+  commandStatusReadTriggeredByIrq = false;
 }
 
 static size_t progmemImageReader(void* context, uint32_t offset, uint8_t* destination, size_t length) {
@@ -222,7 +292,9 @@ char* DAB::getFirmwareVersion(void) {
 // (caller responds by reinitialising the chip via doRecovery()).
 bool DAB::panic(void) {
   si468x::SystemState state;
-  if (chip.getSystemState(state, 100000UL) != si468x::Result::Ok) return true;
+  const si468x::Result result = chip.getSystemState(state, 100000UL);
+  finishCommandDiagnostics(result);
+  if (result != si468x::Result::Ok) return true;
   return state.image != (isFm() ? si468x::Image::FMHD : si468x::Image::DAB);
 }
 
@@ -333,14 +405,15 @@ static void cts(void) {
   }
 }
 
-static void detectRadioControlMode(void) {
-  // POWER_UP has completed by bounded polling with CTSIEN set. Read status a
-  // few times to clear the expected pending CTS condition before sampling the
-  // physical pin, otherwise a valid connected INTB could look stuck low. GPIO12
-  // uses a pull-up: a pull-down can suppress an inactive/high interrupt output.
+static void detectRadioControlMode(bool deferConfirmationToRuntime = false) {
+  // POWER_UP has completed by bounded polling with CTSIEN set. Sample status a
+  // few times before the physical pin so the expected bootloader CTS can
+  // settle. RD_REPLY does not ACK application sticky sources, which is why the
+  // reuse path below accepts LOW and defers confirmation. GPIO12 uses a pull-up.
   // A high line is only a candidate because an unconnected input also reads
-  // high; the next real falling edge confirms INTB, while three bounded CTS
-  // safety polls automatically demote an unconnected candidate to POLL.
+  // high. When reusing an application image, a legitimate sticky source may
+  // instead keep a connected line low; that path is armed as a candidate too
+  // and is confirmed by the first post-bootstrap command.
   si468x::Status status;
   commandAwaitingCts = false;
   takeRadioIntb();
@@ -355,18 +428,18 @@ static void detectRadioControlMode(void) {
     delay(1);
   }
 
-  if (highSamples >= 10U) {
+  if (deferConfirmationToRuntime || highSamples >= 10U) {
     radioControlMode = RADIO_CTRL_INTB;
     radioIntbConfirmed = false;
     takeRadioIntb();
     attachInterrupt(digitalPinToInterrupt(SI4684_INTB_PIN), radioIntbIsr, FALLING);
-    // IRQ wakes servicing immediately. A short hybrid check is essential here:
-    // some application images do not assert CTS even though bootloader INTB is
-    // proven, and a long fallback interval would block every radio command.
+    // IRQ wakes servicing immediately; the bounded hybrid check remains the
+    // safety path for a disconnected or faulty application interrupt.
     chip.setCtsPollIntervalUs(RADIO_INTB_CTS_SAFETY_US);
     chip.setIdleStatusPollIntervalUs(50000);
-    Serial.printf("[RADIO/IRQ] GPIO12 INTB candidate high=%u/12; awaiting edge\n",
-                  highSamples);
+    Serial.printf("[RADIO/IRQ] GPIO12 INTB candidate high=%u/12; proof=%s\n",
+                  highSamples,
+                  deferConfirmationToRuntime ? "runtime edge" : "boot edge");
     Serial.printf("[RADIO/IRQ] hybrid safety polling CTS=%u us events=%u ms\n",
                   static_cast<unsigned>(RADIO_INTB_CTS_SAFETY_US),
                   static_cast<unsigned>(RADIO_DAB_STATUS_SAFETY_MS));
@@ -445,11 +518,22 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   dabRssi10 = 0;
   dabSignalTimer = 0;
   lastStatus0 = 0;
+  // Stop the previous session's ISR before resetting its edge diagnostics.
+  detachInterrupt(digitalPinToInterrupt(SI4684_INTB_PIN));
   radioControlMode = RADIO_CTRL_DETECT;
   radioIntbConfirmed = false;
-  radioIntbPending = false;
-  radioIntbEdgeCount = 0;
-  detachInterrupt(digitalPinToInterrupt(SI4684_INTB_PIN));
+  __atomic_store_n(&radioIntbPending, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&radioIntbEdgeCount, 0U, __ATOMIC_RELEASE);
+  radioBootIrqEdgeCount = 0;
+  radioRuntimeIrqTracking = false;
+  radioRuntimeIntbConfirmed = false;
+  radioRuntimeDiagnosticsActive = false;
+  diagFmBusySkipCount = 0;
+  diagFmRsqStatusCount = 0;
+  diagFmRdsStatusCount = 0;
+  diagCtsIrqCompletionCount = 0;
+  diagCtsPollCompletionCount = 0;
+  diagFmLastReportMs = 0;
   // GPIO12 is MTDI on classic ESP32. Hardware using it for INTB must have
   // VDD_SDIO fixed safely at 3.3 V; firmware never reads or writes eFuse.
   pinMode(SI4684_INTB_PIN, INPUT_PULLUP);
@@ -599,27 +683,74 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     }
   } else {
     Serial.println("[RADIO] V9 bootHostImage skipped; preserving running image and TFT state");
-    detectRadioControlMode();
+    // Existing application sources may hold INTB low and RD_REPLY does not ACK
+    // them. Arm GPIO12 here and let the polling bootstrap plus GET_PART_INFO
+    // provide the deterministic edge/no-edge proof.
+    detectRadioControlMode(true);
   }
 
-  // BOOT starts a new application image whose INT_CTL_ENABLE property is back
-  // at its default. Re-enable CTS immediately, before issuing identity/shared-
-  // property commands. Bootstrap this one SET_PROPERTY with a short poll: the
-  // command that enables runtime CTS cannot itself depend on runtime CTS being
-  // enabled already. Afterwards normal IRQ-assisted waits resume.
-  if (result == si468x::Result::Ok &&
-      radioControlMode == RADIO_CTRL_INTB) {
-    Serial.println("[RADIO/IRQ] enabling runtime CTS source after BOOT");
-    chip.setCtsPollIntervalUs(1000);
-    const si468x::Result runtimeCtsResult =
-        chip.setInterruptEnable(si468x::INTERRUPT_CTS);
+  // Everything through BOOT belongs to the bootloader IRQ phase. From here on
+  // the edge delta proves that the loaded FM/DAB image drives INTB as well.
+  radioBootIrqEdgeCount = radioIntbEdges();
+  radioRuntimeIrqTracking = true;
+  Serial.printf("[RADIO/IRQ] boot INTB edges=%u\n",
+                static_cast<unsigned>(radioBootIrqEdgeCount));
+
+  // BOOT resets application properties. Configure the physical INTB output
+  // before enabling its CTS source. While doing so, force the common transport
+  // into polling: the commands which create runtime IRQ signalling cannot
+  // depend on that signalling for their own completion.
+  const bool runtimeIntbRequested = radioControlMode == RADIO_CTRL_INTB;
+  const uint16_t pinConfig = RADIO_PIN_CONFIG_AUDIO |
+      (runtimeIntbRequested ? RADIO_PIN_CONFIG_INTBOUTEN : 0U);
+  if (runtimeIntbRequested) radioControlMode = RADIO_CTRL_POLL;
+  chip.setCtsPollIntervalUs(1000);
+  chip.setIdleStatusPollIntervalUs(20000);
+
+  const si468x::Result pinConfigResult =
+      chip.setProperty(si468x::Property::PIN_CONFIG_ENABLE, pinConfig);
+  Serial.printf("[RADIO/IRQ] runtime PIN_CONFIG=0x%04X result=%d\n",
+                static_cast<unsigned>(pinConfig),
+                static_cast<int>(pinConfigResult));
+
+  si468x::Result runtimeCtsResult = si468x::Result::Ok;
+  si468x::Result pendingStatusResult = si468x::Result::Ok;
+  si468x::Status pendingStatus;
+  if (runtimeIntbRequested && pinConfigResult == si468x::Result::Ok) {
+    runtimeCtsResult = chip.setInterruptEnable(si468x::INTERRUPT_CTS);
+    Serial.printf("[RADIO/IRQ] runtime sources=0x%04X stage=bootstrap result=%d\n",
+                  static_cast<unsigned>(si468x::INTERRUPT_CTS),
+                  static_cast<int>(runtimeCtsResult));
     if (runtimeCtsResult == si468x::Result::Ok) {
+      // Observe the status accumulated while IRQ assistance was off. The
+      // host-side edge latch is cleared below; mode handlers acknowledge their
+      // own sticky STC/RSQ/ACF/RDS sources with the documented ACK arguments.
+      pendingStatusResult = chip.readStatus(pendingStatus);
+      Serial.printf("[RADIO/IRQ] runtime pending status=0x%02X readResult=%d\n",
+                    static_cast<unsigned>(pendingStatus.status0),
+                    static_cast<int>(pendingStatusResult));
+    }
+  }
+
+  if (runtimeIntbRequested) {
+    radioControlMode = RADIO_CTRL_INTB;
+    if (pinConfigResult == si468x::Result::Ok &&
+        runtimeCtsResult == si468x::Result::Ok &&
+        pendingStatusResult == si468x::Result::Ok) {
+      confirmRuntimeIntb();
       takeRadioIntb();
       chip.setCtsPollIntervalUs(RADIO_INTB_CTS_SAFETY_US);
-      Serial.println("[RADIO/IRQ] runtime CTS source enabled");
+      chip.setIdleStatusPollIntervalUs(50000);
+      if (!radioRuntimeIntbConfirmed)
+        Serial.println("[RADIO/IRQ] runtime INTB armed; awaiting post-BOOT edge");
     } else {
-      usePollingFallback("runtime CTS source configuration failed");
+      useRuntimePollingFallback("runtime INTB bootstrap failed");
     }
+  }
+
+  if (pinConfigResult != si468x::Result::Ok) {
+    Serial.println("[RADIO] ERROR: PIN_CONFIG_ENABLE failed");
+    return false;
   }
 
   si468x::PartInfo part;
@@ -631,6 +762,16 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
                 static_cast<int>(result),
                 result == si468x::Result::Ok ? static_cast<unsigned>(part.partNumber) : 0U,
                 static_cast<unsigned>(lastStatus0));
+  // On a reused application image there were no bootloader edges available to
+  // distinguish a connected INTB from an unconnected INPUT_PULLUP. The first
+  // post-bootstrap command is the deterministic runtime proof.
+  if (result == si468x::Result::Ok && reuseRunningImage &&
+      radioControlMode == RADIO_CTRL_INTB && !radioIntbConfirmed) {
+    delay(1);
+    confirmRuntimeIntb();
+    if (!radioIntbConfirmed)
+      useRuntimePollingFallback("INTB candidate produced no runtime ISR edge");
+  }
   if (result != si468x::Result::Ok || part.partNumber != 4684) {
     Serial.println("[RADIO] ERROR: GET_PART_INFO failed or part != 4684");
     return false;
@@ -672,7 +813,6 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   // Shared audio/front-end setup retained from the proven DAB configuration.
   Set_Property(0x0200, 0x8000);
   Set_Property(0x0202, 0x1600);
-  Set_Property(0x0800, 0x0003);
   Set_Property(0x1710, 0xFC4A);
   Set_Property(0x1711, 0x00F8);
   Serial.println("[RADIO] shared properties done");
@@ -702,11 +842,24 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     Set_Property(0xB400, 0x0097);
     Set_Property(0xB401, 0x0002);
     Set_Property(0xB500, 0x0000);
-    const si468x::Result irqResult = chip.setInterruptEnable(
+    const uint16_t interruptSources =
         si468x::INTERRUPT_CTS | si468x::INTERRUPT_STC |
-        si468x::INTERRUPT_DSRV | si468x::INTERRUPT_DACQ);
-    if (irqResult != si468x::Result::Ok)
-      usePollingFallback("DAB interrupt-source configuration failed");
+        si468x::INTERRUPT_DSRV | si468x::INTERRUPT_DACQ;
+    const si468x::Result irqResult = chip.setInterruptEnable(interruptSources);
+    si468x::Status irqStatus;
+    const si468x::Result irqStatusResult =
+        irqResult == si468x::Result::Ok
+            ? chip.readStatus(irqStatus)
+            : irqResult;
+    confirmRuntimeIntb();
+    takeRadioIntb();
+    Serial.printf("[RADIO/IRQ] runtime sources=0x%04X mode=DAB result=%d read=%d\n",
+                  static_cast<unsigned>(interruptSources),
+                  static_cast<int>(irqResult),
+                  static_cast<int>(irqStatusResult));
+    if (irqResult != si468x::Result::Ok ||
+        irqStatusResult != si468x::Result::Ok)
+      useRuntimePollingFallback("DAB interrupt-source configuration failed");
   } else {
     Serial.println("[RADIO] FM band/RDS properties");
     applyFmRegionProperties();
@@ -716,21 +869,39 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     Set_Property(0x3C00, 0x001B);
     Set_Property(0x3C01, 1);
     Set_Property(0x3C02, 0x0051); // RDS enabled, conservative BLE thresholds
-    const si468x::Result irqResult = chip.setInterruptEnable(
+    const uint16_t interruptSources =
         si468x::INTERRUPT_CTS | si468x::INTERRUPT_STC |
         si468x::INTERRUPT_ACF | si468x::INTERRUPT_RDS |
-        si468x::INTERRUPT_RSQ | si468x::INTERRUPT_DEVICE_EVENT);
-    if (irqResult != si468x::Result::Ok)
-      usePollingFallback("FM interrupt-source configuration failed");
+        si468x::INTERRUPT_RSQ | si468x::INTERRUPT_DEVICE_EVENT;
+    const si468x::Result irqResult = chip.setInterruptEnable(interruptSources);
+    si468x::Status irqStatus;
+    const si468x::Result irqStatusResult =
+        irqResult == si468x::Result::Ok
+            ? chip.readStatus(irqStatus)
+            : irqResult;
+    confirmRuntimeIntb();
+    takeRadioIntb();
+    Serial.printf("[RADIO/IRQ] runtime sources=0x%04X mode=FM result=%d read=%d\n",
+                  static_cast<unsigned>(interruptSources),
+                  static_cast<int>(irqResult),
+                  static_cast<int>(irqStatusResult));
+    if (irqResult != si468x::Result::Ok ||
+        irqStatusResult != si468x::Result::Ok)
+      useRuntimePollingFallback("FM interrupt-source configuration failed");
     clearFmData();
   }
 
   clearData();
+  // No boot/configuration command may leak diagnostic state into FM runtime.
+  commandAwaitingCts = false;
+  commandStatusReadTriggeredByIrq = false;
+  radioRuntimeDiagnosticsActive = true;
+  diagFmLastReportMs = millis();
   Serial.printf("[RADIO/BOOT] patch=%u ms firmware=%u ms total=%u ms mode=%s irqEdges=%u workspace=%u chunk=%u\n",
                 static_cast<unsigned>(patchUploadMs),
                 static_cast<unsigned>(firmwareUploadMs),
                 static_cast<unsigned>(millis() - radioBeginMs),
-                controlModeName(), static_cast<unsigned>(radioIntbEdgeCount),
+                controlModeName(), static_cast<unsigned>(radioIntbEdges()),
                 static_cast<unsigned>(CHIP_WORKSPACE_BYTES),
                 static_cast<unsigned>(CHIP_HOST_LOAD_PAYLOAD));
   Serial.printf("[RADIO] begin SUCCESS mode=%s firmware=%s heap=%u min=%u\n",
@@ -1502,6 +1673,7 @@ void DAB::setFmFrequency(uint16_t frequency10kHz) {
   fmFrequency10kHz = frequency10kHz;
   lastStatus0 = 0;
   const si468x::Result result = chip.startFmTune(frequency10kHz);
+  finishCommandDiagnostics(result);
   tunePending = result == si468x::Result::Pending || result == si468x::Result::Ok;
   seekPending = false;
   tuneDeadline = millis() + 3000UL;
@@ -1513,6 +1685,7 @@ bool DAB::startFmSeek(bool up) {
   clearFmData();
   lastStatus0 = 0;
   const si468x::Result result = chip.startFmSeek(up, true);
+  finishCommandDiagnostics(result);
   tunePending = result == si468x::Result::Pending || result == si468x::Result::Ok;
   seekPending = tunePending;
   tuneDeadline = millis() + 12000UL;
@@ -1522,7 +1695,11 @@ bool DAB::startFmSeek(bool up) {
 
 void DAB::processFmRds(void) {
   si468x::FmRdsGroup group;
-  if (chip.fmRdsStatus(group, false, false, true, 100000UL) != si468x::Result::Ok) return;
+  ++diagFmRdsStatusCount;
+  const si468x::Result statusResult =
+      chip.fmRdsStatus(group, false, false, true, 100000UL);
+  finishCommandDiagnostics(statusResult);
+  if (statusResult != si468x::Result::Ok) return;
   // Loss of instantaneous RDS sync must not erase a text that was already
   // assembled correctly. A FIFO overrun invalidates only the in-progress
   // assembly; the last published PS/RT remains on screen until replaced.
@@ -1534,7 +1711,10 @@ void DAB::processFmRds(void) {
     memset(fmPsCandidate, 0, sizeof(fmPsCandidate));
     memset(fmPsWork, ' ', 8); fmPsWork[8] = '\0';
     memset(fmRtWork, ' ', 64); fmRtWork[64] = '\0';
-    chip.fmRdsStatus(group, true, true, true, 100000UL);
+    ++diagFmRdsStatusCount;
+    const si468x::Result clearResult =
+        chip.fmRdsStatus(group, true, true, true, 100000UL);
+    finishCommandDiagnostics(clearResult);
     return;
   }
   if (!group.sync) return;
@@ -1685,14 +1865,33 @@ void DAB::processFmRds(void) {
 
 void DAB::updateFm(void) {
   const uint32_t now = millis();
-  if (chip.busy()) return;
+  const bool reportDiagnostics =
+      static_cast<uint32_t>(now - diagFmLastReportMs) >= RADIO_FM_DIAG_INTERVAL_MS;
+  if (chip.busy()) {
+    ++diagFmBusySkipCount;
+    if (reportDiagnostics) {
+      diagFmLastReportMs = now;
+      Serial.printf("[FM/IRQ] edges=%u busySkip=%u rsq=%u rds=%u ctsIrq=%u ctsPoll=%u\n",
+                    static_cast<unsigned>(radioRuntimeIntbEdges()),
+                    static_cast<unsigned>(diagFmBusySkipCount),
+                    static_cast<unsigned>(diagFmRsqStatusCount),
+                    static_cast<unsigned>(diagFmRdsStatusCount),
+                    static_cast<unsigned>(diagCtsIrqCompletionCount),
+                    static_cast<unsigned>(diagCtsPollCompletionCount));
+    }
+    return;
+  }
 
   const bool stc = (lastStatus0 & si468x::INTERRUPT_STC) != 0;
   const bool timedOut = tunePending && static_cast<int32_t>(now - tuneDeadline) >= 0;
   if ((tunePending && (stc || now - fmRsqTimer >= 100U)) ||
       (!tunePending && now - fmRsqTimer >= 250U)) {
     si468x::FmRsqStatus rsq;
-    if (chip.fmRsqStatus(rsq, true, false, timedOut, stc || timedOut, 100000UL) == si468x::Result::Ok) {
+    ++diagFmRsqStatusCount;
+    const si468x::Result rsqResult =
+        chip.fmRsqStatus(rsq, true, false, timedOut, stc || timedOut, 100000UL);
+    finishCommandDiagnostics(rsqResult);
+    if (rsqResult == si468x::Result::Ok) {
       if (isFmFrequencyValid(rsq.frequency10kHz, activeFmRegion))
         fmFrequency10kHz = rsq.frequency10kHz;
       // During tune acquisition the command can return a syntactically valid
@@ -1728,7 +1927,9 @@ void DAB::updateFm(void) {
 
   if (!tunePending && now - fmAcfTimer >= 500U) {
     si468x::FmAcfStatus acf;
-    if (chip.fmAcfStatus(acf, true, 100000UL) == si468x::Result::Ok) {
+    const si468x::Result acfResult = chip.fmAcfStatus(acf, true, 100000UL);
+    finishCommandDiagnostics(acfResult);
+    if (acfResult == si468x::Result::Ok) {
       fmPilot = acf.pilot;
       fmStereoBlend = acf.stereoBlendPercent;
       audiomode = acf.pilot ? 2 : 1;
@@ -1740,6 +1941,17 @@ void DAB::updateFm(void) {
     processFmRds();
     lastStatus0 &= static_cast<uint8_t>(~si468x::INTERRUPT_RDS);
     fmRdsTimer = now;
+  }
+
+  if (reportDiagnostics) {
+    diagFmLastReportMs = now;
+    Serial.printf("[FM/IRQ] edges=%u busySkip=%u rsq=%u rds=%u ctsIrq=%u ctsPoll=%u\n",
+                  static_cast<unsigned>(radioRuntimeIntbEdges()),
+                  static_cast<unsigned>(diagFmBusySkipCount),
+                  static_cast<unsigned>(diagFmRsqStatusCount),
+                  static_cast<unsigned>(diagFmRdsStatusCount),
+                  static_cast<unsigned>(diagCtsIrqCompletionCount),
+                  static_cast<unsigned>(diagCtsPollCompletionCount));
   }
 }
 
@@ -1809,9 +2021,13 @@ void DAB::setService(uint8_t _index) {
 //     service for TPEG-like data components on first activation
 void DAB::Update(void) {
   if (isFm()) {
-    if (radioControlMode == RADIO_CTRL_INTB && radioIntbActive())
+    if (radioControlMode == RADIO_CTRL_INTB && radioIntbActive()) {
+      // Non-blocking tune/seek commands are completed here rather than through
+      // hostIdle(), so record that this CTS service was IRQ-triggered as well.
+      if (commandAwaitingCts) commandStatusReadTriggeredByIrq = true;
       chip.notifyInterrupt();
-    chip.service();
+    }
+    finishCommandDiagnostics(chip.service());
     updateFm();
     return;
   }
