@@ -113,7 +113,6 @@ void Communication(void) {
                 } else if (intValue < radio.numberofservices) {
                   radio.ServiceIndex = intValue;
                   radio.setService(radio.ServiceIndex);
-                  radio.ServiceStart = true;
                   store = true;
                   DataPrint("#0\n*SERVICE=" + String(radio.ServiceIndex) + "\n");
                   DataPrint("$M=SLIDESHOW=0\n");

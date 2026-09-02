@@ -43,17 +43,25 @@ static constexpr size_t CHIP_HOST_LOAD_PAYLOAD =
     (CHIP_WORKSPACE_BYTES - 3U) & ~static_cast<size_t>(3U);
 static uint8_t* chipWorkspace = nullptr;
 static volatile uint8_t lastStatus0;
-static uint8_t legacyLastCommand = 0;
 static volatile bool radioIntbPending = false;
 static volatile uint32_t radioIntbEdgeCount = 0;
 static RadioControlMode radioControlMode = RADIO_CTRL_DETECT;
-static bool radioIntbConfirmed = false;
+enum class RadioIntbCapability : uint8_t {
+  Unknown,
+  Absent,
+  Present
+};
+static RadioIntbCapability radioIntbCapability = RadioIntbCapability::Unknown;
+static bool radioIntbInterruptAttached = false;
 static uint32_t radioBootIrqEdgeCount = 0;
-static bool radioRuntimeIrqTracking = false;
-static bool radioRuntimeIntbConfirmed = false;
 static bool commandAwaitingCts = false;
 static bool commandStatusReadTriggeredByIrq = false;
 static uint32_t commandStartedUs = 0;
+static bool radioPowerUpCtsViaIrq = false;
+static bool radioDabRuntimeActive = false;
+static bool dabStcPending = false;
+static bool dabDsrvPending = false;
+static bool dabDeviceEventPending = false;
 
 // AN649 PIN_CONFIG_ENABLE (0x0800) output-enable bits used by this board.
 // Keep both audio paths enabled; expose INTB only when GPIO12 was detected.
@@ -66,10 +74,12 @@ static constexpr uint16_t RADIO_PIN_CONFIG_AUDIO =
 // Keep INTB as the fast path for real events and retain short, bounded safety
 // polls so a disconnected or faulty application IRQ cannot stall the UI.
 static constexpr uint32_t RADIO_INTB_CTS_SAFETY_US = 2000UL;
-static constexpr uint32_t RADIO_LEGACY_CTS_SAFETY_MS = 2UL;
-static constexpr uint32_t RADIO_DAB_STC_SAFETY_MS = 20UL;
-static constexpr uint32_t RADIO_DAB_STATUS_SAFETY_MS = 50UL;
 static constexpr uint32_t RADIO_FM_DIAG_INTERVAL_MS = 5000UL;
+static constexpr uint32_t RADIO_DAB_DIAG_INTERVAL_MS = 5000UL;
+static constexpr uint32_t RADIO_DAB_TUNE_TIMEOUT_MS = 5000UL;
+static constexpr uint8_t RADIO_DAB_MAX_DSRV_BURST = 4U;
+static constexpr uint16_t RADIO_DAB_EVENT_SERVICE_LIST = 0x0001U;
+static constexpr uint16_t RADIO_DAB_EVENT_RECONFIGURATION = 0x0080U;
 
 // Runtime-only counters. They are reset after each image boot/reuse so the
 // rate-limited FM line compares main-screen and menu behaviour directly.
@@ -80,6 +90,13 @@ static uint32_t diagFmRdsStatusCount = 0;
 static uint32_t diagCtsIrqCompletionCount = 0;
 static uint32_t diagCtsPollCompletionCount = 0;
 static uint32_t diagFmLastReportMs = 0;
+static uint32_t diagDabStcCount = 0;
+static uint32_t diagDabDsrvCount = 0;
+static uint32_t diagDabDsrvOverflowCount = 0;
+static uint32_t diagDabDeviceEventCount = 0;
+static uint32_t diagDabCommandErrorCount = 0;
+static uint32_t diagDabBusySkipCount = 0;
+static uint32_t diagDabLastReportMs = 0;
 
 // Boot diagnostics. HOST_LOAD is intentionally not logged chunk-by-chunk;
 // progress is reported roughly every 64 KiB to keep the UART readable.
@@ -107,15 +124,13 @@ static uint32_t radioRuntimeIntbEdges(void) {
   return radioIntbEdges() - radioBootIrqEdgeCount;
 }
 
-static void confirmRuntimeIntb(void) {
-  if (!radioRuntimeIrqTracking || radioRuntimeIntbConfirmed ||
-      radioControlMode != RADIO_CTRL_INTB || radioRuntimeIntbEdges() == 0U)
-    return;
-
-  radioIntbConfirmed = true;
-  radioRuntimeIntbConfirmed = true;
-  Serial.printf("[RADIO/IRQ] runtime INTB active edges=%u\n",
-                static_cast<unsigned>(radioRuntimeIntbEdges()));
+static void setRadioIntbInterrupt(bool enabled) {
+  if (enabled == radioIntbInterruptAttached) return;
+  if (enabled)
+    attachInterrupt(digitalPinToInterrupt(SI4684_INTB_PIN), radioIntbIsr, FALLING);
+  else
+    detachInterrupt(digitalPinToInterrupt(SI4684_INTB_PIN));
+  radioIntbInterruptAttached = enabled;
 }
 
 static bool radioIntbActive(void) {
@@ -124,20 +139,13 @@ static bool radioIntbActive(void) {
   // falling edge. Foreground code must therefore honor both the latched edge
   // and the current pin level.
   const bool edge = takeRadioIntb();
-  if (edge && !radioIntbConfirmed) {
-    radioIntbConfirmed = true;
-    Serial.printf("[RADIO/IRQ] GPIO12 INTB confirmed by ISR edge #%u\n",
-                  static_cast<unsigned>(radioIntbEdges()));
-  }
-  if (edge) confirmRuntimeIntb();
   return edge || digitalRead(SI4684_INTB_PIN) == LOW;
 }
 
 static void usePollingFallback(const char* reason) {
   if (radioControlMode == RADIO_CTRL_POLL) return;
-  detachInterrupt(digitalPinToInterrupt(SI4684_INTB_PIN));
+  setRadioIntbInterrupt(false);
   radioControlMode = RADIO_CTRL_POLL;
-  radioIntbConfirmed = false;
   chip.setCtsPollIntervalUs(1000);
   chip.setIdleStatusPollIntervalUs(20000);
   Serial.printf("[RADIO/IRQ] %s; polling fallback\n", reason ? reason : "INTB disabled");
@@ -223,7 +231,9 @@ static bool hostReadReply(void*, uint8_t* destination, uint16_t length) {
 
 static uint32_t hostTimeUs(void*) { return micros(); }
 static void hostIdle(void*) {
-  if (radioControlMode == RADIO_CTRL_INTB && radioIntbActive()) {
+  if ((radioControlMode == RADIO_CTRL_INTB ||
+       radioControlMode == RADIO_CTRL_DETECT) &&
+      radioIntbActive()) {
     if (commandAwaitingCts) commandStatusReadTriggeredByIrq = true;
     chip.notifyInterrupt();
   }
@@ -236,16 +246,37 @@ static void statusChanged(void*, const si468x::Status& status) {
   // One callback corresponds to the status read caused by the most recent
   // service decision. Do not carry its trigger into a later safety poll.
   commandStatusReadTriggeredByIrq = false;
+  if (radioDabRuntimeActive) {
+    if (status.stcInt() && !dabStcPending) {
+      dabStcPending = true;
+      ++diagDabStcCount;
+    }
+    if (status.dsrvInt() && !dabDsrvPending) {
+      dabDsrvPending = true;
+      ++diagDabDsrvCount;
+    }
+    if (status.deviceEventInt() && !dabDeviceEventPending) {
+      dabDeviceEventPending = true;
+      ++diagDabDeviceEventCount;
+    }
+  }
+
   if (!commandAwaitingCts || !status.cts()) return;
 
+  if (diagLastCommand == static_cast<uint8_t>(si468x::Command::POWER_UP) &&
+      radioControlMode == RADIO_CTRL_DETECT && irqTriggered)
+    radioPowerUpCtsViaIrq = true;
+
   if (radioRuntimeDiagnosticsActive) {
-    if (radioControlMode == RADIO_CTRL_INTB && irqTriggered)
+    if ((radioControlMode == RADIO_CTRL_INTB ||
+         radioControlMode == RADIO_CTRL_DETECT) && irqTriggered)
       ++diagCtsIrqCompletionCount;
     else
       ++diagCtsPollCompletionCount;
   }
 
-  if (radioControlMode == RADIO_CTRL_INTB && !irqTriggered) {
+  if ((radioControlMode == RADIO_CTRL_INTB ||
+       radioControlMode == RADIO_CTRL_DETECT) && !irqTriggered) {
     // Keep a diagnostic for a genuinely long wait, but do not flood the UART
     // for the normal 2 ms hybrid safety poll.
     if (static_cast<uint32_t>(micros() - commandStartedUs) >= 200000UL)
@@ -269,9 +300,6 @@ static size_t progmemImageReader(void* context, uint32_t offset, uint8_t* destin
   return length;
 }
 
-static void SPIwrite(unsigned char* data, uint32_t length);
-static void SPIread(uint16_t length);
-static void cts(void);
 static void Set_Property(uint16_t property, uint16_t value);
 static String convertToUTF8(const wchar_t* input);
 static String extractUTF8Substring(const String& utf8String, size_t start, size_t length);
@@ -319,134 +347,15 @@ void DAB::vol(uint8_t vol) {
   Set_Property(0x0300, (vol & 0x3F));
 }
 
-// v6 A/B transport test: legacy DAB runtime uses the exact proven SPI model
-// from the stable driver.  This is intentionally separate from the Si468x
-// HostInterface used for POWER_UP/HOST_LOAD/BOOT and identity queries.
-static void SPIwrite(unsigned char* data, uint32_t length) {
-  if (data && length > 0 && data[0] != 0) legacyLastCommand = data[0];
-  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(slaveSelectPin, LOW);
-  SPI.transfer(data, length);
-  digitalWrite(slaveSelectPin, HIGH);
-  SPI.endTransaction();
-}
-
-static void SPIread(uint16_t length) {
-  for (uint16_t i = 0; i < length + 1; i++) SPIbuffer[i] = 0;
-  SPIwrite(SPIbuffer, length + 1);
-}
-
 // SET_PROPERTY (cmd 0x13): write one of the chip's internal properties such
 // as sample rate, audio output config, FIC interrupt source. See AN649 §6.
 static void Set_Property(uint16_t property, uint16_t value) {
-  SPIbuffer[0] = 0x13;
-  SPIbuffer[1] = 0x00;
-  SPIbuffer[2] = property & 0xFF;
-  SPIbuffer[3] = (property >> 8) & 0xFF;
-  SPIbuffer[4] = value & 0xFF;
-  SPIbuffer[5] = (value >> 8) & 0xFF;
-  SPIwrite(SPIbuffer, 6);
-  cts();
-}
-
-static void cts(void) {
-  bool timeout = false;
-  bool irqSeen = false;
-  bool fallbackPoll = false;
-  const uint32_t started = millis();
-  uint32_t nextFallbackPoll = started + RADIO_LEGACY_CTS_SAFETY_MS;
-
-  while (!(SPIbuffer[1] & 0x80)) {
-    bool shouldPoll = radioControlMode != RADIO_CTRL_INTB;
-    if (radioControlMode == RADIO_CTRL_INTB) {
-      if (radioIntbActive()) {
-        irqSeen = true;
-        shouldPoll = true;
-      } else if (static_cast<int32_t>(millis() - nextFallbackPoll) >= 0) {
-        fallbackPoll = true;
-        shouldPoll = true;
-        nextFallbackPoll = millis() + RADIO_LEGACY_CTS_SAFETY_MS;
-      }
-    }
-
-    if (shouldPoll) {
-      if (radioControlMode != RADIO_CTRL_INTB) delay(2);
-      memset(SPIbuffer, 0, 5);
-      SPIwrite(SPIbuffer, 5);
-    } else {
-      delay(1);
-      yield();
-    }
-
-    if (millis() - started >= 1000UL) {
-      timeout = true;
-      break;
-    }
-  }
-
-  if (radioControlMode == RADIO_CTRL_INTB) {
-    // A safety poll is not evidence of a broken INTB line: several application
-    // images simply do not assert every enabled CTS source. Detection is
-    // finalized only after the complete bootloader upload has had a chance to
-    // produce a real ISR edge.
-    (void)fallbackPoll;
-    (void)irqSeen;
-  }
-
-  if (SPIbuffer[1] & 0x40) {
-    Serial.printf("[V7.1/LEGACY] CTS ERR status=0x%02X after cmd=0x%02X\n",
-                  SPIbuffer[1], legacyLastCommand);
-    memset(SPIbuffer, 0, 5);
-  }
-
-  if (timeout && sizeof(SPIbuffer) > 5) {
-    Serial.println("[V7.1/LEGACY] CTS TIMEOUT");
-    SPIbuffer[5] |= (1 << 7);
-  }
-}
-
-static void detectRadioControlMode(bool deferConfirmationToRuntime = false) {
-  // POWER_UP has completed by bounded polling with CTSIEN set. Sample status a
-  // few times before the physical pin so the expected bootloader CTS can
-  // settle. RD_REPLY does not ACK application sticky sources, which is why the
-  // reuse path below accepts LOW and defers confirmation. GPIO12 uses a pull-up.
-  // A high line is only a candidate because an unconnected input also reads
-  // high. When reusing an application image, a legitimate sticky source may
-  // instead keep a connected line low; that path is armed as a candidate too
-  // and is confirmed by the first post-bootstrap command.
-  si468x::Status status;
-  commandAwaitingCts = false;
-  takeRadioIntb();
-  for (uint8_t i = 0; i < 3; ++i) {
-    chip.readStatus(status);
-    delay(1);
-  }
-
-  uint8_t highSamples = 0;
-  for (uint8_t i = 0; i < 12; ++i) {
-    if (digitalRead(SI4684_INTB_PIN) == HIGH) ++highSamples;
-    delay(1);
-  }
-
-  if (deferConfirmationToRuntime || highSamples >= 10U) {
-    radioControlMode = RADIO_CTRL_INTB;
-    radioIntbConfirmed = false;
-    takeRadioIntb();
-    attachInterrupt(digitalPinToInterrupt(SI4684_INTB_PIN), radioIntbIsr, FALLING);
-    // IRQ wakes servicing immediately; the bounded hybrid check remains the
-    // safety path for a disconnected or faulty application interrupt.
-    chip.setCtsPollIntervalUs(RADIO_INTB_CTS_SAFETY_US);
-    chip.setIdleStatusPollIntervalUs(50000);
-    Serial.printf("[RADIO/IRQ] GPIO12 INTB candidate high=%u/12; proof=%s\n",
-                  highSamples,
-                  deferConfirmationToRuntime ? "runtime edge" : "boot edge");
-    Serial.printf("[RADIO/IRQ] hybrid safety polling CTS=%u us events=%u ms\n",
-                  static_cast<unsigned>(RADIO_INTB_CTS_SAFETY_US),
-                  static_cast<unsigned>(RADIO_DAB_STATUS_SAFETY_MS));
-  } else {
-    Serial.printf("[RADIO/IRQ] INTB samples high=%u/12\n", highSamples);
-    usePollingFallback("INTB not detected");
-  }
+  const si468x::Result result = chip.setProperty(property, value);
+  finishCommandDiagnostics(result);
+  if (result != si468x::Result::Ok)
+    Serial.printf("[RADIO/PROP] set 0x%04X=0x%04X failed result=%d\n",
+                  static_cast<unsigned>(property),
+                  static_cast<unsigned>(value), static_cast<int>(result));
 }
 
 RadioControlMode DAB::controlMode(void) const {
@@ -454,7 +363,14 @@ RadioControlMode DAB::controlMode(void) const {
 }
 
 const char* DAB::controlModeName(void) const {
+  if (radioControlMode == RADIO_CTRL_DETECT) return "DETECT";
   return radioControlMode == RADIO_CTRL_INTB ? "INTB" : "POLL";
+}
+
+const char* DAB::intbHardwareName(void) const {
+  if (radioIntbCapability == RadioIntbCapability::Present) return "INTB";
+  if (radioIntbCapability == RadioIntbCapability::Absent) return "Polling";
+  return "Unknown";
 }
 
 void DAB::applyFmRegionProperties(void) {
@@ -517,16 +433,50 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   numberofservices = 0;
   dabRssi10 = 0;
   dabSignalTimer = 0;
+  dabCommand = DabCommand::None;
+  dabCommandRequestId = 0;
+  dabTuneRequestId = 0;
+  dabWaitingTuneRequestId = 0;
+  dabTuneRequestPending = false;
+  dabWaitingForStc = false;
+  dabRequestedServiceId = 0;
+  dabRequestedComponentId = 0;
+  dabActiveServiceId = 0;
+  dabActiveComponentId = 0;
+  dabCommandServiceId = 0;
+  dabCommandComponentId = 0;
+  dabServiceRequestPending = false;
+  dabActiveServiceValid = false;
+  dabSignalRefreshPending = false;
+  dabServiceListRefreshPending = false;
+  dabEnsembleRefreshPending = false;
+  dabTimeRefreshPending = false;
+  dabAudioRefreshPending = false;
+  dabCurrentSubchannelRefreshPending = false;
+  dabCurrentServiceRefreshPending = false;
+  dabServiceTypeScanIndex = 0;
+  dabDataServicePending = false;
+  dabDsrvBurstCount = 0;
   lastStatus0 = 0;
-  // Stop the previous session's ISR before resetting its edge diagnostics.
-  detachInterrupt(digitalPinToInterrupt(SI4684_INTB_PIN));
-  radioControlMode = RADIO_CTRL_DETECT;
-  radioIntbConfirmed = false;
+  radioDabRuntimeActive = false;
+  dabStcPending = false;
+  dabDsrvPending = false;
+  dabDeviceEventPending = false;
+
+  // GPIO12 capability is detected exactly once per ESP32 run. A later
+  // FM/DAB switch or recovery resets the tuner, but restores this immutable HW
+  // result instead of probing the physical connection again.
+  setRadioIntbInterrupt(false);
+  if (radioIntbCapability == RadioIntbCapability::Unknown)
+    radioControlMode = RADIO_CTRL_DETECT;
+  else if (radioIntbCapability == RadioIntbCapability::Present)
+    radioControlMode = RADIO_CTRL_INTB;
+  else
+    radioControlMode = RADIO_CTRL_POLL;
   __atomic_store_n(&radioIntbPending, false, __ATOMIC_RELEASE);
   __atomic_store_n(&radioIntbEdgeCount, 0U, __ATOMIC_RELEASE);
   radioBootIrqEdgeCount = 0;
-  radioRuntimeIrqTracking = false;
-  radioRuntimeIntbConfirmed = false;
+  radioPowerUpCtsViaIrq = false;
   radioRuntimeDiagnosticsActive = false;
   diagFmBusySkipCount = 0;
   diagFmRsqStatusCount = 0;
@@ -534,9 +484,24 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   diagCtsIrqCompletionCount = 0;
   diagCtsPollCompletionCount = 0;
   diagFmLastReportMs = 0;
+  diagDabStcCount = 0;
+  diagDabDsrvCount = 0;
+  diagDabDsrvOverflowCount = 0;
+  diagDabDeviceEventCount = 0;
+  diagDabCommandErrorCount = 0;
+  diagDabBusySkipCount = 0;
+  diagDabLastReportMs = 0;
   // GPIO12 is MTDI on classic ESP32. Hardware using it for INTB must have
   // VDD_SDIO fixed safely at 3.3 V; firmware never reads or writes eFuse.
   pinMode(SI4684_INTB_PIN, INPUT_PULLUP);
+  if (radioControlMode != RADIO_CTRL_POLL) setRadioIntbInterrupt(true);
+  if (radioControlMode == RADIO_CTRL_DETECT)
+    Serial.println("[RADIO/IRQ] detecting INTB on GPIO12");
+  else
+    Serial.printf("[RADIO/IRQ] reusing startup HW capability=%s\n",
+                  radioIntbCapability == RadioIntbCapability::Present
+                      ? "INTB"
+                      : "POLL");
 
   pinMode(slaveSelectPin, OUTPUT);
   digitalWrite(slaveSelectPin, HIGH);
@@ -560,11 +525,16 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   chip.setHost(host);
   chip.setWorkspace(chipWorkspace, CHIP_WORKSPACE_BYTES);
   chip.setStatusCallback(statusChanged);
-  chip.setCtsPollIntervalUs(1000);
-  chip.setIdleStatusPollIntervalUs(20000);
-  Serial.printf("[RADIO/BOOT] workspace=%u chunk=%u CTS bootstrap=poll\n",
+  chip.setCtsPollIntervalUs(radioControlMode == RADIO_CTRL_INTB
+                                ? RADIO_INTB_CTS_SAFETY_US
+                                : 1000UL);
+  chip.setIdleStatusPollIntervalUs(radioControlMode == RADIO_CTRL_INTB
+                                       ? 50000UL
+                                       : 20000UL);
+  Serial.printf("[RADIO/BOOT] workspace=%u chunk=%u CTS bootstrap=%s\n",
                 static_cast<unsigned>(CHIP_WORKSPACE_BYTES),
-                static_cast<unsigned>(CHIP_HOST_LOAD_PAYLOAD));
+                static_cast<unsigned>(CHIP_HOST_LOAD_PAYLOAD),
+                controlModeName());
 
   // Check which image is already running before POWER_UP. This is important on
   // this PCB because resetting/reflashing the ESP32 does not necessarily reset
@@ -591,6 +561,10 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   // opposite application image is active, refuse here; mode switching is kept
   // separate from this startup test because GPIO17 also resets the TFT.
   if (reuseRunningImage) {
+    if (radioIntbCapability == RadioIntbCapability::Unknown) {
+      Serial.println("[RADIO/IRQ] running image without startup POWER_UP; INTB detection inconclusive");
+      return false;
+    }
     Serial.printf("[RADIO] V9 active image already matches requested=%u - REUSE, no POWER_UP/upload\n",
                   static_cast<unsigned>(expected));
   } else if (preResult == si468x::Result::Ok &&
@@ -604,8 +578,9 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   }
 
   si468x::PowerUpConfig power;
-  // The first POWER_UP still completes by polling. CTSIEN only enables the
-  // chip output so GPIO12 can be evaluated safely afterwards.
+  // During the first ESP32 boot DETECT is a real hybrid IRQ+poll mode. The
+  // FALLING edge both proves the physical connection and wakes the same
+  // generic command engine that completes POWER_UP.
   power.ctsInterruptEnable = true;
   power.clockMode = 1;
   power.trSize = 7;
@@ -617,8 +592,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   // V15 clean A/B test:
   //   FM  -> FMHD 5.3.3 (unchanged)
   //   DAB -> DAB 6.0.9 (only firmware-image change versus V14.1)
-  // Reset handling, TFT recovery, patch, SPI transport and legacy DAB runtime
-  // commands are intentionally unchanged.
+  // Reset handling, TFT recovery, patch and SPI timing remain unchanged.
   const uint8_t* image =
       requestedMode == RADIO_MODE_FM ? si468x_fmhd_5_3_3 : si468x_dab_6_0_9;
   const uint32_t imageSize =
@@ -634,8 +608,31 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
                   static_cast<unsigned>(imageSize));
     const uint32_t bootStartMs = millis();
 
+    if (radioIntbCapability == RadioIntbCapability::Unknown) {
+      // The proof must belong to this POWER_UP, not to the pre-flight status
+      // query or to a stale level left by an earlier device state.
+      __atomic_store_n(&radioIntbPending, false, __ATOMIC_RELEASE);
+      __atomic_store_n(&radioIntbEdgeCount, 0U, __ATOMIC_RELEASE);
+      radioPowerUpCtsViaIrq = false;
+    }
     result = chip.powerUp(power, 1000000UL);
-    if (result == si468x::Result::Ok) detectRadioControlMode();
+    if (radioIntbCapability == RadioIntbCapability::Unknown) {
+      if (result != si468x::Result::Ok) {
+        Serial.println("[RADIO/IRQ] POWER_UP failed; INTB detection inconclusive");
+      } else if (radioIntbEdges() > 0U) {
+        radioIntbCapability = RadioIntbCapability::Present;
+        radioControlMode = RADIO_CTRL_INTB;
+        chip.setCtsPollIntervalUs(RADIO_INTB_CTS_SAFETY_US);
+        chip.setIdleStatusPollIntervalUs(50000UL);
+        Serial.printf("[RADIO/IRQ] POWER_UP CTS via %s\n",
+                      radioPowerUpCtsViaIrq ? "INTB" : "safety poll");
+        Serial.println("[RADIO/IRQ] INTB connected; IRQ mode");
+      } else {
+        radioIntbCapability = RadioIntbCapability::Absent;
+        Serial.println("[RADIO/IRQ] POWER_UP completed by polling");
+        usePollingFallback("no INTB edge");
+      }
+    }
 
     const uint32_t patchStartMs = millis();
     if (result == si468x::Result::Ok) result = chip.loadInit(1000000UL);
@@ -666,33 +663,13 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
       return false;
     }
 
-    // With INPUT_PULLUP an unconnected GPIO12 also looks inactive/high. Do not
-    // reject the candidate after a few fast safety polls; wait until the whole
-    // bootloader transfer has completed. A real ISR edge during that window is
-    // the distinguishing proof required before About reports INTB.
-    if (radioControlMode == RADIO_CTRL_INTB && !radioIntbConfirmed) {
-      const uint32_t bootIrqEdges =
-          __atomic_load_n(&radioIntbEdgeCount, __ATOMIC_ACQUIRE);
-      if (bootIrqEdges > 0U) {
-        radioIntbConfirmed = true;
-        Serial.printf("[RADIO/IRQ] GPIO12 INTB confirmed after upload; ISR edges=%u\n",
-                      static_cast<unsigned>(bootIrqEdges));
-      } else {
-        usePollingFallback("INTB candidate produced no bootloader ISR edge");
-      }
-    }
   } else {
     Serial.println("[RADIO] V9 bootHostImage skipped; preserving running image and TFT state");
-    // Existing application sources may hold INTB low and RD_REPLY does not ACK
-    // them. Arm GPIO12 here and let the polling bootstrap plus GET_PART_INFO
-    // provide the deterministic edge/no-edge proof.
-    detectRadioControlMode(true);
   }
 
-  // Everything through BOOT belongs to the bootloader IRQ phase. From here on
-  // the edge delta proves that the loaded FM/DAB image drives INTB as well.
+  // Everything through BOOT belongs to the bootloader diagnostic phase. The
+  // edge delta below is runtime telemetry only; it never reclassifies HW.
   radioBootIrqEdgeCount = radioIntbEdges();
-  radioRuntimeIrqTracking = true;
   Serial.printf("[RADIO/IRQ] boot INTB edges=%u\n",
                 static_cast<unsigned>(radioBootIrqEdgeCount));
 
@@ -700,7 +677,8 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   // before enabling its CTS source. While doing so, force the common transport
   // into polling: the commands which create runtime IRQ signalling cannot
   // depend on that signalling for their own completion.
-  const bool runtimeIntbRequested = radioControlMode == RADIO_CTRL_INTB;
+  const bool runtimeIntbRequested =
+      radioIntbCapability == RadioIntbCapability::Present;
   const uint16_t pinConfig = RADIO_PIN_CONFIG_AUDIO |
       (runtimeIntbRequested ? RADIO_PIN_CONFIG_INTBOUTEN : 0U);
   if (runtimeIntbRequested) radioControlMode = RADIO_CTRL_POLL;
@@ -737,12 +715,10 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     if (pinConfigResult == si468x::Result::Ok &&
         runtimeCtsResult == si468x::Result::Ok &&
         pendingStatusResult == si468x::Result::Ok) {
-      confirmRuntimeIntb();
       takeRadioIntb();
       chip.setCtsPollIntervalUs(RADIO_INTB_CTS_SAFETY_US);
       chip.setIdleStatusPollIntervalUs(50000);
-      if (!radioRuntimeIntbConfirmed)
-        Serial.println("[RADIO/IRQ] runtime INTB armed; awaiting post-BOOT edge");
+      Serial.println("[RADIO/IRQ] runtime INTB armed");
     } else {
       useRuntimePollingFallback("runtime INTB bootstrap failed");
     }
@@ -762,16 +738,6 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
                 static_cast<int>(result),
                 result == si468x::Result::Ok ? static_cast<unsigned>(part.partNumber) : 0U,
                 static_cast<unsigned>(lastStatus0));
-  // On a reused application image there were no bootloader edges available to
-  // distinguish a connected INTB from an unconnected INPUT_PULLUP. The first
-  // post-bootstrap command is the deterministic runtime proof.
-  if (result == si468x::Result::Ok && reuseRunningImage &&
-      radioControlMode == RADIO_CTRL_INTB && !radioIntbConfirmed) {
-    delay(1);
-    confirmRuntimeIntb();
-    if (!radioIntbConfirmed)
-      useRuntimePollingFallback("INTB candidate produced no runtime ISR edge");
-  }
   if (result != si468x::Result::Ok || part.partNumber != 4684) {
     Serial.println("[RADIO] ERROR: GET_PART_INFO failed or part != 4684");
     return false;
@@ -818,46 +784,57 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   Serial.println("[RADIO] shared properties done");
 
   if (requestedMode == RADIO_MODE_DAB) {
-    Serial.println("[RADIO] DAB frequency list + properties (V9 legacy transport)");
-    SPIbuffer[0] = 0xB8;
-    SPIbuffer[1] = 0x26;
-    SPIbuffer[2] = 0x00;
-    SPIbuffer[3] = 0x00;
-    for (uint8_t i = 0; i < 38; ++i) {
-      const uint32_t f = DABfrequencyTable_DAB[i].frequency;
-      SPIbuffer[4 + (i * 4)] = f & 0xFF;
-      SPIbuffer[5 + (i * 4)] = (f >> 8) & 0xFF;
-      SPIbuffer[6 + (i * 4)] = (f >> 16) & 0xFF;
-      SPIbuffer[7 + (i * 4)] = (f >> 24) & 0xFF;
-    }
-    SPIwrite(SPIbuffer, 4 + (38 * 4));
-    cts();
-    Set_Property(0x8100, 0x0001);
-    Set_Property(0x8101, 0x0064);
-    Set_Property(0xB200, 0x0000);
-    Set_Property(0xB201, 0x0080);
-    Set_Property(0xB301, 0x0000);
-    Set_Property(0xB302, 0x0000);
-    Set_Property(0xB303, 0x0000);
-    Set_Property(0xB400, 0x0097);
-    Set_Property(0xB401, 0x0002);
-    Set_Property(0xB500, 0x0000);
+    Serial.println("[RADIO] DAB frequency list + generic properties");
+    uint32_t frequencies[38];
+    for (uint8_t i = 0; i < 38; ++i)
+      frequencies[i] = DABfrequencyTable_DAB[i].frequency;
+    const si468x::Result frequencyListResult =
+        chip.dabSetFrequencyList(frequencies, 38);
+
+    const si468x::Result dsrvSourceResult =
+        chip.setDigitalServiceInterruptSource(
+            si468x::DSRV_INTERRUPT_PACKET_READY |
+            si468x::DSRV_INTERRUPT_OVERFLOW);
+    const si468x::Result dsrvRepeatResult =
+        chip.setInterruptRepeat(si468x::INTERRUPT_DSRV);
+    const si468x::Result dabEventSourceResult = chip.setProperty(
+        si468x::Property::DAB_EVENT_INTERRUPT_SOURCE,
+        RADIO_DAB_EVENT_SERVICE_LIST |
+            RADIO_DAB_EVENT_RECONFIGURATION);
+    Set_Property(static_cast<uint16_t>(si468x::Property::DIGITAL_SERVICE_RESTART_DELAY), 0x0064);
+    Set_Property(static_cast<uint16_t>(si468x::Property::DAB_VALID_RSSI_TIME), 0x0000);
+    Set_Property(static_cast<uint16_t>(si468x::Property::DAB_VALID_RSSI_THRESHOLD), 0x0080);
+    Set_Property(static_cast<uint16_t>(si468x::Property::DAB_EVENT_MIN_SVRLIST_PERIOD), 0x0000);
+    Set_Property(static_cast<uint16_t>(si468x::Property::DAB_EVENT_MIN_SVRLIST_PERIOD_RECONFIG), 0x0000);
+    Set_Property(static_cast<uint16_t>(si468x::Property::DAB_EVENT_MIN_FREQINFO_PERIOD), 0x0000);
+    Set_Property(static_cast<uint16_t>(si468x::Property::DAB_XPAD_ENABLE), 0x0097);
+    Set_Property(static_cast<uint16_t>(si468x::Property::DAB_DRC_OPTION), 0x0002);
+    Set_Property(static_cast<uint16_t>(si468x::Property::DAB_CTRL_DAB_MUTE_ENABLE), 0x0000);
     const uint16_t interruptSources =
         si468x::INTERRUPT_CTS | si468x::INTERRUPT_STC |
-        si468x::INTERRUPT_DSRV | si468x::INTERRUPT_DACQ;
+        si468x::INTERRUPT_DSRV | si468x::INTERRUPT_DEVICE_EVENT;
     const si468x::Result irqResult = chip.setInterruptEnable(interruptSources);
     si468x::Status irqStatus;
     const si468x::Result irqStatusResult =
         irqResult == si468x::Result::Ok
             ? chip.readStatus(irqStatus)
             : irqResult;
-    confirmRuntimeIntb();
     takeRadioIntb();
-    Serial.printf("[RADIO/IRQ] runtime sources=0x%04X mode=DAB result=%d read=%d\n",
+    Serial.printf("[RADIO/IRQ] DAB freq=%d sources=0x%04X repeat=0x%04X dsrv=0x%04X event=0x%04X irq=%d read=%d\n",
+                  static_cast<int>(frequencyListResult),
                   static_cast<unsigned>(interruptSources),
+                  static_cast<unsigned>(si468x::INTERRUPT_DSRV),
+                  static_cast<unsigned>(si468x::DSRV_INTERRUPT_PACKET_READY |
+                                        si468x::DSRV_INTERRUPT_OVERFLOW),
+                  static_cast<unsigned>(RADIO_DAB_EVENT_SERVICE_LIST |
+                                        RADIO_DAB_EVENT_RECONFIGURATION),
                   static_cast<int>(irqResult),
                   static_cast<int>(irqStatusResult));
-    if (irqResult != si468x::Result::Ok ||
+    if (frequencyListResult != si468x::Result::Ok ||
+        dsrvSourceResult != si468x::Result::Ok ||
+        dsrvRepeatResult != si468x::Result::Ok ||
+        dabEventSourceResult != si468x::Result::Ok ||
+        irqResult != si468x::Result::Ok ||
         irqStatusResult != si468x::Result::Ok)
       useRuntimePollingFallback("DAB interrupt-source configuration failed");
   } else {
@@ -879,7 +856,6 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
         irqResult == si468x::Result::Ok
             ? chip.readStatus(irqStatus)
             : irqResult;
-    confirmRuntimeIntb();
     takeRadioIntb();
     Serial.printf("[RADIO/IRQ] runtime sources=0x%04X mode=FM result=%d read=%d\n",
                   static_cast<unsigned>(interruptSources),
@@ -897,6 +873,8 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   commandStatusReadTriggeredByIrq = false;
   radioRuntimeDiagnosticsActive = true;
   diagFmLastReportMs = millis();
+  diagDabLastReportMs = millis();
+  radioDabRuntimeActive = requestedMode == RADIO_MODE_DAB;
   Serial.printf("[RADIO/BOOT] patch=%u ms firmware=%u ms total=%u ms mode=%s irqEdges=%u workspace=%u chunk=%u\n",
                 static_cast<unsigned>(patchUploadMs),
                 static_cast<unsigned>(firmwareUploadMs),
@@ -910,176 +888,74 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   return true;
 }
 
-// Query DAB ensemble information (RSSI, CNR, FIC quality, sample/lock state,
-// EID, ensemble label) and populate the public fields. Also fetches the
-// service list when freshly locked. Called periodically from Update().
+// Queue a cooperative DAB metadata refresh. The scheduler starts the actual
+// commands one by one after the generic transport becomes idle.
 void DAB::EnsembleInfo(void) {
-  static bool lastSignalLock = false;
-  static uint8_t lastFic = 0;
+  dabSignalRefreshPending = true;
+}
 
-  SPIbuffer[0] = 0xB2;  // Get signalstatus
-  SPIbuffer[1] = 0x09;
-  SPIwrite(SPIbuffer, 2);
-  cts();
-  SPIread(19);
-  // RD_REPLY adds one SPI framing byte before the documented 23-byte
-  // DAB_DIGRAD_STATUS reply. RSSI is therefore reply[6] -> SPIbuffer[7].
-  // It is signed dBuV and the GUI uses tenths of a dB.
-  dabRssi10 = static_cast<int16_t>(static_cast<int8_t>(SPIbuffer[7])) * 10;
-  fic = SPIbuffer[9] > 100U ? 100U : SPIbuffer[9];
-  cnr = SPIbuffer[10];
-  const bool dabValid = (SPIbuffer[6] & 0x01U) != 0;
-  const bool dabAcquired = (SPIbuffer[6] & 0x04U) != 0;
-  signallock = dabValid && dabAcquired;
+void DAB::parseDabServiceListReply(uint16_t replyLength) {
+  if (replyLength < 9U) return;
+  const uint16_t listSize = static_cast<uint16_t>(SPIbuffer[5]) |
+                            (static_cast<uint16_t>(SPIbuffer[6]) << 8);
+  if (static_cast<uint32_t>(listSize) + 6U > replyLength) return;
 
-  // Log signal changes
-  if (signallock != lastSignalLock) {
-    lastSignalLock = signallock;
+  const uint8_t parsedServices = SPIbuffer[9];
+  if (parsedServices > sizeof(service) / sizeof(DABService)) {
+    clearData();
+    numberofservices = 0;
+    return;
   }
 
-  lastFic = fic;
-  if (signallock) {
-    SPIbuffer[0] = 0x80;  // Get servicelist
-    SPIbuffer[1] = 0x00;
-    SPIwrite(SPIbuffer, 2);
-    cts();
-    SPIread(8);
+  numberofservices = parsedServices;
+  uint16_t offset = 13U;
+  for (uint8_t i = 0; i < numberofservices; ++i) {
+    if (static_cast<uint32_t>(offset) + 24U > replyLength + 1U) {
+      clearData();
+      numberofservices = 0;
+      return;
+    }
 
-    if (SPIbuffer[5] + (SPIbuffer[6] << 8) + 6 < sizeof(SPIbuffer)) {
-      SPIread(SPIbuffer[5] + (SPIbuffer[6] << 8) + 6);
-      uint8_t numberofcomponents;
+    serviceID = static_cast<uint32_t>(SPIbuffer[offset]) |
+                (static_cast<uint32_t>(SPIbuffer[offset + 1]) << 8) |
+                (static_cast<uint32_t>(SPIbuffer[offset + 2]) << 16) |
+                (static_cast<uint32_t>(SPIbuffer[offset + 3]) << 24);
+    const uint8_t numberOfComponents = SPIbuffer[offset + 5] & 0x0FU;
+    memcpy(service[i].Label, &SPIbuffer[offset + 8], 16);
+    service[i].Label[16] = '\0';
+    for (int8_t j = 15; j >= 0 && service[i].Label[j] == ' '; --j)
+      service[i].Label[j] = '\0';
+    offset = static_cast<uint16_t>(offset + 24U);
 
-      numberofservices = SPIbuffer[9];
-      if (numberofservices > sizeof(service) / sizeof(DABService)) {
-        clearData();  // Handle overflow when signal is crappy
+    componentID = 0;
+    for (uint8_t j = 0; j < numberOfComponents; ++j) {
+      if (static_cast<uint32_t>(offset) + 4U > replyLength + 1U) {
+        clearData();
         numberofservices = 0;
         return;
       }
-
-      uint16_t offset = 13;
-
-      for (uint8_t i = 0; i < numberofservices; i++) {
-        if (i >= sizeof(service) / sizeof(DABService)) {
-          clearData();  // Handle overflow when signal is crappy
-          numberofservices = 0;
-          return;
-        }
-
-        serviceID = SPIbuffer[offset + 3];
-        serviceID <<= 8;
-        serviceID += SPIbuffer[offset + 2];
-        serviceID <<= 8;
-        serviceID += SPIbuffer[offset + 1];
-        serviceID <<= 8;
-        serviceID += SPIbuffer[offset];
-        componentID = 0;
-
-        numberofcomponents = SPIbuffer[offset + 5] & 0x0F;
-
-        for (uint16_t j = 0; j < 16; j++) service[i].Label[j] = SPIbuffer[offset + 8 + j];
-
-        for (int16_t j = 15; j >= 0; j--) {
-          if (service[i].Label[j] == ' ' && service[i].Label[j + 1] == '\0') {
-            service[i].Label[j] = '\0';
-          } else {
-            break;
-          }
-        }
-        offset += 24;
-
-        for (uint16_t j = 0; j < numberofcomponents; j++) {
-          if (j == 0) {
-            componentID = SPIbuffer[offset + 3];
-            componentID <<= 8;
-            componentID += SPIbuffer[offset + 2];
-            componentID <<= 8;
-            componentID += SPIbuffer[offset + 1];
-            componentID <<= 8;
-            componentID += SPIbuffer[offset];
-          }
-          offset += 4;
-        }
-        service[i].ServiceID = serviceID;
-        service[i].CompID = componentID;
+      if (j == 0) {
+        componentID = static_cast<uint32_t>(SPIbuffer[offset]) |
+                      (static_cast<uint32_t>(SPIbuffer[offset + 1]) << 8) |
+                      (static_cast<uint32_t>(SPIbuffer[offset + 2]) << 16) |
+                      (static_cast<uint32_t>(SPIbuffer[offset + 3]) << 24);
       }
-
-
-      if (numberofservices > 0) {
-        qsort(service, numberofservices, sizeof(DABService), compareCompID);
-
-        if (CurrentServiceID != service[ServiceIndex].ServiceID) {
-          for (byte x = 0; x < numberofservices; x++) {
-            if (CurrentServiceID == service[x].ServiceID) {
-              ServiceIndex = x;
-              break;
-            }
-          }
-        }
-      }
-
-      for (byte i = 0; i < 5; i++) SPIbuffer[i] = 0;
-      SPIwrite(SPIbuffer, 5);
-
-      SPIbuffer[0] = 0xB4;
-      SPIbuffer[1] = 0x00;
-      SPIwrite(SPIbuffer, 2);
-      cts();
-      SPIread(26);
-
-      uint16_t eidRaw = ((uint16_t)SPIbuffer[6] << 8) | SPIbuffer[5];
-      if (eidRaw != 0x0000 && eidRaw != 0xFFFF) {
-        EnsembleInfoSet = true;
-
-        // Only set EID/EnsembleLabel/ECC once after tuning; they don't change on the same frequency
-        // This prevents corrupted data during marginal signal from overwriting valid values
-        if (EID[0] == '\0' || EnsembleLabel[0] == '\0') {
-          EID[2] = (SPIbuffer[5] & 0xF0) >> 4;
-          EID[3] = (SPIbuffer[5] & 0x0F);
-          EID[0] = (SPIbuffer[6] & 0xF0) >> 4;
-          EID[1] = (SPIbuffer[6] & 0x0F);
-          EID[4] = '\0';
-
-          for (int i = 0; i < 4; i++) {
-            if (EID[i] < 10) {
-              EID[i] += '0';
-            } else {
-              EID[i] += 'A' - 10;
-            }
-          }
-          for (uint8_t i = 0; i < 16 && SPIbuffer[7 + i] != '\0'; i++) {
-            EnsembleLabel[i] = static_cast<char>(SPIbuffer[7 + i]);
-          }
-          EnsembleLabel[16] = '\0';
-
-          for (int8_t i = 15; i >= 0; i--) {
-            if (EnsembleLabel[i] == ' ' && EnsembleLabel[i + 1] == '\0') {
-              EnsembleLabel[i] = '\0';
-            } else {
-              break;
-            }
-          }
-          EnsembleLabelCharset = SPIbuffer[24];
-        }
-        if (ensembleEcc == 0 && SPIbuffer[23] != 0) {
-          ensembleEcc = SPIbuffer[23];
-        }
-      } else {
-        EnsembleInfoSet = false;
-      }
+      offset = static_cast<uint16_t>(offset + 4U);
     }
-    SPIbuffer[0] = 0xBC;
-    SPIbuffer[1] = 0x00;
-    SPIwrite(SPIbuffer, 2);
-    cts();
-    SPIread(11);
+    service[i].ServiceID = serviceID;
+    service[i].CompID = componentID;
+    service[i].ServiceType = 0;
+  }
 
-    if (!bitRead(SPIbuffer[1], 6)) {
-      Year = SPIbuffer[5] + ((uint16_t)SPIbuffer[6] << 8);
-      Months = SPIbuffer[7];
-      Days = SPIbuffer[8];
-      Hours = SPIbuffer[9];
-      Minutes = SPIbuffer[10];
-      Seconds = SPIbuffer[11];
+  if (numberofservices == 0) return;
+  qsort(service, numberofservices, sizeof(DABService), compareCompID);
+  if (ServiceIndex >= numberofservices) ServiceIndex = 0;
+  if (CurrentServiceID != service[ServiceIndex].ServiceID) {
+    for (uint8_t i = 0; i < numberofservices; ++i) {
+      if (CurrentServiceID == service[i].ServiceID) {
+        ServiceIndex = i;
+        break;
+      }
     }
   }
 }
@@ -1093,19 +969,16 @@ void DAB::getServiceData(void) {
   uint32_t byte_count = 0;
   uint32_t byte_number = 0;
 
-  // DAB runtime uses legacy direct-SPI polling. DSRV must therefore come
-  // from the directly-polled status byte, not lastStatus0 from chip.service().
-  if (bitRead(SPIbuffer[1], 4)) {
-    SPIbuffer[0] = 0x84;
-    SPIbuffer[1] = 0x01;
-    SPIwrite(SPIbuffer, 2);
-    cts();
-    SPIread(20);
-
-    if ((SPIbuffer[19] + (SPIbuffer[20] << 8)) + 24 < sizeof(SPIbuffer)) {
-      if ((SPIbuffer[19] + (SPIbuffer[20] << 8)) > 0) {
-        cts();
-        SPIread((SPIbuffer[19] + (SPIbuffer[20] << 8)) + 24);
+  // finishDabCommand() has already fetched and parsed the fixed 24-byte DSRV
+  // header into SPIbuffer[1..24]. Re-read the preserved reply at full length
+  // only when its payload fits the shared 4 KiB buffer.
+  byte_count = SPIbuffer[19] + (static_cast<uint32_t>(SPIbuffer[20]) << 8);
+  if (byte_count + 24U < sizeof(SPIbuffer)) {
+    if (byte_count > 0) {
+      const si468x::Result readResult = chip.readCurrentReply(
+          SPIbuffer + 1, static_cast<uint16_t>(byte_count + 24U));
+      finishCommandDiagnostics(readResult);
+      if (readResult == si468x::Result::Ok) {
         byte_count = SPIbuffer[19] + (SPIbuffer[20] << 8);
 
         // Read Radiotext
@@ -1448,94 +1321,10 @@ void DAB::assembleSlideshow(void) {
 // time/date, protection level) for the currently selected service. The
 // service list itself is filled in EnsembleInfo().
 void DAB::ServiceInfo(void) {
-  for (byte x = 0; x < numberofservices; x++) {
-    SPIbuffer[0] = 0xBE;
-    SPIbuffer[1] = 0x00;
-    SPIbuffer[2] = 0x00;
-    SPIbuffer[3] = 0x00;
-    SPIbuffer[4] = service[x].ServiceID & 0xFF;
-    SPIbuffer[5] = (service[x].ServiceID >> 8) & 0xFF;
-    SPIbuffer[6] = (service[x].ServiceID >> 16) & 0xFF;
-    SPIbuffer[7] = (service[x].ServiceID >> 24) & 0xFF;
-    SPIbuffer[8] = service[x].CompID & 0xFF;
-    SPIbuffer[9] = (service[x].CompID >> 8) & 0xFF;
-    SPIbuffer[10] = (service[x].CompID >> 16) & 0xFF;
-    SPIbuffer[11] = (service[x].CompID >> 24) & 0xFF;
-    SPIwrite(SPIbuffer, 12);
-    cts();
-    SPIread(12);
-    service[x].ServiceType = SPIbuffer[5];
-  }
-
-  if (ServiceStart) {
-    SPIbuffer[0] = 0xBD;
-    SPIbuffer[1] = 0x00;
-    SPIwrite(SPIbuffer, 2);
-    cts();
-    SPIread(16);
-
-    if (SPIbuffer[1] == 0x80) {
-      bitrate = SPIbuffer[5] + (SPIbuffer[6] << 8);
-      samplerate = SPIbuffer[7] + (SPIbuffer[8] << 8);
-      audiomode = SPIbuffer[9] & 0x03;
-    }
-
-    SPIbuffer[0] = 0xBE;
-    SPIbuffer[1] = 0x00;
-    SPIbuffer[2] = 0x00;
-    SPIbuffer[3] = 0x00;
-    SPIbuffer[4] = service[ServiceIndex].ServiceID & 0xFF;
-    SPIbuffer[5] = (service[ServiceIndex].ServiceID >> 8) & 0xFF;
-    SPIbuffer[6] = (service[ServiceIndex].ServiceID >> 16) & 0xFF;
-    SPIbuffer[7] = (service[ServiceIndex].ServiceID >> 24) & 0xFF;
-    SPIbuffer[8] = service[ServiceIndex].CompID & 0xFF;
-    SPIbuffer[9] = (service[ServiceIndex].CompID >> 8) & 0xFF;
-    SPIbuffer[10] = (service[ServiceIndex].CompID >> 16) & 0xFF;
-    SPIbuffer[11] = (service[ServiceIndex].CompID >> 24) & 0xFF;
-    SPIwrite(SPIbuffer, 12);
-    cts();
-    SPIread(12);
-
-    if (SPIbuffer[1] == 0x80) {
-      servicetype = SPIbuffer[5];
-      protectionlevel = SPIbuffer[6];
-    }
-
-    SPIbuffer[0] = 0xC0;
-    SPIbuffer[1] = 0x00;
-    SPIbuffer[2] = 0x00;
-    SPIbuffer[3] = 0x00;
-    SPIbuffer[4] = service[ServiceIndex].ServiceID & 0xFF;
-    SPIbuffer[5] = (service[ServiceIndex].ServiceID >> 8) & 0xFF;
-    SPIbuffer[6] = (service[ServiceIndex].ServiceID >> 16) & 0xFF;
-    SPIbuffer[7] = (service[ServiceIndex].ServiceID >> 24) & 0xFF;
-    SPIwrite(SPIbuffer, 8);
-    cts();
-    SPIread(26);
-
-    if (SPIbuffer[1] == 0x80) {
-      for (byte x = 9; x < 25; x++) PStext[x - 9] = SPIbuffer[x];
-
-      for (int8_t i = 15; i >= 0; i--) {
-        if (PStext[i] == ' ' && PStext[i + 1] == '\0') {
-          PStext[i] = '\0';
-        } else {
-          break;
-        }
-      }
-
-      pty = (SPIbuffer[5] >> 1) & 0x1F;
-      ServiceLabelCharset = SPIbuffer[7];
-
-      // Use service ECC if available, otherwise fall back to ensemble ECC
-      // Only set once after service start to prevent corruption during marginal signal
-      if (ecc == 0) {
-        uint8_t srvEcc = SPIbuffer[8];
-        serviceHasOwnEcc = (srvEcc != 0);
-        ecc = serviceHasOwnEcc ? srvEcc : ensembleEcc;
-      }
-    }
-  }
+  if (!dabActiveServiceValid) return;
+  dabAudioRefreshPending = true;
+  dabCurrentSubchannelRefreshPending = true;
+  dabCurrentServiceRefreshPending = true;
 }
 
 // Wipe every cached metadata field. Called when re-tuning so stale labels,
@@ -1554,7 +1343,6 @@ void DAB::clearData(void) {
 // no multi-second polling loop here.
 void DAB::setFreq(uint8_t freq) {
   if (isFm()) return;
-  memset(SPIbuffer, 0, sizeof(SPIbuffer));
   DataUpdate -= 1000;
   numberofservices = 0;
   clearData();
@@ -1589,50 +1377,21 @@ void DAB::setFreq(uint8_t freq) {
   cnr = 0;
   lastStatus0 = 0;
 
-  // V7: exact legacy DAB_TUNE_FREQ transaction from stable commit 4fab606.
-  SPIbuffer[0] = 0xB0;
-  SPIbuffer[1] = 0x00;
-  SPIbuffer[2] = freq;
-  SPIbuffer[3] = 0x00;
-  SPIbuffer[4] = 0x00;
-  SPIbuffer[5] = 0x00;
-  Serial.printf("[V7/LEGACY] DAB_TUNE_FREQ B0 00 %02X 00 00 00\n", freq);
-  SPIwrite(SPIbuffer, 6);
-  cts();
-
-  const uint32_t stcStartMs = millis();
-  uint32_t nextStcFallbackMs = stcStartMs + RADIO_DAB_STC_SAFETY_MS;
-  while (bitRead(SPIbuffer[1], 0) == false) {
-    bool shouldPoll = radioControlMode != RADIO_CTRL_INTB;
-    if (radioControlMode == RADIO_CTRL_INTB) {
-      if (radioIntbActive()) {
-        shouldPoll = true;
-      } else if (static_cast<int32_t>(millis() - nextStcFallbackMs) >= 0) {
-        shouldPoll = true;
-        nextStcFallbackMs = millis() + RADIO_DAB_STC_SAFETY_MS;
-      }
-    }
-    if (shouldPoll) {
-      if (radioControlMode != RADIO_CTRL_INTB) delay(20);
-      memset(SPIbuffer, 0, 5);
-      SPIwrite(SPIbuffer, 5);
-    } else {
-      delay(1);
-      yield();
-    }
-    if (millis() - stcStartMs >= 5000UL) {
-      Serial.println("[V7/LEGACY] DAB tune STC timeout");
-      break;
-    }
-  }
-  Serial.printf("[V7/LEGACY] tune completion status=0x%02X elapsed=%u ms\n",
-                SPIbuffer[1], static_cast<unsigned>(millis() - stcStartMs));
-
-  // Clear STC exactly as legacy driver did.
-  SPIbuffer[0] = 0xB2;
-  SPIbuffer[1] = 0x01;
-  SPIwrite(SPIbuffer, 2);
-  cts();
+  ++dabTuneRequestId;
+  if (dabTuneRequestId == 0) ++dabTuneRequestId;
+  dabRequestedFrequency = freq;
+  dabTuneRequestPending = true;
+  dabWaitingForStc = false;
+  dabStcPending = false;
+  dabServiceRequestPending = false;
+  dabActiveServiceValid = false;
+  dabServiceListRefreshPending = false;
+  dabServiceTypeScanIndex = 0;
+  dabDataServicePending = false;
+  tunePending = true;
+  DataUpdate = millis() - 500U;
+  Serial.printf("[DAB/ASYNC] queued tune index=%u request=%u\n",
+                freq, static_cast<unsigned>(dabTuneRequestId));
 }
 
 void DAB::clearFmData(void) {
@@ -1963,6 +1722,8 @@ void DAB::setService(uint8_t _index) {
     uint8_t monoctet[4];
   } u;
 
+  if (isFm() || _index >= numberofservices) return;
+
   pty = 36;
   bitrate = 0;
   protectionlevel = 0;
@@ -1972,7 +1733,7 @@ void DAB::setService(uint8_t _index) {
   slideshowRamSize = 0;
   SlideShowAvailable = false;
   SlideShowInit = false;
-  ServiceStart = true;
+  ServiceStart = false;
   ServiceIndex = _index;
   ecc = 0;  // Reset so ServiceInfo() picks up the new service's ECC
   serviceHasOwnEcc = false;
@@ -1983,19 +1744,6 @@ void DAB::setService(uint8_t _index) {
   SlideShowTransportID = 0;
   SlideShowLastActivity = 0;
 
-  SPIbuffer[0] = 0x81;
-  SPIbuffer[1] = 0x00;
-  SPIbuffer[2] = 0x00;
-  SPIbuffer[3] = 0x00;
-  SPIbuffer[4] = service[ServiceIndex].ServiceID & 0xff;
-  SPIbuffer[5] = (service[ServiceIndex].ServiceID >> 8) & 0xff;
-  SPIbuffer[6] = (service[ServiceIndex].ServiceID >> 16) & 0xff;
-  SPIbuffer[7] = (service[ServiceIndex].ServiceID >> 24) & 0xff;
-  SPIbuffer[8] = service[ServiceIndex].CompID & 0xff;
-  SPIbuffer[9] = (service[ServiceIndex].CompID >> 8) & 0xff;
-  SPIbuffer[10] = (service[ServiceIndex].CompID >> 16) & 0xff;
-  SPIbuffer[11] = (service[ServiceIndex].CompID >> 24) & 0xff;
-  SPIwrite(SPIbuffer, 12);
   u.combine = service[ServiceIndex].ServiceID;
 
   SID[3] = u.monoctet[0] & 0xF;
@@ -2011,14 +1759,518 @@ void DAB::setService(uint8_t _index) {
     }
   }
   CurrentServiceID = service[ServiceIndex].ServiceID;
-  ServiceInfo();
+  dabRequestedServiceId = service[ServiceIndex].ServiceID;
+  dabRequestedComponentId = service[ServiceIndex].CompID;
+  dabServiceRequestPending = true;
+  dabDataServicePending = false;
+  Serial.printf("[DAB/ASYNC] queued service SID=%08X CID=%08X\n",
+                static_cast<unsigned>(dabRequestedServiceId),
+                static_cast<unsigned>(dabRequestedComponentId));
 }
 
-// Periodic driver pump. Called every loop iteration:
-//   - Pull any pending service-data (RT / MOT) packets
-//   - Discard the slideshow buffer if no segment has arrived in 30 s
-//   - Every 500 ms, refresh EnsembleInfo + ServiceInfo and start a data
-//     service for TPEG-like data components on first activation
+bool DAB::startDabCommand(DabCommand operation, uint8_t command,
+                          const uint8_t* args, uint16_t argLength,
+                          uint16_t replyLength, uint32_t timeoutUs) {
+  if (chip.busy() || dabCommand != DabCommand::None) return false;
+  if (replyLength > sizeof(SPIbuffer) - 1U) {
+    ++diagDabCommandErrorCount;
+    return false;
+  }
+  if (replyLength > 0) memset(SPIbuffer + 1, 0, replyLength);
+  const si468x::Result result = chip.startCommand(
+      static_cast<si468x::Command>(command), args, argLength,
+      replyLength > 0 ? SPIbuffer + 1 : nullptr, replyLength, timeoutUs);
+  if (result == si468x::Result::Pending) {
+    dabCommand = operation;
+    return true;
+  }
+  finishCommandDiagnostics(result);
+  ++diagDabCommandErrorCount;
+  Serial.printf("[DAB/ASYNC] command 0x%02X start failed result=%d\n",
+                command, static_cast<int>(result));
+  return false;
+}
+
+void DAB::finishDabCommand(void) {
+  const DabCommand completed = dabCommand;
+  const si468x::Result result = chip.lastResult();
+  dabCommand = DabCommand::None;
+  finishCommandDiagnostics(result);
+
+  if (result != si468x::Result::Ok) {
+    ++diagDabCommandErrorCount;
+    Serial.printf("[DAB/ASYNC] command failed op=%u result=%d reason=0x%02X\n",
+                  static_cast<unsigned>(completed), static_cast<int>(result),
+                  static_cast<unsigned>(chip.lastDeviceError()));
+    if ((completed == DabCommand::Tune || completed == DabCommand::TuneStatus) &&
+        dabCommandRequestId == dabTuneRequestId) {
+      dabTuneRequestPending = false;
+      dabWaitingForStc = false;
+      tunePending = false;
+    }
+    if (completed == DabCommand::StopService || completed == DabCommand::StartService) {
+      dabServiceRequestPending = false;
+      if (completed == DabCommand::StartService) ServiceStart = false;
+    }
+    if (completed == DabCommand::StartDataService) dabDataServicePending = false;
+    return;
+  }
+
+  const auto parseOk = [](si468x::Result parseResult) {
+    return parseResult == si468x::Result::Ok;
+  };
+
+  switch (completed) {
+    case DabCommand::Tune:
+      if (dabCommandRequestId == dabTuneRequestId && !dabTuneRequestPending) {
+        dabWaitingTuneRequestId = dabCommandRequestId;
+        dabWaitingForStc = true;
+        dabTuneDeadlineMs = millis() + RADIO_DAB_TUNE_TIMEOUT_MS;
+        Serial.printf("[DAB/ASYNC] tune command accepted request=%u\n",
+                      static_cast<unsigned>(dabCommandRequestId));
+      }
+      break;
+
+    case DabCommand::TuneStatus:
+    case DabCommand::SignalStatus: {
+      si468x::DabDigradStatus status;
+      const si468x::Result parseResult = si468x::Si468x::parseDabDigradStatus(
+          SPIbuffer + 1, 23, status);
+      if (!parseOk(parseResult)) {
+        ++diagDabCommandErrorCount;
+        break;
+      }
+      const bool wasLocked = signallock;
+      dabRssi10 = static_cast<int16_t>(status.rssi) * 10;
+      fic = status.ficQuality > 100U ? 100U : status.ficQuality;
+      cnr = status.cnr;
+      signallock = status.valid && status.acquired;
+
+      if (completed == DabCommand::TuneStatus &&
+          dabCommandRequestId == dabTuneRequestId) {
+        dabWaitingForStc = false;
+        tunePending = false;
+        if (signallock) {
+          dabServiceListRefreshPending = true;
+          dabEnsembleRefreshPending = true;
+          dabTimeRefreshPending = true;
+        }
+        Serial.printf("[DAB/ASYNC] tune complete request=%u lock=%u index=%u\n",
+                      static_cast<unsigned>(dabCommandRequestId), signallock,
+                      status.tuneIndex);
+      } else if (completed == DabCommand::SignalStatus && signallock) {
+        if (!wasLocked) dabServiceListRefreshPending = true;
+        dabEnsembleRefreshPending = true;
+        dabTimeRefreshPending = true;
+        ServiceInfo();
+      }
+      break;
+    }
+
+    case DabCommand::DsrvHeader: {
+      si468x::DsrvHeader header;
+      const si468x::Result parseResult = si468x::Si468x::parseDsrvHeader(
+          SPIbuffer + 1, 24, header);
+      if (!parseOk(parseResult)) {
+        ++diagDabCommandErrorCount;
+        dabDsrvPending = false;
+        break;
+      }
+      if (header.interruptSource & 0x02U) ++diagDabDsrvOverflowCount;
+      if (header.byteCount > 0) getServiceData();
+      dabDsrvPending = header.buffersRemaining > 0;
+      break;
+    }
+
+    case DabCommand::EventStatus: {
+      si468x::DabEventStatus event;
+      const si468x::Result parseResult = si468x::Si468x::parseDabEventStatus(
+          SPIbuffer + 1, 8, event);
+      if (!parseOk(parseResult)) {
+        ++diagDabCommandErrorCount;
+        break;
+      }
+      dabDeviceEventPending = false;
+      if (event.reconfiguration || event.serviceListInterrupt ||
+          event.serviceListAvailable)
+        dabServiceListRefreshPending = true;
+      break;
+    }
+
+    case DabCommand::ServiceListHeader: {
+      const uint16_t listSize = static_cast<uint16_t>(SPIbuffer[5]) |
+                                (static_cast<uint16_t>(SPIbuffer[6]) << 8);
+      const uint32_t fullLength = static_cast<uint32_t>(listSize) + 6U;
+      if (fullLength < 9U || fullLength > sizeof(SPIbuffer) - 1U) {
+        ++diagDabCommandErrorCount;
+        Serial.printf("[DAB/ASYNC] invalid service-list length=%u\n",
+                      static_cast<unsigned>(fullLength));
+        break;
+      }
+      const si468x::Result readResult = chip.readCurrentReply(
+          SPIbuffer + 1, static_cast<uint16_t>(fullLength));
+      finishCommandDiagnostics(readResult);
+      if (readResult != si468x::Result::Ok) {
+        ++diagDabCommandErrorCount;
+        break;
+      }
+      parseDabServiceListReply(static_cast<uint16_t>(fullLength));
+      dabServiceTypeScanIndex = 0;
+      dabEnsembleRefreshPending = true;
+      queueDabDataService();
+      break;
+    }
+
+    case DabCommand::EnsembleInfo: {
+      si468x::DabEnsembleInfo info;
+      const si468x::Result parseResult = si468x::Si468x::parseDabEnsembleInfo(
+          SPIbuffer + 1, 26, info);
+      if (!parseOk(parseResult)) {
+        ++diagDabCommandErrorCount;
+        break;
+      }
+      if (info.ensembleId == 0 || info.ensembleId == 0xFFFFU) {
+        EnsembleInfoSet = false;
+        break;
+      }
+      EnsembleInfoSet = true;
+      if (EID[0] == '\0' || EnsembleLabel[0] == '\0') {
+        static const char hex[] = "0123456789ABCDEF";
+        EID[0] = hex[(info.ensembleId >> 12) & 0x0F];
+        EID[1] = hex[(info.ensembleId >> 8) & 0x0F];
+        EID[2] = hex[(info.ensembleId >> 4) & 0x0F];
+        EID[3] = hex[info.ensembleId & 0x0F];
+        EID[4] = '\0';
+        memcpy(EnsembleLabel, info.label, 16);
+        EnsembleLabel[16] = '\0';
+        for (int8_t i = 15; i >= 0 && EnsembleLabel[i] == ' '; --i)
+          EnsembleLabel[i] = '\0';
+        // AN649 keeps the ensemble label charset in the byte between ECC and
+        // the abbreviation mask; the typed helper intentionally leaves it raw.
+        EnsembleLabelCharset = SPIbuffer[24];
+      }
+      if (ensembleEcc == 0 && info.ecc != 0) ensembleEcc = info.ecc;
+      break;
+    }
+
+    case DabCommand::Time: {
+      si468x::DabTimeInfo time;
+      const si468x::Result parseResult = si468x::Si468x::parseDabTime(
+          SPIbuffer + 1, 11, time);
+      if (!parseOk(parseResult)) {
+        ++diagDabCommandErrorCount;
+        break;
+      }
+      Year = time.year;
+      Months = time.month;
+      Days = time.day;
+      Hours = time.hour;
+      Minutes = time.minute;
+      Seconds = time.second;
+      break;
+    }
+
+    case DabCommand::ServiceType: {
+      const uint8_t index = static_cast<uint8_t>(dabCommandRequestId);
+      si468x::DabSubchannelInfo info;
+      const si468x::Result parseResult = si468x::Si468x::parseDabSubchannelInfo(
+          SPIbuffer + 1, 12, info);
+      if (!parseOk(parseResult)) {
+        ++diagDabCommandErrorCount;
+      } else if (index < numberofservices) {
+        service[index].ServiceType = info.serviceMode;
+      }
+      if (dabServiceTypeScanIndex == index)
+        dabServiceTypeScanIndex = static_cast<uint8_t>(index + 1U);
+      queueDabDataService();
+      break;
+    }
+
+    case DabCommand::AudioInfo: {
+      si468x::DabAudioInfo info;
+      const si468x::Result parseResult = si468x::Si468x::parseDabAudioInfo(
+          SPIbuffer + 1, 10, info);
+      if (!parseOk(parseResult)) {
+        ++diagDabCommandErrorCount;
+      } else if (dabActiveServiceValid &&
+                 dabCommandServiceId == dabActiveServiceId &&
+                 dabCommandComponentId == dabActiveComponentId) {
+        bitrate = info.bitRateKbps;
+        samplerate = info.sampleRateHz;
+        audiomode = info.audioMode;
+      }
+      break;
+    }
+
+    case DabCommand::CurrentSubchannelInfo: {
+      si468x::DabSubchannelInfo info;
+      const si468x::Result parseResult = si468x::Si468x::parseDabSubchannelInfo(
+          SPIbuffer + 1, 12, info);
+      if (!parseOk(parseResult)) {
+        ++diagDabCommandErrorCount;
+      } else if (dabActiveServiceValid &&
+                 dabCommandServiceId == dabActiveServiceId &&
+                 dabCommandComponentId == dabActiveComponentId) {
+        servicetype = info.serviceMode;
+        protectionlevel = info.protectionInfo;
+      }
+      break;
+    }
+
+    case DabCommand::CurrentServiceInfo: {
+      si468x::DabServiceInfo info;
+      const si468x::Result parseResult = si468x::Si468x::parseDabServiceInfo(
+          SPIbuffer + 1, 26, info);
+      if (!parseOk(parseResult)) {
+        ++diagDabCommandErrorCount;
+      } else if (dabActiveServiceValid &&
+                 dabCommandServiceId == dabActiveServiceId) {
+        memcpy(PStext, info.label, 16);
+        PStext[16] = '\0';
+        for (int8_t i = 15; i >= 0 && PStext[i] == ' '; --i) PStext[i] = '\0';
+        pty = info.pty;
+        ServiceLabelCharset = info.charset;
+        if (ecc == 0) {
+          serviceHasOwnEcc = info.ecc != 0;
+          ecc = serviceHasOwnEcc ? info.ecc : ensembleEcc;
+        }
+      }
+      break;
+    }
+
+    case DabCommand::StopService:
+      if (dabActiveServiceValid && dabCommandServiceId == dabActiveServiceId &&
+          dabCommandComponentId == dabActiveComponentId) {
+        dabActiveServiceValid = false;
+        ServiceStart = false;
+      }
+      break;
+
+    case DabCommand::StartService:
+      dabActiveServiceId = dabCommandServiceId;
+      dabActiveComponentId = dabCommandComponentId;
+      dabActiveServiceValid = true;
+      if (dabCommandServiceId == dabRequestedServiceId &&
+          dabCommandComponentId == dabRequestedComponentId) {
+        dabServiceRequestPending = false;
+        ServiceStart = true;
+        ServiceInfo();
+        queueDabDataService();
+      }
+      break;
+
+    case DabCommand::StartDataService:
+      dataServiceCheck = dabCommandComponentId;
+      dabDataServicePending = false;
+      break;
+
+    case DabCommand::None:
+      break;
+  }
+}
+
+void DAB::queueDabDataService(void) {
+  if (!dabActiveServiceValid || dabServiceTypeScanIndex < numberofservices ||
+      dabDataServicePending)
+    return;
+  for (uint8_t i = 0; i < numberofservices; ++i) {
+    if (service[i].ServiceType == 3 &&
+        strstr(service[i].Label, "tpeg") == nullptr &&
+        strstr(service[i].Label, "TPEG") == nullptr &&
+        service[i].CompID != dataServiceCheck) {
+      dabDataServiceId = service[i].ServiceID;
+      dabDataComponentId = service[i].CompID;
+      dabDataServicePending = true;
+      break;
+    }
+  }
+}
+
+void DAB::scheduleNextDabCommand(void) {
+  if (chip.busy() || dabCommand != DabCommand::None) return;
+
+  const uint8_t zero = 0;
+  if (dabDsrvPending && dabDsrvBurstCount < RADIO_DAB_MAX_DSRV_BURST) {
+    const uint8_t args[1] = {0x01};
+    if (startDabCommand(DabCommand::DsrvHeader,
+                        static_cast<uint8_t>(si468x::Command::GET_DIGITAL_SERVICE_DATA),
+                        args, sizeof(args), 24)) {
+      ++dabDsrvBurstCount;
+      dabDsrvPending = false;
+    }
+    return;
+  }
+  if (dabDsrvBurstCount >= RADIO_DAB_MAX_DSRV_BURST) dabDsrvBurstCount = 0;
+
+  if (dabTuneRequestPending) {
+    const uint32_t requestId = dabTuneRequestId;
+    dabStcPending = false;
+    const si468x::Result result = chip.startDabTune(dabRequestedFrequency);
+    if (result == si468x::Result::Pending) {
+      dabTuneRequestPending = false;
+      dabCommandRequestId = requestId;
+      dabCommand = DabCommand::Tune;
+    } else {
+      finishCommandDiagnostics(result);
+      ++diagDabCommandErrorCount;
+      tunePending = false;
+      dabTuneRequestPending = false;
+      Serial.printf("[DAB/ASYNC] tune start failed result=%d\n",
+                    static_cast<int>(result));
+    }
+    return;
+  }
+
+  if (dabWaitingForStc &&
+      (dabStcPending || static_cast<int32_t>(millis() - dabTuneDeadlineMs) >= 0)) {
+    if (!dabStcPending) Serial.println("[DAB/ASYNC] STC timeout; reading final status");
+    const uint8_t args[1] = {0x01};
+    dabStcPending = false;
+    dabCommandRequestId = dabWaitingTuneRequestId;
+    startDabCommand(DabCommand::TuneStatus,
+                    static_cast<uint8_t>(si468x::Command::DAB_DIGRAD_STATUS),
+                    args, sizeof(args), 23);
+    return;
+  }
+
+  if (dabDeviceEventPending) {
+    const uint8_t args[1] = {0x01};
+    if (startDabCommand(DabCommand::EventStatus,
+                        static_cast<uint8_t>(si468x::Command::DAB_GET_EVENT_STATUS),
+                        args, sizeof(args), 8))
+      dabDeviceEventPending = false;
+    return;
+  }
+
+  if (dabServiceRequestPending) {
+    uint8_t args[11] = {0};
+    if (dabActiveServiceValid) {
+      si468x::writeLe32(args + 3, dabActiveServiceId);
+      si468x::writeLe32(args + 7, dabActiveComponentId);
+      dabCommandServiceId = dabActiveServiceId;
+      dabCommandComponentId = dabActiveComponentId;
+      startDabCommand(DabCommand::StopService,
+                      static_cast<uint8_t>(si468x::Command::STOP_DIGITAL_SERVICE),
+                      args, sizeof(args));
+    } else {
+      si468x::writeLe32(args + 3, dabRequestedServiceId);
+      si468x::writeLe32(args + 7, dabRequestedComponentId);
+      dabCommandServiceId = dabRequestedServiceId;
+      dabCommandComponentId = dabRequestedComponentId;
+      startDabCommand(DabCommand::StartService,
+                      static_cast<uint8_t>(si468x::Command::START_DIGITAL_SERVICE),
+                      args, sizeof(args));
+    }
+    return;
+  }
+
+  if (dabServiceListRefreshPending && signallock) {
+    if (startDabCommand(DabCommand::ServiceListHeader,
+                        static_cast<uint8_t>(si468x::Command::GET_DIGITAL_SERVICE_LIST),
+                        &zero, 1, 8))
+      dabServiceListRefreshPending = false;
+    return;
+  }
+
+  if (dabServiceTypeScanIndex < numberofservices) {
+    const uint8_t index = dabServiceTypeScanIndex;
+    uint8_t args[11] = {0};
+    si468x::writeLe32(args + 3, service[index].ServiceID);
+    si468x::writeLe32(args + 7, service[index].CompID);
+    dabCommandRequestId = index;
+    startDabCommand(DabCommand::ServiceType,
+                    static_cast<uint8_t>(si468x::Command::DAB_GET_SUBCHAN_INFO),
+                    args, sizeof(args), 12);
+    return;
+  }
+
+  if (dabDataServicePending) {
+    uint8_t args[11] = {0};
+    si468x::writeLe32(args + 3, dabDataServiceId);
+    si468x::writeLe32(args + 7, dabDataComponentId);
+    dabCommandServiceId = dabDataServiceId;
+    dabCommandComponentId = dabDataComponentId;
+    startDabCommand(DabCommand::StartDataService,
+                    static_cast<uint8_t>(si468x::Command::START_DIGITAL_SERVICE),
+                    args, sizeof(args));
+    return;
+  }
+
+  if (dabSignalRefreshPending) {
+    const uint8_t args[1] = {0x08};
+    if (startDabCommand(DabCommand::SignalStatus,
+                        static_cast<uint8_t>(si468x::Command::DAB_DIGRAD_STATUS),
+                        args, sizeof(args), 23))
+      dabSignalRefreshPending = false;
+    return;
+  }
+
+  if (dabEnsembleRefreshPending && signallock) {
+    if (startDabCommand(DabCommand::EnsembleInfo,
+                        static_cast<uint8_t>(si468x::Command::DAB_GET_ENSEMBLE_INFO),
+                        &zero, 1, 26))
+      dabEnsembleRefreshPending = false;
+    return;
+  }
+
+  if (dabTimeRefreshPending && signallock) {
+    if (startDabCommand(DabCommand::Time,
+                        static_cast<uint8_t>(si468x::Command::DAB_GET_TIME),
+                        &zero, 1, 11))
+      dabTimeRefreshPending = false;
+    return;
+  }
+
+  if (dabAudioRefreshPending && dabActiveServiceValid) {
+    dabCommandServiceId = dabActiveServiceId;
+    dabCommandComponentId = dabActiveComponentId;
+    if (startDabCommand(DabCommand::AudioInfo,
+                        static_cast<uint8_t>(si468x::Command::DAB_GET_AUDIO_INFO),
+                        &zero, 1, 10))
+      dabAudioRefreshPending = false;
+    return;
+  }
+
+  if (dabCurrentSubchannelRefreshPending && dabActiveServiceValid) {
+    uint8_t args[11] = {0};
+    si468x::writeLe32(args + 3, dabActiveServiceId);
+    si468x::writeLe32(args + 7, dabActiveComponentId);
+    dabCommandServiceId = dabActiveServiceId;
+    dabCommandComponentId = dabActiveComponentId;
+    if (startDabCommand(DabCommand::CurrentSubchannelInfo,
+                        static_cast<uint8_t>(si468x::Command::DAB_GET_SUBCHAN_INFO),
+                        args, sizeof(args), 12))
+      dabCurrentSubchannelRefreshPending = false;
+    return;
+  }
+
+  if (dabCurrentServiceRefreshPending && dabActiveServiceValid) {
+    uint8_t args[7] = {0};
+    si468x::writeLe32(args + 3, dabActiveServiceId);
+    dabCommandServiceId = dabActiveServiceId;
+    dabCommandComponentId = dabActiveComponentId;
+    if (startDabCommand(DabCommand::CurrentServiceInfo,
+                        static_cast<uint8_t>(si468x::Command::DAB_GET_SERVICE_INFO),
+                        args, sizeof(args), 26))
+      dabCurrentServiceRefreshPending = false;
+    return;
+  }
+
+  // If DSRV consumed its fairness budget but no control/metadata operation was
+  // ready, resume draining immediately.
+  if (dabDsrvPending) {
+    const uint8_t args[1] = {0x01};
+    if (startDabCommand(DabCommand::DsrvHeader,
+                        static_cast<uint8_t>(si468x::Command::GET_DIGITAL_SERVICE_DATA),
+                        args, sizeof(args), 24)) {
+      ++dabDsrvBurstCount;
+      dabDsrvPending = false;
+    }
+  }
+}
+
+// Periodic cooperative driver pump. No DAB command waits for CTS or STC here;
+// every call advances at most one in-flight command and starts at most one more.
 void DAB::Update(void) {
   if (isFm()) {
     if (radioControlMode == RADIO_CTRL_INTB && radioIntbActive()) {
@@ -2032,30 +2284,9 @@ void DAB::Update(void) {
     return;
   }
 
-  // DAB runtime keeps the proven legacy command/reply parser. INTB only tells
-  // foreground code when to read STATUS0; the ISR itself never touches SPI.
-  // A short status check remains as a bounded fallback. The application image
-  // on some modules emits no DSRV edge even though bootloader INTB is proven.
-  static uint32_t dabFallbackStatusMs = 0;
-  bool serviceStatus = radioControlMode != RADIO_CTRL_INTB;
-  if (radioControlMode == RADIO_CTRL_INTB) {
-    serviceStatus = radioIntbActive();
-    if (!serviceStatus &&
-        millis() - dabFallbackStatusMs >= RADIO_DAB_STATUS_SAFETY_MS)
-      serviceStatus = true;
-  }
-  if (signallock && serviceStatus) {
-    dabFallbackStatusMs = millis();
-    for (uint8_t n = 0; n < 4; ++n) {
-      memset(SPIbuffer, 0, 5);
-      SPIwrite(SPIbuffer, 5);                // foreground RD_REPLY/status
-      if (!bitRead(SPIbuffer[1], 4)) break;  // DSRV not pending
-      getServiceData();
-    }
-  }
-
   // Current project keeps slideshow data in RAM; do not pull old LittleFS code back in.
-  if (SlideShowInit && SlideShowLastActivity > 0 && millis() - SlideShowLastActivity > 30000) {
+  const uint32_t now = millis();
+  if (SlideShowInit && SlideShowLastActivity > 0 && now - SlideShowLastActivity > 30000) {
     if (SlideShowDebug) Serial.println("[SLS] Collection timeout, resetting");
     clearSegmentBuffer();
     SlideShowTransportID = 0;
@@ -2069,37 +2300,41 @@ void DAB::Update(void) {
     SlideShowLastActivity = 0;
   }
 
-  if (millis() - DataUpdate > 500 || !signallock) {
-    EnsembleInfo();
+  if (radioControlMode == RADIO_CTRL_INTB && radioIntbActive()) {
+    if (commandAwaitingCts) commandStatusReadTriggeredByIrq = true;
+    chip.notifyInterrupt();
+  }
+  const si468x::Result serviceResult = chip.service();
+  finishCommandDiagnostics(serviceResult);
+  if (dabCommand != DabCommand::None && !chip.busy()) finishDabCommand();
 
-    if (signallock) {
-      ServiceInfo();
-    }
+  if (now - DataUpdate >= 500U) {
+    dabSignalRefreshPending = true;
+    DataUpdate = now;
+  }
 
-    if (ServiceStart) {
-      for (int i = 0; i < numberofservices; i++) {
-        if (service[i].ServiceType == 3 && strstr(service[i].Label, "tpeg") == NULL && strstr(service[i].Label, "TPEG") == NULL) {
-          if (service[i].CompID != dataServiceCheck) {
-            SPIbuffer[0] = 0x81;
-            SPIbuffer[1] = 0x01;
-            SPIbuffer[2] = 0x00;
-            SPIbuffer[3] = 0x00;
-            SPIbuffer[4] = service[i].ServiceID & 0xff;
-            SPIbuffer[5] = (service[i].ServiceID >> 8) & 0xff;
-            SPIbuffer[6] = (service[i].ServiceID >> 16) & 0xff;
-            SPIbuffer[7] = (service[i].ServiceID >> 24) & 0xff;
-            SPIbuffer[8] = service[i].CompID & 0xff;
-            SPIbuffer[9] = (service[i].CompID >> 8) & 0xff;
-            SPIbuffer[10] = (service[i].CompID >> 16) & 0xff;
-            SPIbuffer[11] = (service[i].CompID >> 24) & 0xff;
-            SPIwrite(SPIbuffer, 12);
-            dataServiceCheck = service[i].CompID;
-            break;
-          }
-        }
-      }
-    }
-    DataUpdate = millis();
+  if (chip.busy()) {
+    ++diagDabBusySkipCount;
+  } else {
+    scheduleNextDabCommand();
+  }
+
+  if (now - diagDabLastReportMs >= RADIO_DAB_DIAG_INTERVAL_MS) {
+    diagDabLastReportMs = now;
+    Serial.printf("[DAB/IRQ] hw=%s mode=%s edges=%u ctsIrq=%u ctsPoll=%u STC=%u DSRV=%u overflow=%u DEVNT=%u busy=%u errors=%u pending=%02X\n",
+                  intbHardwareName(), controlModeName(),
+                  static_cast<unsigned>(radioRuntimeIntbEdges()),
+                  static_cast<unsigned>(diagCtsIrqCompletionCount),
+                  static_cast<unsigned>(diagCtsPollCompletionCount),
+                  static_cast<unsigned>(diagDabStcCount),
+                  static_cast<unsigned>(diagDabDsrvCount),
+                  static_cast<unsigned>(diagDabDsrvOverflowCount),
+                  static_cast<unsigned>(diagDabDeviceEventCount),
+                  static_cast<unsigned>(diagDabBusySkipCount),
+                  static_cast<unsigned>(diagDabCommandErrorCount),
+                  static_cast<unsigned>((dabStcPending ? 0x01U : 0U) |
+                                        (dabDsrvPending ? 0x10U : 0U) |
+                                        (dabDeviceEventPending ? 0x80U : 0U)));
   }
 }
 

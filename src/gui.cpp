@@ -709,7 +709,7 @@ void DoMenu(void) {
         tftPrint(0, "mcelliotg", 155, 132, PrimaryColor, PrimaryColorSmooth, 28);
         tftPrint(0, "github.com/PE5PVB/SI4684-DAB-Receiver", 155, 161, SecondaryColor, SecondaryColorSmooth, 16);
         tftPrint(0, String(radioIrqText[language]) + ": " +
-                    radio.controlModeName(),
+                    radio.intbHardwareName(),
                  155, 182, SecondaryColor, SecondaryColorSmooth, 16);
         break;
     }

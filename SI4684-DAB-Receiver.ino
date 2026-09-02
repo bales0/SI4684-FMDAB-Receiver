@@ -1010,7 +1010,6 @@ void ProcessDAB(void) {
     for (byte x = 0; x < radio.numberofservices; x++) {
       if (_serviceID == radio.service[x].ServiceID) {
         radio.setService(x);
-        radio.ServiceStart = true;
         trysetservice = false;
         store = true;
       }
@@ -1157,7 +1156,6 @@ void DABSelectService(bool dir) {
     }
 
     radio.setService(radio.ServiceIndex);
-    radio.ServiceStart = true;
     store = true;
   }
 }

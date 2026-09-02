@@ -8,9 +8,10 @@
 //   - decode Dynamic Label / Radiotext, PTY, ECC, time, etc.
 //   - reassemble the current MOT slideshow image in RAM
 //
-// All chip status comes back via the SPI status byte + a 4 KB SPI rx buffer
-// (`SPIbuffer` in si4684.cpp). Every command goes via cts() to wait for the
-// "command ready" bit before the next byte is written.
+// All chip traffic is serialized by the shared Si468x command engine. Runtime
+// FM and DAB operations are pumped cooperatively from Update(); the 4 KB
+// `SPIbuffer` in si4684.cpp remains the persistent reply workspace used by the
+// existing service-list and DLS/MOT parsers.
 
 #ifndef si4684_h
 #define si4684_h
@@ -173,11 +174,31 @@ class DAB {
     bool isRbds(void) const { return fmProfile().rbds; }
     RadioControlMode controlMode(void) const;
     const char* controlModeName(void) const;
+    const char* intbHardwareName(void) const;
     bool isTunePending(void) const { return tunePending; }
     const uint8_t* slideshowData(void) const { return slideshowSegBuf; }
     uint32_t slideshowSize(void) const { return SlideShowAvailable ? slideshowRamSize : 0; }
 
   private:
+    enum class DabCommand : uint8_t {
+      None,
+      Tune,
+      TuneStatus,
+      DsrvHeader,
+      EventStatus,
+      SignalStatus,
+      ServiceListHeader,
+      EnsembleInfo,
+      Time,
+      ServiceType,
+      AudioInfo,
+      CurrentSubchannelInfo,
+      CurrentServiceInfo,
+      StopService,
+      StartService,
+      StartDataService
+    };
+
     bool SlideShowInit;
     RadioMode activeMode;
     uint8_t activeFmRegion = static_cast<uint8_t>(FmRegion::Europe);
@@ -214,6 +235,41 @@ class DAB {
     uint16_t SlideShowTransportID;        // Current transport ID
     uint32_t SlideShowLastActivity;       // millis() of last new segment received
 
+    // Cooperative DAB command scheduler. startCommand() retains the reply
+    // pointer until CTS, so every async reply is stored in the global,
+    // persistent SPIbuffer rather than in a temporary stack array.
+    DabCommand dabCommand = DabCommand::None;
+    uint32_t dabCommandRequestId = 0;
+    uint32_t dabTuneRequestId = 0;
+    uint32_t dabWaitingTuneRequestId = 0;
+    uint8_t dabRequestedFrequency = 0;
+    bool dabTuneRequestPending = false;
+    bool dabWaitingForStc = false;
+    uint32_t dabTuneDeadlineMs = 0;
+
+    uint32_t dabRequestedServiceId = 0;
+    uint32_t dabRequestedComponentId = 0;
+    uint32_t dabActiveServiceId = 0;
+    uint32_t dabActiveComponentId = 0;
+    uint32_t dabCommandServiceId = 0;
+    uint32_t dabCommandComponentId = 0;
+    bool dabServiceRequestPending = false;
+    bool dabActiveServiceValid = false;
+
+    bool dabSignalRefreshPending = false;
+    bool dabServiceListRefreshPending = false;
+    bool dabEnsembleRefreshPending = false;
+    bool dabTimeRefreshPending = false;
+    bool dabAudioRefreshPending = false;
+    bool dabCurrentSubchannelRefreshPending = false;
+    bool dabCurrentServiceRefreshPending = false;
+    uint8_t dabServiceTypeScanIndex = 0;
+
+    bool dabDataServicePending = false;
+    uint32_t dabDataServiceId = 0;
+    uint32_t dabDataComponentId = 0;
+    uint8_t dabDsrvBurstCount = 0;
+
     // One 40 KB MOT buffer with adaptive fixed slots. Services seen in the
     // field use 512-, 1024- or 2000-byte DSRV blocks. Large slots use the
     // actual block size (up to 2048 B), preserving all 40960 reserved bytes.
@@ -234,6 +290,14 @@ class DAB {
     void clearFmData(void);
     void processFmRds(void);
     void updateFm(void);
+    bool startDabCommand(DabCommand operation, uint8_t command,
+                         const uint8_t* args, uint16_t argLength,
+                         uint16_t replyLength = 0,
+                         uint32_t timeoutUs = 1000000UL);
+    void finishDabCommand(void);
+    void scheduleNextDabCommand(void);
+    void parseDabServiceListReply(uint16_t replyLength);
+    void queueDabDataService(void);
 };
 
 #endif
