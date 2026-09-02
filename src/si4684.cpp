@@ -30,6 +30,10 @@ static uint32_t slideshowFirstSegmentMs = 0;
 
 unsigned long DataUpdate = 0;       // millis() of last EnsembleInfo/ServiceInfo refresh (500 ms throttle)
 bool EnsembleInfoSet;
+// FM PTY value 0 is a valid RDS value ("Unknown"), so validity must be
+// tracked separately from fmPty itself. Cleared on every tune/seek and set
+// only after FM_RDS_STATUS explicitly reports TP/PTY valid.
+bool fmPtyValid = false;
 uint8_t slaveSelectPin;
 
 static si468x::Si468x chip;
@@ -1614,6 +1618,7 @@ void DAB::clearFmData(void) {
   fmMultipath = 0;
   fmPi = 0;
   fmPty = 0;
+  fmPtyValid = false;
   fmPsMask = 0;
   fmRtMask = 0;
   fmRtSeenMask = 0;
@@ -1696,6 +1701,7 @@ void DAB::processFmRds(void) {
   if (group.piValid) fmPi = group.pi;
   if (group.tpPtyValid) {
     fmPty = group.pty;
+    fmPtyValid = true;
     pty = fmPty;
   }
   // BLE 0 and 1 are clean or corrected by at most two bits. Do not use BLE 2

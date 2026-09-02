@@ -939,10 +939,12 @@ void loop(void) {
     if (millis() - tottimer >= totprobe) deepSleep();
   }
 
-  // 500 ms after the user stops scrolling, commit either a preset store
-  // (StoreFrequency) or finalise the tune. We detach the encoder interrupts
-  // around the EEPROM write so the long flash erase doesn't lose ticks.
-  if (millis() - TuningTimer >= 500) {
+  // Manual FM and DAB tuning are both finalised after 250 ms so both modes
+  // feel equally responsive. Keep preset-store commits at the original 500 ms.
+  // Encoder interrupts are detached around the EEPROM write below.
+  const uint32_t tuningDebounceMs =
+      (tuning && !store) ? 250UL : 500UL;
+  if (millis() - TuningTimer >= tuningDebounceMs) {
     if (store) {
       detachInterrupt(digitalPinToInterrupt(ROTARY_PIN_A));
       detachInterrupt(digitalPinToInterrupt(ROTARY_PIN_B));
@@ -992,10 +994,20 @@ void ProcessDAB(void) {
   if (!tuning) {
     radio.Update();
     SignalLevel = radio.getRSSI();
-    if (radioMode == RADIO_MODE_FM && !radio.isTunePending() &&
+    // During FM auto-seek the driver already reports the current candidate
+    // frequency from FM_RSQ_STATUS about every 100 ms. Publish it while seek is
+    // active; for ordinary tuning keep waiting for the tune operation to finish.
+    if (radioMode == RADIO_MODE_FM &&
+        (seek || !radio.isTunePending()) &&
         isFmFrequencyValid(radio.fmFrequency10kHz, fmRegion) &&
         fmfreq != radio.fmFrequency10kHz) {
       fmfreq = radio.fmFrequency10kHz;
+      ShowFreq();
+    } else if (radioMode == RADIO_MODE_DAB &&
+               seek && dabfreq != dabfreqold) {
+      // DAB AUTO advances one Band-III channel after the previous asynchronous
+      // tune has completed. Publish each newly requested channel here, in the
+      // same ProcessDAB refresh path used for the live FM seek frequency.
       ShowFreq();
     }
   }
@@ -1843,7 +1855,8 @@ void Seek(bool mode) {
     radio.setFreq(dabfreq);
     radio.ServiceIndex = 0;
     radio.ServiceStart = false;
-    ShowFreq();
+    // ProcessDAB publishes the changed DAB channel on the next cooperative
+    // refresh, matching the live-frequency update path used by FM AUTO seek.
     dabSeekStarted = true;
     return;
   }

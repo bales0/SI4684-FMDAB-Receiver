@@ -6,6 +6,10 @@
 
 #include "gui.h"
 
+// Defined by the FM RDS decoder in si4684.cpp. PTY=0 is a real value, so
+// this flag distinguishes "not received yet" from a valid PTY 0 (Unknown).
+extern bool fmPtyValid;
+
 byte menuitem;                    // current highlight when the menu is open
 
 // Apply the user-selected colour theme to the global PrimaryColor/etc. used
@@ -172,7 +176,10 @@ void ShowServiceInfo(void) {
     tftPrint(-1, String(fmfreq / 100) + "." + String((fmfreq % 100) / 10) + " MHz", 166, 36, PrimaryColor, PrimaryColorSmooth, 16);
     tftPrint(-1, String(radio.fmRssi) + "/" + String(radio.fmSnr) + " dB" + (radio.fmAfcRail ? " " + String(fmAfcRailText[language]) : ""), 166, 56, PrimaryColor, PrimaryColorSmooth, 16);
     tftPrint(-1, ps, 166, 76, PrimaryColor, PrimaryColorSmooth, 16);
-    tftPrint(-1, String(radio.fmPty) + ": " + String(myLanguage[language][37 + radio.fmPty]), 166, 96, PrimaryColor, PrimaryColorSmooth, 16);
+    String fmPtyInfo = "";
+    if (!tuning && fmPtyValid && radio.fmPty <= 31)
+      fmPtyInfo = String(radio.fmPty) + ": " + String(myLanguage[language][37 + radio.fmPty]);
+    tftPrint(-1, fmPtyInfo, 166, 96, PrimaryColor, PrimaryColorSmooth, 16);
     tftPrint(-1, radio.fmPi ? pi : "-", 166, 116, PrimaryColor, PrimaryColorSmooth, 16);
     tftPrint(-1, String(radio.fmMultipath) + "%", 166, 136, PrimaryColor, PrimaryColorSmooth, 16);
     tftPrint(-1, String(radio.fmStereoBlend) + "%", 166, 156, PrimaryColor, PrimaryColorSmooth, 16);
@@ -783,25 +790,25 @@ void ShowFreq(void) {
 
 void ShowPTY(void) {
   const uint8_t ptyValue = radio.isFm() ? radio.fmPty : radio.pty;
+  const bool ptyVisible =
+      radio.isFm()
+          ? (!tuning && fmPtyValid && ptyValue <= 31)
+          : (radio.ServiceStart && ptyValue <= 29);
+  const uint8_t displayPty = ptyVisible ? ptyValue : 0xFF;
   String value = "";
 
   // myLanguage[][37] is PTY 0 ("Unknown"), so 37 + PTY is correct for
-  // real PTY values. DAB PTY 30/31 are unused; radio.pty == 36 is only
-  // an internal "not available yet" sentinel and must never index the table.
-  if (radio.isFm()) {
-    if (ptyValue <= 31)
-      value = myLanguage[language][37 + ptyValue];
-  } else if (radio.ServiceStart && ptyValue <= 29) {
-    value = myLanguage[language][37 + ptyValue];
-  }
+  // real PTY values. FM additionally waits for the decoder's explicit
+  // TP/PTY-valid indication; DAB keeps 30/31 and the internal 36 sentinel blank.
+  if (ptyVisible) value = myLanguage[language][37 + ptyValue];
 
-  if (ptyValue != ptyold || displayreset) {
+  if (displayPty != ptyold || displayreset) {
     LongSprite.pushImage(-8, -162, 320, 240, Background);
     LongSprite.setTextDatum(TC_DATUM);
     LongSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
     LongSprite.drawString(value, 75, 0);
     LongSprite.pushSprite(8, 162);
-    ptyold = ptyValue;
+    ptyold = displayPty;
   }
 }
 
@@ -814,13 +821,16 @@ void ShowRT(void) {
     FullLineSprite.pushImage(-6, -220, 320, 240, Background);
   }
 
+  String value = radio.ASCII(radio.ServiceData, radio.ServiceLabelCharset);
+  if (radio.isFm() && tuning) value = "";
+
   FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
-  if (radio.ASCII(radio.ServiceData, radio.ServiceLabelCharset).length() > 0) {
-    RTWidth = tft.textWidth(radio.ASCII(radio.ServiceData, radio.ServiceLabelCharset));
+  if (value.length() > 0) {
+    RTWidth = tft.textWidth(value);
     if (RTWidth < 300) {
       xPos = 0;
       FullLineSprite.setTextDatum(TC_DATUM);
-      FullLineSprite.drawString(String(radio.ASCII(radio.ServiceData, radio.ServiceLabelCharset)), 154, 1);
+      FullLineSprite.drawString(value, 154, 1);
       FullLineSprite.pushSprite(6, 219);
     } else {
       if (millis() - rtticker >= 20) {
@@ -829,8 +839,8 @@ void ShowRT(void) {
 
         if (xPos < -RTWidth - 50) xPos = 0;
         FullLineSprite.setTextDatum(TL_DATUM);
-        FullLineSprite.drawString(String(radio.ASCII(radio.ServiceData, radio.ServiceLabelCharset)), xPos, 1);
-        FullLineSprite.drawString(String(radio.ASCII(radio.ServiceData, radio.ServiceLabelCharset)), xPos + RTWidth + 50, 1);
+        FullLineSprite.drawString(value, xPos, 1);
+        FullLineSprite.drawString(value, xPos + RTWidth + 50, 1);
         FullLineSprite.pushSprite(6, 219);
         rtticker = millis();
       }
@@ -838,13 +848,15 @@ void ShowRT(void) {
   } else {
     FullLineSprite.pushSprite(6, 220);
   }
-  if (RTold != radio.ASCII(radio.ServiceData, radio.ServiceLabelCharset)) xPos = 0;
-  RTold = radio.ASCII(radio.ServiceData, radio.ServiceLabelCharset);
+  if (RTold != value) xPos = 0;
+  RTold = value;
 }
 
 void ShowSID(void) {
   if (radio.isFm()) {
-    const String value = radio.fmPi ? String(radio.fmPty) : "";
+    const String value = (!tuning && fmPtyValid && radio.fmPty <= 31)
+                             ? String(radio.fmPty)
+                             : "";
     if (value != SIDold || displayreset) {
       ShortSprite.pushImage(-38, -120, 320, 240, Background);
       ShortSprite.setTextDatum(TL_DATUM);
@@ -868,7 +880,7 @@ void ShowSID(void) {
 
 void ShowEID(void) {
   if (radio.isFm()) {
-    String value = radio.fmPi ? String(radio.fmPi, HEX) : "";
+    String value = (!tuning && radio.fmPi) ? String(radio.fmPi, HEX) : "";
     value.toUpperCase();
     while (value.length() > 0 && value.length() < 4) value = "0" + value;
     if (value != EIDold || displayreset) {
@@ -894,7 +906,7 @@ void ShowEID(void) {
 
 void ShowPS(void) {
   if (radio.isFm()) {
-    String value = String(radio.fmPs);
+    String value = tuning ? "" : String(radio.fmPs);
     value.trim();
     // The station-name field has only two visible states: placeholder while
     // PS is unknown/acquiring, then the decoder-confirmed eight-character PS.
