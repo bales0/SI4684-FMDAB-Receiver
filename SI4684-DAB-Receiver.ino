@@ -1009,6 +1009,10 @@ void ProcessDAB(void) {
   if (radioMode == RADIO_MODE_DAB && trysetservice && radio.signallock) {
     for (byte x = 0; x < radio.numberofservices; x++) {
       if (_serviceID == radio.service[x].ServiceID) {
+        // Keep the requested service name visible while START_DIGITAL_SERVICE
+        // completes asynchronously; do not flash a generic placeholder.
+        strncpy(_serviceName, radio.service[x].Label, sizeof(_serviceName));
+        _serviceName[sizeof(_serviceName) - 1] = '\0';
         radio.setService(x);
         trysetservice = false;
         store = true;
@@ -1024,12 +1028,10 @@ void ProcessDAB(void) {
     slsWaitingView = false;
     Serial.println("[SLS/UI] complete image received; closing waiting overlay");
   }
-  if (slsWaitingView && !menu && !slsReceiving) {
-    slsWaitingView = false;
-    SlideShowView = false;
-    slsDisplayedFingerprintValid = false;
-    RestoreMainDisplayAfterSlideshow();
-  }
+  // Manual slideshow waiting is sticky. MOT reception can legitimately become
+  // idle between objects/segments; that is not a reason to close the view.
+  // The user can cancel the waiting view explicitly, or a complete image below
+  // will replace the overlay.
 
   if ((!SlideShowView || slsWaitingView) && !menu) {
     if (!ChannelListView) ShowSignalLevel();
@@ -1155,6 +1157,12 @@ void DABSelectService(bool dir) {
       }
     }
 
+    // setService() intentionally clears ServiceStart until the asynchronous
+    // START_DIGITAL_SERVICE command finishes. Preserve the target label so the
+    // UI can transition directly from the old service name to the new one.
+    strncpy(_serviceName, radio.service[radio.ServiceIndex].Label,
+            sizeof(_serviceName));
+    _serviceName[sizeof(_serviceName) - 1] = '\0';
     radio.setService(radio.ServiceIndex);
     store = true;
   }
@@ -1401,6 +1409,7 @@ void ModeButtonPress(void) {
       }
       MarkEepromDirty();
       menu = false;
+      menuopen = false;
       if (requestedRadioMode != radioMode) {
         if (!SwitchRadioMode(requestedRadioMode)) requestedRadioMode = radioMode;
       }

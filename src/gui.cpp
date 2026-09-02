@@ -195,7 +195,10 @@ void ShowServiceInfo(void) {
   tftPrint(-1, "dB", 286, 56, PrimaryColor, PrimaryColorSmooth, 16);
   tftPrint(-1, radio.ASCII(radio.EnsembleLabel, radio.EnsembleLabelCharset), 166, 76, PrimaryColor, PrimaryColorSmooth, 16);
   tftPrint(-1, radio.ASCII(radio.service[radio.ServiceIndex].Label, radio.ServiceLabelCharset), 166, 96, PrimaryColor, PrimaryColorSmooth, 16);
-  tftPrint(-1, String(radio.pty, DEC) + ": " + String(myLanguage[language][37 + radio.pty]), 166, 116, PrimaryColor, PrimaryColorSmooth, 16);
+  String ptyInfo = "";
+  if (radio.ServiceStart && radio.pty <= 29)
+    ptyInfo = String(radio.pty, DEC) + ": " + String(myLanguage[language][37 + radio.pty]);
+  tftPrint(-1, ptyInfo, 166, 116, PrimaryColor, PrimaryColorSmooth, 16);
   tftPrint(-1, ProtectionText[radio.protectionlevel], 166, 136, PrimaryColor, PrimaryColorSmooth, 16);
   String bitrateString = String(radio.samplerate);
   bitrateString = bitrateString.substring(0, 2) + "." + bitrateString.substring(2);
@@ -370,6 +373,9 @@ void ShowOneLine(byte position, byte item, bool selected) {
 
 // Full redraw of the settings menu (entered by long-pressing MODE).
 void BuildMenu(void) {
+  // A full menu rebuild always means the top-level menu is active. This also
+  // clears a stale About/submenu latch when the menu was left by another key.
+  menuopen = false;
   SlideShowView = false;
   slsWaitingView = false;
   ShowServiceInformation = false;
@@ -432,6 +438,10 @@ void BuildDisplay(void) {
 // Menu navigation: handle the rotary-up event while the settings menu is
 // open. Either steps a value of the current row or moves to the next row.
 void MenuUp(void) {
+  // About (ITEM9) has no editable value. Ignore rotary movement completely
+  // while it is open so the generic popup sprite cannot overwrite the page.
+  if (menuopen && menuoption == ITEM9) return;
+
   if (!menuopen) {
     ShowOneLine(menuoption, menuitem, false);
     menuoption += ITEM_GAP;
@@ -530,6 +540,10 @@ void MenuUp(void) {
 
 // Menu navigation: rotary-down counterpart of MenuUp().
 void MenuDown(void) {
+  // About (ITEM9) has no editable value. Ignore rotary movement completely
+  // while it is open so the generic popup sprite cannot overwrite the page.
+  if (menuopen && menuoption == ITEM9) return;
+
   if (!menuopen) {
     ShowOneLine(menuoption, menuitem, false);
     menuoption -= ITEM_GAP;
@@ -768,15 +782,26 @@ void ShowFreq(void) {
 }
 
 void ShowPTY(void) {
-  if (radio.isFm()) radio.pty = radio.fmPty;
-  else if (!radio.ServiceStart) radio.pty = 36;
-  if (radio.pty != ptyold || displayreset) {
+  const uint8_t ptyValue = radio.isFm() ? radio.fmPty : radio.pty;
+  String value = "";
+
+  // myLanguage[][37] is PTY 0 ("Unknown"), so 37 + PTY is correct for
+  // real PTY values. DAB PTY 30/31 are unused; radio.pty == 36 is only
+  // an internal "not available yet" sentinel and must never index the table.
+  if (radio.isFm()) {
+    if (ptyValue <= 31)
+      value = myLanguage[language][37 + ptyValue];
+  } else if (radio.ServiceStart && ptyValue <= 29) {
+    value = myLanguage[language][37 + ptyValue];
+  }
+
+  if (ptyValue != ptyold || displayreset) {
     LongSprite.pushImage(-8, -162, 320, 240, Background);
     LongSprite.setTextDatum(TC_DATUM);
     LongSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
-    LongSprite.drawString(myLanguage[language][37 + radio.pty], 75, 0);
+    LongSprite.drawString(value, 75, 0);
     LongSprite.pushSprite(8, 162);
-    ptyold = radio.pty;
+    ptyold = ptyValue;
   }
 }
 
@@ -884,29 +909,56 @@ void ShowPS(void) {
     }
     return;
   }
-  if (tunemode != TUNE_MEM && !radio.ServiceStart && !tuning && !seek) {
-    if (radio.signallock && !radio.ServiceStart) {
-      strncpy(_serviceName, (radio.numberofservices > 0 ? myLanguage[language][74] : myLanguage[language][73]), sizeof(_serviceName));
-      _serviceName[sizeof(_serviceName) - 1] = '\0';
-    } else if (radio.signallock && radio.ServiceStart) {
-      for (byte x = 0; x < 16; x++) _serviceName[x] = '\0';
-    } else if (!trysetservice) {
-      for (byte x = 0; x < 16; x++) _serviceName[x] = '\0';
+
+  String value;
+
+  if (radio.ServiceStart) {
+    value = radio.ASCII(radio.PStext, radio.ServiceLabelCharset);
+
+    // CurrentServiceInfo can arrive shortly after START_DIGITAL_SERVICE.
+    // Until then keep the already selected service-list label visible.
+    if (value.length() == 0 &&
+        radio.numberofservices > 0 &&
+        radio.ServiceIndex < radio.numberofservices) {
+      value = radio.ASCII(radio.service[radio.ServiceIndex].Label,
+                          radio.ServiceLabelCharset);
     }
-  } else if (tunemode != TUNE_MEM && !tuning) {
-    strcpy(_serviceName, radio.service[radio.ServiceIndex].Label);
+  } else if (tuning || seek) {
+    // A new multiplex is still being tuned.
+    value = "";
+  } else if (radio.signallock) {
+    if (radio.numberofservices == 0) {
+      value = myLanguage[language][73];  // Waiting for list
+    } else {
+      // During asynchronous service selection/restoration _serviceName equals
+      // the target service-list label. Otherwise no service has been selected.
+      String pendingName = radio.ASCII(_serviceName, radio.ServiceLabelCharset);
+      String indexedName;
+      if (radio.ServiceIndex < radio.numberofservices)
+        indexedName = radio.ASCII(radio.service[radio.ServiceIndex].Label,
+                                  radio.ServiceLabelCharset);
+
+      if (pendingName.length() > 0 && pendingName == indexedName)
+        value = pendingName;
+      else
+        value = myLanguage[language][74];  // Select service
+    }
+  } else if (trysetservice) {
+    // On boot/recovery the stored name may be known before lock/list arrives.
+    value = radio.ASCII(_serviceName, radio.ServiceLabelCharset);
+  } else {
+    value = "";
   }
 
-  if ((radio.ServiceStart ? radio.ASCII(radio.service[radio.ServiceIndex].Label, radio.ServiceLabelCharset) : radio.ASCII(_serviceName, radio.ServiceLabelCharset)) != PSold || displayreset) {
-    if (tunemode != TUNE_MEM || (tunemode == TUNE_MEM && String((radio.signallock && radio.ServiceStart ? radio.ASCII(radio.PStext, radio.ServiceLabelCharset) : radio.ASCII(_serviceName, radio.ServiceLabelCharset))).length() != 0)) {
+  if (value != PSold || displayreset) {
+    if (tunemode != TUNE_MEM || value.length() != 0) {
       OneBigLineSprite.pushImage(-44, -185, 320, 240, Background);
       OneBigLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
       OneBigLineSprite.setTextDatum(TC_DATUM);
-      OneBigLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
-      OneBigLineSprite.drawString(String((radio.ServiceStart ? radio.ASCII(radio.PStext, radio.ServiceLabelCharset) : (radio.signallock && tunemode != TUNE_MEM && !tuning && !seek ? (radio.numberofservices > 0 ? myLanguage[language][74] : myLanguage[language][73]) : radio.ASCII(_serviceName, radio.ServiceLabelCharset)))), 130, 4);
+      OneBigLineSprite.drawString(value, 130, 4);
       OneBigLineSprite.pushSprite(44, 185);
     }
-    PSold = (radio.ServiceStart ? radio.ASCII(radio.PStext, radio.ServiceLabelCharset) : radio.ASCII(_serviceName, radio.ServiceLabelCharset));
+    PSold = value;
   }
 }
 
@@ -1003,6 +1055,11 @@ void ShowAudioMode(void) {
   }
 }
 
+static void ClearDabFlagArea(void) {
+  // An empty flag slot is intentionally quieter than the old '???' bitmap.
+  tft.fillRect(80, 110, 36, 23, BackgroundColor3);
+}
+
 void ShowECC(void) {
   if (radio.isFm()) return;
   if (eccold != radio.ecc || displayreset) {
@@ -1015,7 +1072,7 @@ void ShowECC(void) {
           case 0xe2: tft.pushImage(80, 110, 36, 23, ma); ITU = "MRC"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, me); ITU = "MNE"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, md); ITU = "MDA"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1026,7 +1083,7 @@ void ShowECC(void) {
           case 0xe2: tft.pushImage(80, 110, 36, 23, cz); ITU = "CZE"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, ie); ITU = "IRL"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, ee); ITU = "EST"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1037,7 +1094,7 @@ void ShowECC(void) {
           case 0xe2: tft.pushImage(80, 110, 36, 23, pl); ITU = "POL"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, tr); ITU = "TUR"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, mk); ITU = "MKD"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1046,7 +1103,7 @@ void ShowECC(void) {
           case 0xe0: tft.pushImage(80, 110, 36, 23, il); ITU = "ISR"; break;
           case 0xe1: tft.pushImage(80, 110, 36, 23, ch); ITU = "SUI"; break;
           case 0xe2: tft.pushImage(80, 110, 36, 23, va); ITU = "CVA"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1056,7 +1113,7 @@ void ShowECC(void) {
           case 0xe1: tft.pushImage(80, 110, 36, 23, jo); ITU = "JOR"; break;
           case 0xe2: tft.pushImage(80, 110, 36, 23, sk); ITU = "SVK"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, tj); ITU = "TJK"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1066,7 +1123,7 @@ void ShowECC(void) {
           case 0xe1: tft.pushImage(80, 110, 36, 23, fi); ITU = "FNL"; break;
           case 0xe2: tft.pushImage(80, 110, 36, 23, sy); ITU = "SYR"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, ua); ITU = "UKR"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1076,7 +1133,7 @@ void ShowECC(void) {
           case 0xe1: tft.pushImage(80, 110, 36, 23, lu); ITU = "LUX"; break;
           case 0xe2: tft.pushImage(80, 110, 36, 23, tn); ITU = "TUN"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, kz); ITU = "XXK"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1087,7 +1144,7 @@ void ShowECC(void) {
           case 0xe2: tft.pushImage(80, 110, 36, 23, m1); ITU = "MDR"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, nl); ITU = "HOL"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, pt); ITU = "POR"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1098,7 +1155,7 @@ void ShowECC(void) {
           case 0xe2: tft.pushImage(80, 110, 36, 23, li); ITU = "LIE"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, lv); ITU = "LVA"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, si); ITU = "SVN"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1109,7 +1166,7 @@ void ShowECC(void) {
           case 0xe2: tft.pushImage(80, 110, 36, 23, is); ITU = "ISL"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, lb); ITU = "LBN"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, am); ITU = "ARM"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1120,7 +1177,7 @@ void ShowECC(void) {
           case 0xe2: tft.pushImage(80, 110, 36, 23, mc); ITU = "MCO"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, az); ITU = "AZE"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, uz); ITU = "UZB"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1131,7 +1188,7 @@ void ShowECC(void) {
           case 0xe2: tft.pushImage(80, 110, 36, 23, lt); ITU = "LTU"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, hr); ITU = "HRV"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, ge); ITU = "GEO"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1141,7 +1198,7 @@ void ShowECC(void) {
           case 0xe1: tft.pushImage(80, 110, 36, 23, ly); ITU = "LBY"; break;
           case 0xe2: tft.pushImage(80, 110, 36, 23, rs); ITU = "SRB"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, kz); ITU = "KAZ"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1152,7 +1209,7 @@ void ShowECC(void) {
           case 0xe2: tft.pushImage(80, 110, 36, 23, es); ITU = "E"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, se); ITU = "S"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, tm); ITU = "TKM"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
 
@@ -1163,10 +1220,10 @@ void ShowECC(void) {
           case 0xe2: tft.pushImage(80, 110, 36, 23, no); ITU = "NOR"; break;
           case 0xe3: tft.pushImage(80, 110, 36, 23, by); ITU = "BLR"; break;
           case 0xe4: tft.pushImage(80, 110, 36, 23, ba); ITU = "BIH"; break;
-          default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+          default: ClearDabFlagArea(); ITU = ""; break;
         }
         break;
-      default: tft.pushImage(80, 110, 36, 23, unknown); ITU = ""; break;
+      default: ClearDabFlagArea(); ITU = ""; break;
     }
     tftReplace(0, ITUold, ITU, 97, 140, SecondaryColor, SecondaryColorSmooth, BackgroundColor3, 16);
     eccold = radio.ecc;
