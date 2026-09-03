@@ -39,6 +39,7 @@
 #include "soc/rtc_cntl_reg.h"
 #include "esp_system.h"
 #include <EEPROM.h>
+#include <cstdlib>
 #include <Wire.h>
 #include "src/font.h"
 #include "src/constants.h"
@@ -49,6 +50,7 @@
 #include "src/slideshow.h"
 #include "src/si4684.h"
 #include "src/TPA6130A2.h"
+#include "src/ir_remote.h"
 
 TPA6130A2 Headphones;
 DAB radio;
@@ -100,6 +102,8 @@ RadioMode radioMode = RADIO_MODE_DAB;
 RadioMode requestedRadioMode = RADIO_MODE_DAB;
 uint8_t fmRegion = static_cast<uint8_t>(FmRegion::Europe);
 uint8_t requestedFmRegion = static_cast<uint8_t>(FmRegion::Europe);
+uint8_t gpio12Mode = GPIO12_AUTO;
+uint8_t requestedGpio12Mode = GPIO12_AUTO;
 uint16_t fmfreq = 8750;
 char _serviceName[17];
 const uint8_t* currentFont = nullptr;
@@ -160,6 +164,21 @@ unsigned long VolumeTimer;
 unsigned long EepromDirtyTimer;
 unsigned long RadioSwitchMuteTimer;
 
+struct SettingsSnapshot {
+  uint8_t language;
+  uint8_t contrast;
+  bool autoslideshow;
+  uint8_t unit;
+  uint8_t tot;
+  uint8_t theme;
+  RadioMode radioMode;
+  uint8_t fmRegion;
+  uint8_t gpio12Mode;
+};
+
+static SettingsSnapshot settingsOriginal{};
+static bool settingsSnapshotValid = false;
+
 static const int8_t enc_states[]  = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
 
 typedef struct _Memory {
@@ -183,7 +202,7 @@ TFT_eSprite QualityBarSprite = TFT_eSprite(&tft);
 TFT_eSprite ShortSprite = TFT_eSprite(&tft);
 
 DABMemory memory[EE_PRESETS_CNT];
-FmMemory fmMemory[EE_PRESETS_CNT];
+FmMemory* fmMemory = nullptr;
 
 // Forward declarations
 void DefaultSettings(void);
@@ -216,6 +235,11 @@ void MarkEepromDirty(void);
 void FlushEeprom(void);
 void LogRamUsage(const char* tag);
 void SlideshowReceptionState(bool active);
+void CaptureSettingsSnapshot(void);
+void ExitSettingsMenu(void);
+void CycleTuneMode(void);
+void RemoteModeAction(void);
+void RemoteVolumeStep(int8_t delta);
 
 
 
@@ -381,6 +405,11 @@ void FlushEeprom(void) {
   eepromDirty = false;
 }
 
+static void ClearIrProfileStorage(void) {
+  for (int i = EE_IR_CONFIG_START; i < EE_IR_CONFIG_END; ++i)
+    EEPROM.writeByte(i, 0);
+}
+
 static void WriteEmptyFmPresetsV4(void) {
   for (int i = 0; i < EE_PRESETS_CNT; ++i) {
     EEPROM.put(EE_FM_PRESETS_FREQ_START + i * 2,
@@ -393,20 +422,22 @@ static void WriteEmptyFmPresetsV4(void) {
   }
 }
 
-static void MigrateSchema2To4(void) {
-  Serial.println("[EEPROM] migrate schema 2 -> 4");
+static void MigrateSchema2ToCurrent(void) {
+  Serial.println("[EEPROM] migrate schema 2 -> 5");
   // Schema 2 has no FM records. Preserve every DAB byte and initialise only
   // the newly allocated FM settings/tail.
   EEPROM.writeByte(EE_BYTE_RADIO_MODE, RADIO_MODE_DAB);
   EEPROM.put(EE_UINT16_FM_FREQUENCY, static_cast<uint16_t>(8750));
   EEPROM.writeByte(EE_BYTE_FM_REGION, static_cast<uint8_t>(FmRegion::Europe));
+  EEPROM.writeByte(EE_BYTE_GPIO12_MODE, GPIO12_AUTO);
   WriteEmptyFmPresetsV4();
+  ClearIrProfileStorage();
   EEPROM.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
   EEPROM.commit();
   eepromDirty = false;
 }
 
-static void MigrateSchema3To4(void) {
+static void MigrateSchema3ToCurrent(void) {
   struct LegacyFmPreset {
     uint8_t frequencyIndex;
     uint32_t pi;
@@ -414,7 +445,7 @@ static void MigrateSchema3To4(void) {
   };
   LegacyFmPreset snapshot[EE_PRESETS_CNT];
 
-  Serial.println("[EEPROM] migrate schema 3 -> 4");
+  Serial.println("[EEPROM] migrate schema 3 -> 5");
   // The v4 frequency and PI arrays overlap all three v3 arrays. Snapshot all
   // 99 source records before writing even the first destination byte.
   for (int i = 0; i < EE_PRESETS_CNT; ++i) {
@@ -444,14 +475,27 @@ static void MigrateSchema3To4(void) {
                        snapshot[i].label[y]);
   }
   EEPROM.writeByte(EE_BYTE_FM_REGION, static_cast<uint8_t>(FmRegion::Europe));
+  EEPROM.writeByte(EE_BYTE_GPIO12_MODE, GPIO12_AUTO);
+  ClearIrProfileStorage();
   EEPROM.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
   EEPROM.commit();
   eepromDirty = false;
   Serial.printf("[EEPROM] migrated %u FM presets\n", migrated);
 }
 
+static void MigrateSchema4ToCurrent(void) {
+  Serial.println("[EEPROM] migrate schema 4 -> 5 (GPIO12/IR metadata only)");
+  // Schema 4 already has the final DAB/FM layout. Preserve every existing
+  // setting and preset; initialize only bytes that were reserved in schema 4.
+  EEPROM.writeByte(EE_BYTE_GPIO12_MODE, GPIO12_AUTO);
+  ClearIrProfileStorage();
+  EEPROM.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
+  EEPROM.commit();
+  eepromDirty = false;
+}
+
 // DAB records keep their original byte-for-byte schema. FM records are loaded
-// separately because schema 4 stores an absolute uint16_t frequency and PI.
+// separately because schema 4+ stores an absolute uint16_t frequency and PI.
 void LoadPresets(void) {
   for (int i = 0; i < EE_PRESETS_CNT; ++i) {
     if (radioMode == RADIO_MODE_FM) {
@@ -604,8 +648,12 @@ bool SwitchRadioMode(RadioMode newMode, bool force) {
   SlideShowView = false;
   if (radioMode == RADIO_MODE_FM) {
     fmfreq = normalizeFmFrequency(fmfreq, fmRegion);
-    EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
-    MarkEepromDirty();
+    uint16_t storedFmFrequency = 0;
+    EEPROM.get(EE_UINT16_FM_FREQUENCY, storedFmFrequency);
+    if (storedFmFrequency != fmfreq) {
+      EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
+      MarkEepromDirty();
+    }
     radio.setFmFrequency(fmfreq);
   } else {
     radio.setFreq(dabfreq);
@@ -622,6 +670,136 @@ bool SwitchRadioMode(RadioMode newMode, bool force) {
   RadioSwitchMuteTimer = millis();
   return true;
 }
+
+void CaptureSettingsSnapshot(void) {
+  settingsOriginal.language = language;
+  settingsOriginal.contrast = ContrastSet;
+  settingsOriginal.autoslideshow = autoslideshow;
+  settingsOriginal.unit = unit;
+  settingsOriginal.tot = tot;
+  settingsOriginal.theme = CurrentTheme;
+  settingsOriginal.radioMode = radioMode;
+  settingsOriginal.fmRegion = fmRegion;
+  settingsOriginal.gpio12Mode = gpio12Mode;
+  requestedRadioMode = radioMode;
+  requestedFmRegion = fmRegion;
+  requestedGpio12Mode = gpio12Mode;
+  settingsSnapshotValid = true;
+}
+
+void ExitSettingsMenu(void) {
+  if (!menu) return;
+  IrRemoteUiAbort();
+  if (!settingsSnapshotValid) CaptureSettingsSnapshot();
+
+  const uint8_t selectedRegion = sanitizeFmRegion(requestedFmRegion);
+  const uint8_t selectedGpio12 = sanitizeGpio12Mode(requestedGpio12Mode);
+  const bool gpio12Changed = selectedGpio12 != settingsOriginal.gpio12Mode;
+  const bool radioModeChanged = requestedRadioMode != settingsOriginal.radioMode;
+  const bool fmRegionChanged = selectedRegion != settingsOriginal.fmRegion;
+  bool settingsChanged = false;
+
+  auto writeByteChanged = [&](int address, uint8_t current, uint8_t original) {
+    if (current == original) return;
+    EEPROM.writeByte(address, current);
+    settingsChanged = true;
+  };
+
+  writeByteChanged(EE_BYTE_LANGUAGE, language, settingsOriginal.language);
+  writeByteChanged(EE_BYTE_CONTRASTSET, ContrastSet, settingsOriginal.contrast);
+  writeByteChanged(EE_BYTE_AUTOSLIDESHOW, autoslideshow ? 1U : 0U,
+                   settingsOriginal.autoslideshow ? 1U : 0U);
+  writeByteChanged(EE_BYTE_UNIT, unit, settingsOriginal.unit);
+  writeByteChanged(EE_BYTE_TOT, tot, settingsOriginal.tot);
+  writeByteChanged(EE_BYTE_THEME, CurrentTheme, settingsOriginal.theme);
+
+  if (fmRegionChanged) {
+    EEPROM.writeByte(EE_BYTE_FM_REGION, selectedRegion);
+    settingsChanged = true;
+    const uint16_t previousFrequency = fmfreq;
+    fmfreq = normalizeFmFrequency(fmfreq, selectedRegion);
+    if (fmfreq != previousFrequency) EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
+    fmRegion = selectedRegion;
+  }
+
+  if (gpio12Changed) {
+    EEPROM.writeByte(EE_BYTE_GPIO12_MODE, selectedGpio12);
+    settingsChanged = true;
+    if (radioModeChanged) {
+      EEPROM.writeByte(EE_BYTE_RADIO_MODE, static_cast<uint8_t>(requestedRadioMode));
+      settingsChanged = true;
+    }
+  }
+
+  if (settingsChanged) MarkEepromDirty();
+  menu = false;
+  menuopen = false;
+  settingsSnapshotValid = false;
+
+  if (gpio12Changed) {
+    FlushEeprom();
+    ShowStatusOverlay("Restarting...");
+    delay(250);
+    // Match the FM/DAB transition behaviour: hide the TFT reset/boot interval
+    // so the panel cannot flash white or show partial reset contents.
+    analogWrite(CONTRASTPIN, 0);
+    delay(20);
+    ESP.restart();
+    return;
+  }
+
+  if (fmRegionChanged) {
+    const bool stayingInFm = radioMode == RADIO_MODE_FM &&
+                             requestedRadioMode == RADIO_MODE_FM;
+    radio.setFmRegion(fmRegion, stayingInFm);
+    if (stayingInFm) {
+      LoadPresets();
+      radio.setFmFrequency(fmfreq);
+    }
+    Serial.printf("[FM/REGION] selected %s normalized=%u\n",
+                  fmRegionProfile(fmRegion).menuName, fmfreq);
+  }
+
+  if (requestedRadioMode != radioMode) {
+    if (!SwitchRadioMode(requestedRadioMode)) requestedRadioMode = radioMode;
+  } else {
+    BuildDisplay();
+  }
+}
+
+void CycleTuneMode(void) {
+  const byte previous = tunemode;
+  tunemode++;
+  if (tunemode > TUNE_MEM) tunemode = TUNE_MAN;
+  if (tunemode != previous) {
+    EEPROM.writeByte(EE_BYTE_TUNEMODE, tunemode);
+    MarkEepromDirty();
+  }
+  ShowTuneModeCurrent();
+  ShowMemoryPos();
+}
+
+void RemoteModeAction(void) {
+  tottimer = millis();
+  seek = false;
+  dabSeekStarted = false;
+  fmSeekStarted = false;
+  if (menu) ExitSettingsMenu();
+  else if (SlideShowView || ChannelListView || ShowServiceInformation) BuildDisplay();
+  else CycleTuneMode();
+}
+
+void RemoteVolumeStep(int8_t delta) {
+  setvolume = true;
+  const int next = constrain(static_cast<int>(volume) + delta, 0, 62);
+  if (next != volume) {
+    volume = static_cast<byte>(next);
+    EEPROM.writeByte(EE_BYTE_VOLUME, volume);
+    MarkEepromDirty();
+  }
+  ShowVolume();
+}
+
 
 // Edge-detect helper for buttons that have a single, immediate action.
 // Returns true exactly once per physical press; rearmed only after the
@@ -667,6 +845,19 @@ void setup(void) {
   gpio_set_drive_capability((gpio_num_t) 22, GPIO_DRIVE_CAP_0);
   Serial.printf("[BOOT] GPIO drive config OK; heap=%u\n", ESP.getFreeHeap());
 
+  // The FM preset cache is permanent runtime state but does not need to occupy
+  // linker-reserved .bss. Allocate it from the normal internal heap instead.
+  // This leaves additional static DRAM headroom for IRremote on classic ESP32.
+  fmMemory = static_cast<FmMemory*>(calloc(EE_PRESETS_CNT, sizeof(FmMemory)));
+  if (!fmMemory) {
+    Serial.printf("[BOOT] FATAL: FM preset cache allocation failed (%u bytes)\n",
+                  static_cast<unsigned>(EE_PRESETS_CNT * sizeof(FmMemory)));
+    while (true) delay(1000);
+  }
+  Serial.printf("[BOOT] FM preset cache heap allocation=%u bytes; heap=%u\n",
+                static_cast<unsigned>(EE_PRESETS_CNT * sizeof(FmMemory)),
+                ESP.getFreeHeap());
+
   // EEPROM check byte acts as a schema version. Known schemas are migrated
   // without changing the DAB layout; only unknown/corrupt values use defaults.
   Serial.println("[BOOT] EEPROM.begin");
@@ -674,9 +865,11 @@ void setup(void) {
   const uint8_t storedSchema = EEPROM.readByte(EE_BYTE_CHECKBYTE);
   Serial.printf("[BOOT] EEPROM OK schema=%u\n", storedSchema);
   if (storedSchema == EE_CHECKBYTE_DAB_ONLY) {
-    MigrateSchema2To4();
+    MigrateSchema2ToCurrent();
   } else if (storedSchema == EE_CHECKBYTE_FM_INDEXED) {
-    MigrateSchema3To4();
+    MigrateSchema3ToCurrent();
+  } else if (storedSchema == EE_CHECKBYTE_FM_ABSOLUTE) {
+    MigrateSchema4ToCurrent();
   } else if (storedSchema != EE_CHECKBYTE_VALUE) {
     DefaultSettings();
   }
@@ -685,7 +878,11 @@ void setup(void) {
   displayflip = EEPROM.readByte(EE_BYTE_DISPLAYFLIP);
   rotarymode = EEPROM.readByte(EE_BYTE_ROTARYMODE);
   tunemode = EEPROM.readByte(EE_BYTE_TUNEMODE);
-  if (tunemode > TUNE_MEM) tunemode = TUNE_MAN;
+  if (tunemode > TUNE_MEM) {
+    tunemode = TUNE_MAN;
+    EEPROM.writeByte(EE_BYTE_TUNEMODE, tunemode);
+    MarkEepromDirty();
+  }
   unit = EEPROM.readByte(EE_BYTE_UNIT);
   dabfreq = EEPROM.readByte(EE_BYTE_DABFREQ);
   volume = EEPROM.readByte(EE_BYTE_VOLUME);
@@ -697,13 +894,27 @@ void setup(void) {
   requestedRadioMode = radioMode;
   fmRegion = sanitizeFmRegion(EEPROM.readByte(EE_BYTE_FM_REGION));
   requestedFmRegion = fmRegion;
+  const uint8_t storedGpio12Mode = EEPROM.readByte(EE_BYTE_GPIO12_MODE);
+  gpio12Mode = sanitizeGpio12Mode(storedGpio12Mode);
+  requestedGpio12Mode = gpio12Mode;
+  if (storedGpio12Mode != gpio12Mode) {
+    EEPROM.writeByte(EE_BYTE_GPIO12_MODE, gpio12Mode);
+    MarkEepromDirty();
+  }
   EEPROM.get(EE_UINT16_FM_FREQUENCY, fmfreq);
   fmfreq = normalizeFmFrequency(fmfreq, fmRegion);
   radio.setFmRegion(fmRegion, false);
-  Serial.printf("[BOOT] settings loaded: mode=%s DAB=%u FM=%u region=%s volume=%u theme=%u\n",
+  Serial.printf("[BOOT] settings loaded: mode=%s DAB=%u FM=%u region=%s GPIO12=%s volume=%u theme=%u\n",
                 radioMode == RADIO_MODE_FM ? "FM" : "DAB",
                 dabfreq, fmfreq, fmRegionProfile(fmRegion).menuName,
-                volume, CurrentTheme);
+                Gpio12ModeText[gpio12Mode], volume, CurrentTheme);
+
+  // IR tables live on the normal heap rather than linker-reserved .bss. In IR
+  // mode allocate both persistent tables once, early in boot, before the TFT
+  // and radio runtime can fragment the heap. They are never freed/reallocated.
+  if (gpio12Mode == GPIO12_IR && !IrRemotePrepare())
+    Serial.println("[BOOT] ERROR: IR persistent buffer allocation failed");
+
   LoadPresets();
   Serial.printf("[BOOT] presets loaded; heap=%u\n", ESP.getFreeHeap());
   LogRamUsage("after settings/presets");
@@ -760,6 +971,10 @@ void setup(void) {
 
   FullLineSprite.createSprite(308, 20);
   FullLineSprite.setSwapBytes(true);
+  // Every use of this 20-pixel sprite is a single line. With TFT_eSPI's
+  // default horizontal wrapping, the off-screen part of scrolling text is
+  // moved down by one font line and its top pixels leak into the bottom row.
+  FullLineSprite.setTextWrap(false, false);
 
   ModeSprite.createSprite(46, 47);
   ModeSprite.setTextDatum(TC_DATUM);
@@ -823,7 +1038,8 @@ void setup(void) {
   Serial.println("[V16] shared-reset recovery START");
   Serial.printf("[V16] TFT: CS=%d DC=%d TFT_RST=%d MOSI=%d MISO=%d SCLK=%d\n",
                 TFT_CS, TFT_DC, TFT_RST, TFT_MOSI, TFT_MISO, TFT_SCLK);
-  Serial.println("[V16] SI4684: CS=15 RST=17 MOSI=13 MISO=16 SCLK=14; INTB=GPIO12 auto-detect");
+  Serial.printf("[V16] SI4684: CS=15 RST=17 MOSI=13 MISO=16 SCLK=14; GPIO12=%s\n",
+                Gpio12ModeText[gpio12Mode]);
 
   // Initialise the radio SPI object on its own bus.
   pinMode(15, OUTPUT);
@@ -893,10 +1109,18 @@ void setup(void) {
   if (tunemode == TUNE_MEM && !IsStationEmpty()) {
     DoMemoryPosTune();
   } else if (radioMode == RADIO_MODE_FM) {
-    if (tunemode == TUNE_MEM) tunemode = TUNE_MAN;
+    if (tunemode == TUNE_MEM) {
+      tunemode = TUNE_MAN;
+      EEPROM.writeByte(EE_BYTE_TUNEMODE, tunemode);
+      MarkEepromDirty();
+    }
     radio.setFmFrequency(fmfreq);
   } else {
-    if (tunemode == TUNE_MEM) tunemode = TUNE_MAN;
+    if (tunemode == TUNE_MEM) {
+      tunemode = TUNE_MAN;
+      EEPROM.writeByte(EE_BYTE_TUNEMODE, tunemode);
+      MarkEepromDirty();
+    }
     radio.setFreq(dabfreq);
     EEPROM.get(EE_UINT32_SERVICEID, _serviceID);
     for (int i = 0; i < 16; i++) {
@@ -904,6 +1128,9 @@ void setup(void) {
     }
   }
   if (radioMode == RADIO_MODE_DAB && _serviceID != 0) trysetservice = true;
+
+  // GPIO12 role is selected at boot. AUTO never initializes IR.
+  if (gpio12Mode == GPIO12_IR) IrRemoteBegin();
 
   radioSwitchMuted = true;
   RadioSwitchMuteTimer = millis();
@@ -923,6 +1150,7 @@ void setup(void) {
 void loop(void) {
   ProcessDAB();
   Communication();
+  IrRemoteProcess();
   if (displayreset) ShowTuneModeCurrent();
   displayreset = false;
 
@@ -1222,24 +1450,41 @@ void ShowTuneModeCurrent(void) {
   }
 
   ModeSprite.pushSprite(6, 33);
-  EEPROM.writeByte(EE_BYTE_TUNEMODE, tunemode);
-  MarkEepromDirty();
 }
 
 void StoreFrequency(void) {
   if (radioMode == RADIO_MODE_FM) {
     fmfreq = radio.fmFrequency10kHz;
-    EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
-    MarkEepromDirty();
+    uint16_t storedFmFrequency = 0;
+    EEPROM.get(EE_UINT16_FM_FREQUENCY, storedFmFrequency);
+    if (storedFmFrequency != fmfreq) {
+      EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
+      MarkEepromDirty();
+    }
     return;
   }
-  EEPROM.put(EE_UINT32_SERVICEID, radio.service[radio.ServiceIndex].ServiceID);
-  EEPROM.put(EE_BYTE_DABFREQ, dabfreq);
-  for (int i = 0; i < 16; i++) {
-    EEPROM.writeByte(i + EE_CHAR17_SERVICENAME, radio.PStext[i]);
+
+  const uint32_t serviceId = radio.service[radio.ServiceIndex].ServiceID;
+  bool changed = false;
+  uint32_t storedServiceId = 0;
+  EEPROM.get(EE_UINT32_SERVICEID, storedServiceId);
+  if (storedServiceId != serviceId) {
+    EEPROM.put(EE_UINT32_SERVICEID, serviceId);
+    changed = true;
   }
-  MarkEepromDirty();
-  _serviceID = radio.service[radio.ServiceIndex].ServiceID;
+  if (EEPROM.readByte(EE_BYTE_DABFREQ) != dabfreq) {
+    EEPROM.writeByte(EE_BYTE_DABFREQ, dabfreq);
+    changed = true;
+  }
+  for (int i = 0; i < 16; ++i) {
+    if (EEPROM.readByte(i + EE_CHAR17_SERVICENAME) !=
+        static_cast<uint8_t>(radio.PStext[i])) {
+      EEPROM.writeByte(i + EE_CHAR17_SERVICENAME, radio.PStext[i]);
+      changed = true;
+    }
+  }
+  if (changed) MarkEepromDirty();
+  _serviceID = serviceId;
 }
 
 // Rotary 1 click: stores/recalls a memory preset when in TUNE_MEM, toggles
@@ -1286,6 +1531,8 @@ void ButtonPress(void) {
           memory[memorypos].Channel = dabfreq;
           memory[memorypos].ServiceID = radio.service[radio.ServiceIndex].ServiceID;
         }
+        if (EEPROM.readByte(EE_BYTE_MEMORYPOS) != memorypos)
+          EEPROM.writeByte(EE_BYTE_MEMORYPOS, memorypos);
         MarkEepromDirty();
 
         ShowTuneModeCurrent();
@@ -1366,21 +1613,11 @@ void SlideShowButtonPress(void) {
 void ModeButtonPress(void) {
   static unsigned long pressStart = 0;
   static bool actionDone = false;
-  bool pressed = (digitalRead(MODEBUTTON) == LOW);
+  const bool pressed = (digitalRead(MODEBUTTON) == LOW);
 
   if (!pressed) {
     if (pressStart != 0) {
-      if (!actionDone) {
-        if (radioMode == RADIO_MODE_FM) {
-          tunemode++;
-          if (tunemode > TUNE_MEM) tunemode = TUNE_MAN;
-        } else {
-          tunemode++;
-          if (tunemode > TUNE_MEM) tunemode = TUNE_MAN;
-        }
-        ShowTuneModeCurrent();
-        ShowMemoryPos();
-      }
+      if (!actionDone) CycleTuneMode();
       pressStart = 0;
       actionDone = false;
     }
@@ -1396,36 +1633,7 @@ void ModeButtonPress(void) {
     fmSeekStarted = false;
 
     if (menu) {
-      EEPROM.writeByte(EE_BYTE_LANGUAGE, language);
-      EEPROM.writeByte(EE_BYTE_CONTRASTSET, ContrastSet);
-      EEPROM.writeByte(EE_BYTE_AUTOSLIDESHOW, autoslideshow);
-      EEPROM.writeByte(EE_BYTE_UNIT, unit);
-      EEPROM.writeByte(EE_BYTE_TOT, tot);
-      EEPROM.writeByte(EE_BYTE_THEME, CurrentTheme);
-      const uint8_t selectedFmRegion = sanitizeFmRegion(requestedFmRegion);
-      const bool fmRegionChanged = selectedFmRegion != fmRegion;
-      if (fmRegionChanged) {
-        fmRegion = selectedFmRegion;
-        EEPROM.writeByte(EE_BYTE_FM_REGION, fmRegion);
-        fmfreq = normalizeFmFrequency(fmfreq, fmRegion);
-        EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
-        const bool stayingInFm = radioMode == RADIO_MODE_FM &&
-                                 requestedRadioMode == RADIO_MODE_FM;
-        radio.setFmRegion(fmRegion, stayingInFm);
-        if (stayingInFm) {
-          LoadPresets();
-          radio.setFmFrequency(fmfreq);
-        }
-        Serial.printf("[FM/REGION] selected %s normalized=%u\n",
-                      fmRegionProfile(fmRegion).menuName, fmfreq);
-      }
-      MarkEepromDirty();
-      menu = false;
-      menuopen = false;
-      if (requestedRadioMode != radioMode) {
-        if (!SwitchRadioMode(requestedRadioMode)) requestedRadioMode = radioMode;
-      }
-      else BuildDisplay();
+      ExitSettingsMenu();
       actionDone = true;
     } else if (SlideShowView || ChannelListView || ShowServiceInformation) {
       BuildDisplay();
@@ -1438,8 +1646,7 @@ void ModeButtonPress(void) {
   }
 
   if (!actionDone && (millis() - pressStart) > 1000) {
-    requestedRadioMode = radioMode;
-    requestedFmRegion = fmRegion;
+    CaptureSettingsSnapshot();
     menu = true;
     BuildMenu();
     actionDone = true;
@@ -1725,8 +1932,7 @@ void KeyUp2(void) {
   tottimer = millis();
 
   if (setvolume) {
-    if (volume < 62) volume += 2;
-    ShowVolume();
+    RemoteVolumeStep(+2);
   } else if (radioMode == RADIO_MODE_FM) {
     const uint8_t spacing = fmRegionProfile(fmRegion).seekSpacing10kHz;
     fmfreq = stepFmFrequency(fmfreq, spacing, fmRegion);
@@ -1758,8 +1964,7 @@ void KeyDown2(void) {
   rotary2 = 0;
 
   if (setvolume) {
-    if (volume > 0) volume -= 2;
-    ShowVolume();
+    RemoteVolumeStep(-2);
   } else if (radioMode == RADIO_MODE_FM) {
     const uint8_t spacing = fmRegionProfile(fmRegion).seekSpacing10kHz;
     fmfreq = stepFmFrequency(fmfreq, -static_cast<int16_t>(spacing), fmRegion);
@@ -1798,6 +2003,10 @@ void DoMemoryPosTune(void) {
         _serviceName[i] = memory[memorypos].Label[i];
     }
 
+    if (EEPROM.readByte(EE_BYTE_MEMORYPOS) != memorypos) {
+      EEPROM.writeByte(EE_BYTE_MEMORYPOS, memorypos);
+      MarkEepromDirty();
+    }
     ShowFreq();
     radio.ServiceStart = false;
     TuningTimer = millis();
@@ -1929,6 +2138,7 @@ void DefaultSettings(void) {
   EEPROM.writeByte(EE_BYTE_DABFREQ, 0);
   EEPROM.put(EE_UINT16_FM_FREQUENCY, static_cast<uint16_t>(8750));
   EEPROM.writeByte(EE_BYTE_FM_REGION, static_cast<uint8_t>(FmRegion::Europe));
+  EEPROM.writeByte(EE_BYTE_GPIO12_MODE, GPIO12_AUTO);
   for (int y = 0; y < 17; y++) {
     EEPROM.writeByte(EE_CHAR17_SERVICENAME + y, '\0');
   }
@@ -1941,6 +2151,7 @@ void DefaultSettings(void) {
     }
   }
   WriteEmptyFmPresetsV4();
+  ClearIrProfileStorage();
   EEPROM.commit();
   eepromDirty = false;
 }

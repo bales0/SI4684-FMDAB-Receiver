@@ -1,10 +1,6 @@
 // GUI module: all TFT rendering for the radio.
 // Renders directly to the 320x240 ILI9341 panel via TFT_eSPI, plus uses
-// TFT_eSprite objects (defined in the .ino) for flicker-free partial updates
-// of frequency, signal level, radiotext, slideshow icons, etc.
-//
-// Visual state lives in the bool flags declared below; the routines in
-// gui.cpp inspect those + the live radio.* fields to decide what to redraw.
+// TFT_eSprite objects (defined in the .ino) for flicker-free partial updates.
 
 #ifndef GUI_H
 #define GUI_H
@@ -58,6 +54,8 @@ extern RadioMode radioMode;
 extern RadioMode requestedRadioMode;
 extern uint8_t fmRegion;
 extern uint8_t requestedFmRegion;
+extern uint8_t gpio12Mode;
+extern uint8_t requestedGpio12Mode;
 extern uint16_t fmfreq;
 extern char _serviceName[17];
 extern int ActiveColor;
@@ -149,10 +147,11 @@ void ShowTuneMode(void);
 void ShowRSSI(void);
 void ShowOneLine(byte position, byte item, bool selected);
 
-extern void ShowTuneMode(void);
-extern void tftPrint(int8_t offset, const String & text, int16_t x, int16_t y, int color, int smoothcolor, uint8_t fontsize);
-extern void tftReplace(int8_t offset, const String & textold, const String & text, int16_t x, int16_t y, int color, int smoothcolor, int backcolor, uint8_t fontsize);
-extern void ShowMemoryPos(void);
+extern void tftPrint(int8_t offset, const String & text, int16_t x, int16_t y,
+                     int color, int smoothcolor, uint8_t fontsize);
+extern void tftReplace(int8_t offset, const String & textold, const String & text,
+                       int16_t x, int16_t y, int color, int smoothcolor,
+                       int backcolor, uint8_t fontsize);
 extern void loadFonts(bool option);
 extern bool IsStationEmpty(void);
 extern void MarkEepromDirty(void);

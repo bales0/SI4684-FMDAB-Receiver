@@ -12,6 +12,7 @@
 #include "esp_heap_caps.h"
 
 extern void SlideshowReceptionState(bool active);
+extern uint8_t gpio12Mode;
 #include "Si468xROM.h"
 // Arduino defines interrupts() as a function-like macro; the standalone
 // driver also has a reply field named `interrupts`.
@@ -34,6 +35,19 @@ bool EnsembleInfoSet;
 // tracked separately from fmPty itself. Cleared on every tune/seek and set
 // only after FM_RDS_STATUS explicitly reports TP/PTY valid.
 bool fmPtyValid = false;
+
+// DAB labels carry independent charset identifiers. Keep one 4-bit charset
+// value per *sorted* service row (32 bytes total). Si468x DLS service-data
+// packets carry their own control/charset bytes before the text payload, so
+// Dynamic Label decoding is independent from ServiceLabelCharset as well.
+static uint8_t dabServiceCharsetValue[32] = {0};
+static uint8_t dabDynamicLabelCharset = 0;
+static uint8_t dabDynamicLabelLength = 0;
+
+uint8_t DabServiceLabelCharset(uint8_t serviceIndex) {
+  return serviceIndex < 32 ? dabServiceCharsetValue[serviceIndex] : 0;
+}
+
 uint8_t slaveSelectPin;
 
 static si468x::Si468x chip;
@@ -536,16 +550,25 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   dabDsrvPending = false;
   dabDeviceEventPending = false;
 
-  // GPIO12 capability is detected exactly once per ESP32 run. A later
-  // FM/DAB switch or recovery resets the tuner, but restores this immutable HW
-  // result instead of probing the physical connection again.
+  // GPIO12 has an explicit boot-time role. INTB bypasses all detection and
+  // attaches the proven FALLING IRQ path immediately; IR never lets the radio
+  // driver own GPIO12. AUTO preserves the existing one-shot HW detection and
+  // reuses its result across later FM/DAB switches in the same ESP32 run.
   setRadioIntbInterrupt(false);
-  if (radioIntbCapability == RadioIntbCapability::Unknown)
-    radioControlMode = RADIO_CTRL_DETECT;
-  else if (radioIntbCapability == RadioIntbCapability::Present)
+  const uint8_t configuredGpio12Mode = sanitizeGpio12Mode(gpio12Mode);
+  if (configuredGpio12Mode == GPIO12_INTB) {
+    radioIntbCapability = RadioIntbCapability::Present;
     radioControlMode = RADIO_CTRL_INTB;
-  else
+  } else if (configuredGpio12Mode == GPIO12_IR) {
+    radioIntbCapability = RadioIntbCapability::Absent;
     radioControlMode = RADIO_CTRL_POLL;
+  } else if (radioIntbCapability == RadioIntbCapability::Unknown) {
+    radioControlMode = RADIO_CTRL_DETECT;
+  } else if (radioIntbCapability == RadioIntbCapability::Present) {
+    radioControlMode = RADIO_CTRL_INTB;
+  } else {
+    radioControlMode = RADIO_CTRL_POLL;
+  }
   __atomic_store_n(&radioIntbPending, false, __ATOMIC_RELEASE);
   __atomic_store_n(&radioIntbEdgeCount, 0U, __ATOMIC_RELEASE);
   __atomic_store_n(&radioIntbFallingCount, 0U, __ATOMIC_RELEASE);
@@ -569,18 +592,23 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   diagDabLastReportMs = 0;
   // GPIO12 is MTDI on classic ESP32. Hardware using it for INTB must have
   // VDD_SDIO fixed safely at 3.3 V; firmware never reads or writes eFuse.
-  pinMode(SI4684_INTB_PIN, INPUT_PULLUP);
-  if (radioControlMode == RADIO_CTRL_DETECT)
-    setRadioIntbInterrupt(true, CHANGE);
-  else if (radioControlMode == RADIO_CTRL_INTB)
-    setRadioIntbInterrupt(true, FALLING);
-  if (radioControlMode == RADIO_CTRL_DETECT)
-    Serial.println("[RADIO/IRQ] detecting INTB on GPIO12");
+  // In IR mode leave the pin completely to Arduino-IRremote.
+  if (configuredGpio12Mode != GPIO12_IR) {
+    pinMode(SI4684_INTB_PIN, INPUT_PULLUP);
+    if (radioControlMode == RADIO_CTRL_DETECT)
+      setRadioIntbInterrupt(true, CHANGE);
+    else if (radioControlMode == RADIO_CTRL_INTB)
+      setRadioIntbInterrupt(true, FALLING);
+  }
+  if (configuredGpio12Mode == GPIO12_INTB)
+    Serial.println("[RADIO/IRQ] GPIO12 setting INTB; FALLING IRQ active before radio commands");
+  else if (configuredGpio12Mode == GPIO12_IR)
+    Serial.println("[RADIO/IRQ] GPIO12 setting IR; radio forced to polling");
+  else if (radioControlMode == RADIO_CTRL_DETECT)
+    Serial.println("[RADIO/IRQ] GPIO12 setting AUTO; detecting INTB");
   else
-    Serial.printf("[RADIO/IRQ] reusing startup HW capability=%s\n",
-                  radioIntbCapability == RadioIntbCapability::Present
-                      ? "INTB"
-                      : "POLL");
+    Serial.printf("[RADIO/IRQ] AUTO reusing startup HW capability=%s\n",
+                  radioIntbCapability == RadioIntbCapability::Present ? "INTB" : "POLL");
 
   pinMode(slaveSelectPin, OUTPUT);
   digitalWrite(slaveSelectPin, HIGH);
@@ -640,7 +668,8 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   // opposite application image is active, refuse here; mode switching is kept
   // separate from this startup test because GPIO17 also resets the TFT.
   if (reuseRunningImage) {
-    if (radioIntbCapability == RadioIntbCapability::Unknown) {
+    if (configuredGpio12Mode == GPIO12_AUTO &&
+        radioIntbCapability == RadioIntbCapability::Unknown) {
       Serial.println("[RADIO/IRQ] running image without startup POWER_UP; INTB detection inconclusive");
       return false;
     }
@@ -690,7 +719,8 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     uint32_t powerUpStartChanges = radioIntbEdges();
     uint32_t powerUpStartFall = radioIntbFallingEdges();
     uint32_t powerUpStartRise = radioIntbRisingEdges();
-    if (radioIntbCapability == RadioIntbCapability::Unknown) {
+    if (configuredGpio12Mode == GPIO12_AUTO &&
+        radioIntbCapability == RadioIntbCapability::Unknown) {
       // The proof must belong to this POWER_UP, not to the pre-flight status
       // query or to a stale level left by an earlier device state.
       __atomic_store_n(&radioIntbPending, false, __ATOMIC_RELEASE);
@@ -706,7 +736,8 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
                     intbBeforePowerUp);
     }
     result = chip.powerUp(power, 1000000UL);
-    if (radioIntbCapability == RadioIntbCapability::Unknown) {
+    if (configuredGpio12Mode == GPIO12_AUTO &&
+        radioIntbCapability == RadioIntbCapability::Unknown) {
       const int intbAfterPowerUp = digitalRead(SI4684_INTB_PIN);
       const uint32_t powerUpChanges = radioIntbEdges() - powerUpStartChanges;
       const uint32_t powerUpFall = radioIntbFallingEdges() - powerUpStartFall;
@@ -786,11 +817,18 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
                 static_cast<unsigned>(radioBootIrqEdgeCount));
 
   const bool applicationProbeNeeded =
+      configuredGpio12Mode == GPIO12_AUTO &&
       radioIntbCapability == RadioIntbCapability::Unknown;
   const bool runtimeIntbRequested =
+      configuredGpio12Mode != GPIO12_IR &&
       radioIntbCapability != RadioIntbCapability::Absent;
+  // In the IR hardware variant INTB is not physically connected to GPIO12, so
+  // do not unnecessarily disable the Si4684 INTB output itself. We simply do
+  // not route/service it in the ESP32 and keep the radio in polling mode.
+  const bool intbOutputEnabled =
+      configuredGpio12Mode == GPIO12_IR || runtimeIntbRequested;
   const uint16_t pinConfig = RADIO_PIN_CONFIG_AUDIO |
-      (runtimeIntbRequested ? RADIO_PIN_CONFIG_INTBOUTEN : 0U);
+      (intbOutputEnabled ? RADIO_PIN_CONFIG_INTBOUTEN : 0U);
 
   // This block is reached in DETECT only if POWER_UP *and the entire
   // LOAD_INIT/HOST_LOAD/BOOT sequence* produced no transition. It is the final
@@ -1123,6 +1161,9 @@ void DAB::parseDabServiceListReply(uint16_t replyLength) {
   }
 
   numberofservices = parsedServices;
+  memset(dabServiceCharsetValue, 0, sizeof(dabServiceCharsetValue));
+  uint32_t parsedServiceId[32] = {0};
+  uint8_t parsedServiceCharset[32] = {0};
   uint16_t offset = 13U;
   for (uint8_t i = 0; i < numberofservices; ++i) {
     if (static_cast<uint32_t>(offset) + 24U > replyLength + 1U) {
@@ -1136,6 +1177,7 @@ void DAB::parseDabServiceListReply(uint16_t replyLength) {
                 (static_cast<uint32_t>(SPIbuffer[offset + 2]) << 16) |
                 (static_cast<uint32_t>(SPIbuffer[offset + 3]) << 24);
     const uint8_t numberOfComponents = SPIbuffer[offset + 5] & 0x0FU;
+    const uint8_t serviceCharset = SPIbuffer[offset + 6] & 0x0FU;
     memcpy(service[i].Label, &SPIbuffer[offset + 8], 16);
     service[i].Label[16] = '\0';
     for (int8_t j = 15; j >= 0 && service[i].Label[j] == ' '; --j)
@@ -1160,10 +1202,23 @@ void DAB::parseDabServiceListReply(uint16_t replyLength) {
     service[i].ServiceID = serviceID;
     service[i].CompID = componentID;
     service[i].ServiceType = 0;
+    // Service Info 3 low nibble is SlCharset for this specific service.
+    // Remember the pre-sort ServiceID so the charset can be realigned after
+    // qsort() without growing the DABService structure or static DRAM.
+    parsedServiceId[i] = serviceID;
+    parsedServiceCharset[i] = serviceCharset;
   }
 
   if (numberofservices == 0) return;
   qsort(service, numberofservices, sizeof(DABService), compareCompID);
+  for (uint8_t sorted = 0; sorted < numberofservices; ++sorted) {
+    for (uint8_t original = 0; original < numberofservices; ++original) {
+      if (service[sorted].ServiceID == parsedServiceId[original]) {
+        dabServiceCharsetValue[sorted] = parsedServiceCharset[original];
+        break;
+      }
+    }
+  }
   if (ServiceIndex >= numberofservices) ServiceIndex = 0;
   if (CurrentServiceID != service[ServiceIndex].ServiceID) {
     for (uint8_t i = 0; i < numberofservices; ++i) {
@@ -1182,7 +1237,6 @@ void DAB::parseDabServiceListReply(uint16_t replyLength) {
 // Called on every Update() while the receiver has signal lock.
 void DAB::getServiceData(void) {
   uint32_t byte_count = 0;
-  uint32_t byte_number = 0;
 
   // finishDabCommand() has already fetched and parsed the fixed 24-byte DSRV
   // header into SPIbuffer[1..24]. Re-read the preserved reply at full length
@@ -1196,11 +1250,40 @@ void DAB::getServiceData(void) {
       if (readResult == si468x::Result::Ok) {
         byte_count = SPIbuffer[19] + (SPIbuffer[20] << 8);
 
-        // Read Radiotext
-        if (((SPIbuffer[8] >> 6) & 0x03) == 0x02 && !((SPIbuffer[25] & 0x10) == 0x10)) {
-          const uint32_t textLength = byte_count < sizeof(ServiceData) ? byte_count : sizeof(ServiceData) - 1;
-          for (byte_number = 0; byte_number < textLength; byte_number++) ServiceData[byte_number] = (char)SPIbuffer[27 + byte_number];
-          ServiceData[byte_number] = '\0';
+        // Read DAB Dynamic Label (DLS). Si468x exposes the two DLS
+        // prefix bytes at PAYLOAD[0..1] and the complete character field from
+        // PAYLOAD+2. BYTE_COUNT covers the complete DSRV payload, hence only
+        // BYTE_COUNT-2 bytes belong to the displayed text. This follows the
+        // Si468x DLS handling used by independent working drivers and avoids
+        // the previous regression that tried to reassemble X-PAD segments here.
+        if (((SPIbuffer[8] >> 6) & 0x03) == 0x02 && byte_count >= 2U) {
+          const uint8_t dlsPrefix0 = SPIbuffer[25];
+
+          if ((dlsPrefix0 & 0x10U) == 0U) {
+            // For a normal Dynamic Label, the high nibble of prefix byte 1 is
+            // the character-set identifier. Some Si468x software reports 0x04
+            // for UCS-2; normalize it to the registered 0x06 decoder path.
+            uint8_t charset = static_cast<uint8_t>((SPIbuffer[26] >> 4) & 0x0FU);
+            if (charset == 0x04U) charset = 0x06U;
+            dabDynamicLabelCharset = charset;
+
+            size_t copyLength = static_cast<size_t>(byte_count - 2U);
+            if (copyLength > sizeof(ServiceData)) copyLength = sizeof(ServiceData);
+            memcpy(ServiceData, SPIbuffer + 27, copyLength);
+
+            // Keep an explicit byte length for UCS-2/UTF-16BE but discard only
+            // trailing NUL padding. The old working parser copied BYTE_COUNT
+            // bytes starting at PAYLOAD+2, i.e. two bytes past the payload;
+            // those foreign bytes could appear as random residual glyphs.
+            while (copyLength > 0U && ServiceData[copyLength - 1U] == '\0')
+              --copyLength;
+            dabDynamicLabelLength = static_cast<uint8_t>(copyLength);
+            if (copyLength < sizeof(ServiceData)) ServiceData[copyLength] = '\0';
+          } else if ((dlsPrefix0 & 0x0FU) == 0x01U) {
+            // DLS command 1 removes the currently displayed Dynamic Label.
+            memset(ServiceData, 0, sizeof(ServiceData));
+            dabDynamicLabelLength = 0;
+          }
 
           // Read Slideshow header - extract total length
         } else if (((SPIbuffer[8] >> 6) & 0x03) == 0x01 &&
@@ -1548,9 +1631,14 @@ void DAB::clearData(void) {
     service[x].ServiceID = 0;
     service[x].CompID = 0;
     service[x].ServiceType = 0;
+    dabServiceCharsetValue[x] = 0;
     for (byte y = 0; y < 16; y++) service[x].Label[y] = '\0';
   }
+  dabDynamicLabelCharset = 0;
+  dabDynamicLabelLength = 0;
   for (byte x = 0; x < 128; x++) ServiceData[x] = '\0';
+  ServiceLabelCharset = 0;
+  EnsembleLabelCharset = 0;
 }
 
 // Start a DAB tune. Completion is handled cooperatively by Update(); there is
@@ -1574,6 +1662,9 @@ void DAB::setFreq(uint8_t freq) {
   serviceHasOwnEcc = false;
   protectionlevel = 0;
   bitrate = 0;
+  samplerate = 0;
+  servicetype = 9;
+  audiomode = 4;
   dataServiceCheck = 0;
   ServiceStart = false;
   SlideShowInit = false;
@@ -1632,6 +1723,8 @@ void DAB::clearFmData(void) {
   memset(fmRtWork, ' ', 64); fmRtWork[64] = '\0';
   memset(PStext, 0, sizeof(PStext));
   memset(ServiceData, 0, sizeof(ServiceData));
+  dabDynamicLabelCharset = 0;
+  dabDynamicLabelLength = 0;
   ServiceLabelCharset = 0;
   EnsembleLabelCharset = 0;
   SlideShowAvailable = false;
@@ -1721,7 +1814,10 @@ void DAB::processFmRds(void) {
       bool validPs = false;
       for (uint8_t i = 0; i < 8; ++i) {
         const uint8_t c = static_cast<uint8_t>(fmPsWork[i]);
-        if (c < 0x20U) {
+        // Current EBU/RDS charset 0000 assigns printable letters to several
+        // byte values below 0x20 (for example 0x1B = U+011A / E-caron).
+        // Only the explicitly non-displayable control codes are invalid here.
+        if (c == 0x00U || c == 0x0AU || c == 0x0BU || c == 0x0DU) {
           validPs = false;
           break;
         }
@@ -1772,11 +1868,12 @@ void DAB::processFmRds(void) {
       return;
     }
 
-    // RDS RadioText uses 0x0D as its end marker. Other C0 control bytes are
-    // not displayable text and indicate that this segment must be reacquired.
+    // RDS RadioText uses 0x0D as its end marker and accepts 0x0A as a
+    // line-break control. Other low byte values can be real EBU letters, so
+    // reject only NUL and the explicitly non-displayable 0x0B control here.
     for (uint8_t i = 0; i < charsPerSegment; ++i) {
       const uint8_t c = static_cast<uint8_t>(segmentData[i]);
-      if (c < 0x20U && c != 0x0DU && c != 0x0AU) return;
+      if (c == 0x00U || c == 0x0BU) return;
     }
 
     const uint16_t segmentBit = static_cast<uint16_t>(1U << segment);
@@ -1941,6 +2038,9 @@ void DAB::setService(uint8_t _index) {
 
   pty = 36;
   bitrate = 0;
+  samplerate = 0;
+  servicetype = 9;
+  audiomode = 4;
   protectionlevel = 0;
   for (byte x = 0; x < 128; x++) ServiceData[x] = '\0';
   memset(PStext, 0, sizeof(PStext));
@@ -2557,41 +2657,29 @@ void DAB::Update(void) {
 // Convert a label/text from the DAB-side character set to UTF-8 for the TFT.
 String DAB::ASCII(const char* input, uint8_t charset) {
   if (!input) return String();
-  String result;
-  if (charset != 0) return String(input);
 
-  // FM RDS text is always the single-byte EBU repertoire. Applying the DAB
-  // UTF-8 heuristic to it can mistake two adjacent extended RDS characters for
-  // a UTF-8 sequence and pass invalid bytes directly to the TFT.
-  if (!isFm()) {
-    bool looksLikeUTF8 = false;
-    for (size_t i = 0; input[i] != '\0'; i++) {
-      uint8_t c = (uint8_t)input[i];
-
-      if ((c & 0xE0) == 0xC0) {
-        uint8_t c2 = (uint8_t)input[i + 1];
-        if ((c2 & 0xC0) == 0x80) {
-          looksLikeUTF8 = true;
-          break;
-        }
-      } else if ((c & 0xF0) == 0xE0) {
-        uint8_t c2 = (uint8_t)input[i + 1];
-        uint8_t c3 = (uint8_t)input[i + 2];
-        if ((c2 & 0xC0) == 0x80 && (c3 & 0xC0) == 0x80) {
-          looksLikeUTF8 = true;
-          break;
-        }
-      }
+  // DAB registered charsets used by labels and Dynamic Label are EBU Latin
+  // (0000), UTF-16BE (0110) and UTF-8 (1111). Fixed DAB labels are 16 bytes,
+  // so UTF-16BE must be decoded by length rather than as a C string.
+  if (charset == 0x0F) return String(input);
+  if (charset == 0x06) {
+    wchar_t temp[9];
+    size_t out = 0;
+    for (size_t i = 0; i + 1 < 16 && out < 8; i += 2) {
+      const uint16_t code =
+          (static_cast<uint16_t>(static_cast<uint8_t>(input[i])) << 8) |
+          static_cast<uint8_t>(input[i + 1]);
+      if (code == 0) break;
+      temp[out++] = static_cast<wchar_t>(code);
     }
-
-    if (looksLikeUTF8) return String(input);
+    temp[out] = L'\0';
+    return convertToUTF8(temp);
   }
+  if (charset != 0x00) return String(input);
 
   wchar_t temp[128];
   charConverter(input, temp, sizeof(temp) / sizeof(wchar_t));
-  result = convertToUTF8(temp);
-
-  return result;
+  return convertToUTF8(temp);
 }
 
 
@@ -2605,173 +2693,45 @@ static int compareCompID(const void* a, const void* b) {
   return 0;
 }
 
-// Translate an EBU-Latin (ETSI EN 300 401) byte string into Unicode code
-// points, handling the DAB-specific shift/escape encodings. Output is a
-// wchar_t buffer that convertToUTF8() later serialises as UTF-8.
+// ETSI TS 101 756 V1.7.1, charset 0000 (Complete EBU Latin repertoire).
+// This is also the Basic RDS character set. Numeric Unicode code points are
+// used deliberately so source-file encoding cannot alter the mapping.
+static const uint16_t EBU_LATIN_TO_UNICODE[256] = {
+  0x0000, 0x0118, 0x012E, 0x0172, 0x0102, 0x0116, 0x010E, 0x0218, 0x021A, 0x010A, 0x0000, 0x0000, 0x0120, 0x0000, 0x017B, 0x0143, // 0x00..0x0F
+  0x0105, 0x0119, 0x012F, 0x0173, 0x0103, 0x0117, 0x010F, 0x0219, 0x021B, 0x010B, 0x0147, 0x011A, 0x0121, 0x0139, 0x017C, 0x002D, // 0x10..0x1F
+  0x0020, 0x0021, 0x0022, 0x0023, 0x013A, 0x0025, 0x0026, 0x0027, 0x0028, 0x0029, 0x002A, 0x002B, 0x002C, 0x002D, 0x002E, 0x002F, // 0x20..0x2F
+  0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037, 0x0038, 0x0039, 0x003A, 0x003B, 0x003C, 0x003D, 0x003E, 0x003F, // 0x30..0x3F
+  0x0040, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047, 0x0048, 0x0049, 0x004A, 0x004B, 0x004C, 0x004D, 0x004E, 0x004F, // 0x40..0x4F
+  0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057, 0x0058, 0x0059, 0x005A, 0x005B, 0x016E, 0x005D, 0x0141, 0x0142, // 0x50..0x5F
+  0x0104, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067, 0x0068, 0x0069, 0x006A, 0x006B, 0x006C, 0x006D, 0x006E, 0x006F, // 0x60..0x6F
+  0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077, 0x0078, 0x0079, 0x007A, 0x00AB, 0x016F, 0x00BB, 0x013D, 0x0126, // 0x70..0x7F
+  0x00E1, 0x00E0, 0x00E9, 0x00E8, 0x00ED, 0x00EC, 0x00F3, 0x00F2, 0x00FA, 0x00F9, 0x00D1, 0x00C7, 0x015E, 0x00DF, 0x00A1, 0x0178, // 0x80..0x8F
+  0x00E2, 0x00E4, 0x00EA, 0x00EB, 0x00EE, 0x00EF, 0x00F4, 0x00F6, 0x00FB, 0x00FC, 0x00F1, 0x00E7, 0x015F, 0x011F, 0x0131, 0x00FF, // 0x90..0x9F
+  0x0136, 0x0145, 0x00A9, 0x0122, 0x011E, 0x011B, 0x0148, 0x0151, 0x0150, 0x20AC, 0x00A3, 0x0024, 0x0100, 0x0112, 0x012A, 0x016A, // 0xA0..0xAF
+  0x0137, 0x0146, 0x013B, 0x0123, 0x013C, 0x0130, 0x0144, 0x0171, 0x0170, 0x00BF, 0x013E, 0x00B0, 0x0101, 0x0113, 0x012B, 0x016B, // 0xB0..0xBF
+  0x00C1, 0x00C0, 0x00C9, 0x00C8, 0x00CD, 0x00CC, 0x00D3, 0x00D2, 0x00DA, 0x00D9, 0x0158, 0x010C, 0x0160, 0x017D, 0x00D0, 0x013F, // 0xC0..0xCF
+  0x00C2, 0x00C4, 0x00CA, 0x00CB, 0x00CE, 0x00CF, 0x00D4, 0x00D6, 0x00DB, 0x00DC, 0x0159, 0x010D, 0x0161, 0x017E, 0x0111, 0x0140, // 0xD0..0xDF
+  0x00C3, 0x00C5, 0x00C6, 0x0152, 0x0177, 0x00DD, 0x00D5, 0x00D8, 0x00DE, 0x014A, 0x0154, 0x0106, 0x015A, 0x0179, 0x0164, 0x00F0, // 0xE0..0xEF
+  0x00E3, 0x00E5, 0x00E6, 0x0153, 0x0175, 0x00FD, 0x00F5, 0x00F8, 0x00FE, 0x014B, 0x0155, 0x0107, 0x015B, 0x017A, 0x0165, 0x0127, // 0xF0..0xFF
+};
+
+// Translate one charset-0000 EBU/RDS byte string into Unicode code points.
+// Output is a wchar_t buffer that convertToUTF8() later serialises as UTF-8.
 static void charConverter(const char* input, wchar_t* output, size_t outSize) {
-    if (!input || !output || outSize == 0) return;
+  if (!input || !output || outSize == 0) return;
 
-    size_t i = 0;
+  size_t outIndex = 0;
+  for (size_t inIndex = 0;
+       input[inIndex] != '\0' && outIndex < outSize - 1;
+       ++inIndex) {
+    const uint8_t code = static_cast<uint8_t>(input[inIndex]);
+    const uint16_t unicode = EBU_LATIN_TO_UNICODE[code];
 
-    for (size_t dbi = 0; input[dbi] != '\0' && i < outSize - 1; dbi++) {
-        uint8_t currentChar = (uint8_t)input[dbi];
-
-        // ----- 2-byte UTF-8 decoding -----
-        if ((currentChar & 0xE0) == 0xC0) {
-            uint8_t nextChar = (uint8_t)input[dbi + 1];
-
-            if ((nextChar & 0xC0) == 0x80) {
-                // decode the Unicode code point
-                uint16_t codepoint = ((currentChar & 0x1F) << 6) | (nextChar & 0x3F);
-                output[i++] = (wchar_t)codepoint;
-                dbi++; // skip the second byte
-                continue;
-            }
-        }
-
-        // ----- Single-byte / fallback -----
-        switch (currentChar) {
-            case 0x20: output[i] = L' '; break;
-            case 0x21 ... 0x5D: output[i] = (wchar_t)currentChar; break;
-            case 0x5E: output[i] = L'―'; break;
-            case 0x5F: output[i] = L'_'; break;
-            case 0x60: output[i] = L'`'; break;
-            case 0x61 ... 0x7D: output[i] = (wchar_t)currentChar; break;
-            case 0x7E: output[i] = L'¯'; break;
-            case 0x7F: output[i] = L' '; break;
-            case 0x80: output[i] = L'á'; break;
-            case 0x81: output[i] = L'à'; break;
-            case 0x82: output[i] = L'é'; break;
-            case 0x83: output[i] = L'è'; break;
-            case 0x84: output[i] = L'í'; break;
-            case 0x85: output[i] = L'ì'; break;
-            case 0x86: output[i] = L'ó'; break;
-            case 0x87: output[i] = L'ò'; break;
-            case 0x88: output[i] = L'ú'; break;
-            case 0x89: output[i] = L'ù'; break;
-            case 0x8A: output[i] = L'Ñ'; break;
-            case 0x8B: output[i] = L'Ç'; break;
-            case 0x8C: output[i] = L'Ş'; break;
-            case 0x8D: output[i] = L'β'; break;
-            case 0x8E: output[i] = L'¡'; break;
-            case 0x8F: output[i] = L'Ĳ'; break;
-            case 0x90: output[i] = L'â'; break;
-            case 0x91: output[i] = L'ä'; break;
-            case 0x92: output[i] = L'ê'; break;
-            case 0x93: output[i] = L'ë'; break;
-            case 0x94: output[i] = L'î'; break;
-            case 0x95: output[i] = L'ï'; break;
-            case 0x96: output[i] = L'ô'; break;
-            case 0x97: output[i] = L'ö'; break;
-            case 0x98: output[i] = L'û'; break;
-            case 0x99: output[i] = L'ü'; break;
-            case 0x9A: output[i] = L'ñ'; break;
-            case 0x9B: output[i] = L'ç'; break;
-            case 0x9C: output[i] = L'ş'; break;
-            case 0x9D: output[i] = L'ǧ'; break;
-            case 0x9E: output[i] = L'ı'; break;
-            case 0x9F: output[i] = L'ĳ'; break;
-            case 0xA0: output[i] = L'Ķ'; break;
-            case 0xA1: output[i] = L'Ņ'; break;
-            case 0xA2: output[i] = L'©'; break;
-            case 0xA3: output[i] = L'Ģ'; break;
-            case 0xA4: output[i] = L'Ğ'; break;
-            case 0xA5: output[i] = L'ě'; break;
-            case 0xA6: output[i] = L'ň'; break;
-            case 0xA7: output[i] = L'ő'; break;
-            case 0xA8: output[i] = L'Ő'; break;
-            case 0xA9: output[i] = L'€'; break;
-            case 0xAA: output[i] = L'£'; break;
-            case 0xAB: output[i] = L'$'; break;
-            case 0xAC: output[i] = L'Ā'; break;
-            case 0xAD: output[i] = L'Ē'; break;
-            case 0xAE: output[i] = L'Ī'; break;
-            case 0xAF: output[i] = L'Ū'; break;
-            case 0xB0: output[i] = L'ķ'; break;
-            case 0xB1: output[i] = L'ņ'; break;
-            case 0xB2: output[i] = L'ļ'; break;
-            case 0xB3: output[i] = L'ģ'; break;
-            case 0xB4: output[i] = L'ľ'; break;
-            case 0xB5: output[i] = L'İ'; break;
-            case 0xB6: output[i] = L'ń'; break;
-            case 0xB7: output[i] = L'ű'; break;
-            case 0xB8: output[i] = L'Ű'; break;
-            case 0xB9: output[i] = L'¿'; break;
-            case 0xBA: output[i] = L'ľ'; break;
-            case 0xBB: output[i] = L'°'; break;
-            case 0xBC: output[i] = L'ā'; break;
-            case 0xBD: output[i] = L'ē'; break;
-            case 0xBE: output[i] = L'ī'; break;
-            case 0xBF: output[i] = L'ū'; break;
-            case 0xC0: output[i] = L'Á'; break;
-            case 0xC1: output[i] = L'À'; break;
-            case 0xC2: output[i] = L'É'; break;
-            case 0xC3: output[i] = L'È'; break;
-            case 0xC4: output[i] = L'Í'; break;
-            case 0xC5: output[i] = L'Ì'; break;
-            case 0xC6: output[i] = L'Ó'; break;
-            case 0xC7: output[i] = L'Ò'; break;
-            case 0xC8: output[i] = L'Ú'; break;
-            case 0xC9: output[i] = L'Ù'; break;
-            case 0xCA: output[i] = L'Ř'; break;
-            case 0xCB: output[i] = L'Č'; break;
-            case 0xCC: output[i] = L'Š'; break;
-            case 0xCD: output[i] = L'Ž'; break;
-            case 0xCE: output[i] = L'Ð'; break;
-            case 0xCF: output[i] = L'Ŀ'; break;
-            case 0xD0: output[i] = L'Â'; break;
-            case 0xD1: output[i] = L'Ä'; break;
-            case 0xD2: output[i] = L'Ê'; break;
-            case 0xD3: output[i] = L'Ë'; break;
-            case 0xD4: output[i] = L'Î'; break;
-            case 0xD5: output[i] = L'Ï'; break;
-            case 0xD6: output[i] = L'Ô'; break;
-            case 0xD7: output[i] = L'Ö'; break;
-            case 0xD8: output[i] = L'Û'; break;
-            case 0xD9: output[i] = L'Ü'; break;
-            case 0xDA: output[i] = L'ř'; break;
-            case 0xDB: output[i] = L'č'; break;
-            case 0xDC: output[i] = L'š'; break;
-            case 0xDD: output[i] = L'ž'; break;
-            case 0xDE: output[i] = L'đ'; break;
-            case 0xDF: output[i] = L'ŀ'; break;
-            case 0xE0: output[i] = L'Ã'; break;
-            case 0xE1: output[i] = L'Å'; break;
-            case 0xE2: output[i] = L'Æ'; break;
-            case 0xE3: output[i] = L'Œ'; break;
-            case 0xE4: output[i] = L'ŷ'; break;
-            case 0xE5: output[i] = L'Ý'; break;
-            case 0xE6: output[i] = L'Õ'; break;
-            case 0xE7: output[i] = L'Ø'; break;
-            case 0xE8: output[i] = L'Þ'; break;
-            case 0xE9: output[i] = L'Ŋ'; break;
-            case 0xEA: output[i] = L'Ŕ'; break;
-            case 0xEB: output[i] = L'Ć'; break;
-            case 0xEC: output[i] = L'Ś'; break;
-            case 0xED: output[i] = L'Ź'; break;
-            case 0xEE: output[i] = L'Ť'; break;
-            case 0xEF: output[i] = L'ð'; break;
-            case 0xF0: output[i] = L'ã'; break;
-            case 0xF1: output[i] = L'å'; break;
-            case 0xF2: output[i] = L'æ'; break;
-            case 0xF3: output[i] = L'œ'; break;
-            case 0xF4: output[i] = L'ŵ'; break;
-            case 0xF5: output[i] = L'ý'; break;
-            case 0xF6: output[i] = L'õ'; break;
-            case 0xF7: output[i] = L'ø'; break;
-            case 0xF8: output[i] = L'þ'; break;
-            case 0xF9: output[i] = L'ŋ'; break;
-            case 0xFA: output[i] = L'ŕ'; break;
-            case 0xFB: output[i] = L'ć'; break;
-            case 0xFC: output[i] = L'ś'; break;
-            case 0xFD: output[i] = L'ź'; break;
-            case 0xFE: output[i] = L'ť'; break;
-            case 0xFF: output[i] = L' '; break;
-            default: output[i] = L'?'; break;
-        }
-        i++;
-    }
-    output[i] = L'\0';
+    // 0x0A/0x0B/0x0D are explicitly non-displayable in the EBU table.
+    if (unicode != 0)
+      output[outIndex++] = static_cast<wchar_t>(unicode);
+  }
+  output[outIndex] = L'\0';
 }
 
 // Substring helper that operates on code-points (not bytes) so cutting a
@@ -2832,4 +2792,63 @@ static String convertToUTF8(const wchar_t* input) {
   }
   return output;
 
+}
+
+// Decode the currently assembled DAB Dynamic Label using its own charset and
+// explicit byte length. The explicit length is essential for UTF-16BE because
+// ordinary ASCII-range UTF-16 characters contain zero bytes.
+String DabDynamicLabelText(const char* input) {
+  if (!input || dabDynamicLabelLength == 0) return String();
+
+  if (dabDynamicLabelCharset == 0x06) {
+    wchar_t temp[65];
+    size_t out = 0;
+    for (size_t i = 0;
+         i + 1 < dabDynamicLabelLength && out < (sizeof(temp) / sizeof(temp[0])) - 1;
+         i += 2) {
+      const uint16_t code =
+          (static_cast<uint16_t>(static_cast<uint8_t>(input[i])) << 8) |
+          static_cast<uint8_t>(input[i + 1]);
+      if (code == 0) continue;
+      // DLS control codes: flatten preferred line/headline breaks for the
+      // one-line TFT strip; retain the standard preferred word break as '-'.
+      if (code == 0x000AU || code == 0x000BU)
+        temp[out++] = L' ';
+      else if (code == 0x001FU)
+        temp[out++] = L'-';
+      else
+        temp[out++] = static_cast<wchar_t>(code);
+    }
+    temp[out] = L'\0';
+    return convertToUTF8(temp);
+  }
+
+  char temp[129];
+  const size_t len = min(static_cast<size_t>(dabDynamicLabelLength),
+                         sizeof(temp) - 1U);
+  memcpy(temp, input, len);
+  temp[len] = '\0';
+
+  if (dabDynamicLabelCharset == 0x0F) {
+    String output(temp);
+    output.replace("\n", " ");
+    String headlineBreak; headlineBreak += static_cast<char>(0x0B);
+    String wordBreak; wordBreak += static_cast<char>(0x1F);
+    output.replace(headlineBreak, " ");
+    output.replace(wordBreak, "-");
+    return output;
+  }
+  if (dabDynamicLabelCharset == 0x00) {
+    // DLS defines these three bytes as layout hints independently of the
+    // selected charset. Flatten them for our one-line ticker before EBU decode.
+    for (size_t i = 0; i < len; ++i) {
+      const uint8_t code = static_cast<uint8_t>(temp[i]);
+      if (code == 0x0AU || code == 0x0BU) temp[i] = ' ';
+      else if (code == 0x1FU) temp[i] = '-';
+    }
+    wchar_t wide[129];
+    charConverter(temp, wide, sizeof(wide) / sizeof(wide[0]));
+    return convertToUTF8(wide);
+  }
+  return String(temp);
 }
