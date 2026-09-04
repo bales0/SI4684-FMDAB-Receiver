@@ -312,51 +312,67 @@ static void drawUiBase(const char* title) {
 }
 
 static void drawMenu(void) {
-  drawUiBase("IR Remote");
-  const char* items[] = {"Learn", "Clear", "Test", "Back"};
+  drawUiBase(irRemoteText[language]);
+  const char* items[] = {
+    irLearnText[language],
+    irClearText[language],
+    irTestText[language],
+    irBackText[language]
+  };
   for (uint8_t i = 0; i < 4; ++i) {
     const int color = i == uiSelection ? ActiveColor : PrimaryColor;
     const int smooth = i == uiSelection ? ActiveColorSmooth : PrimaryColorSmooth;
     tftPrint(-1, String(i == uiSelection ? "> " : "  ") + items[i],
              70, 55 + i * 32, color, smooth, 28);
   }
-  tftPrint(0, profileValid ? "Profile: learned" : "Profile: empty",
+  tftPrint(0,
+           profileValid ? irProfileLearnedText[language]
+                        : irProfileEmptyText[language],
            155, 204, SecondaryColor, SecondaryColorSmooth, 16);
 }
 
 static void drawNeedIr(void) {
-  drawUiBase("IR Remote");
-  tftPrint(0, "Set GPIO12 to IR", 155, 102,
+  drawUiBase(irRemoteText[language]);
+  tftPrint(0, irSetGpio12Text[language], 155, 102,
            ActiveColor, ActiveColorSmooth, 28);
-  tftPrint(0, "Press OK", 155, 145,
+  tftPrint(0, irPressOkText[language], 155, 145,
            SecondaryColor, SecondaryColorSmooth, 16);
 }
 
 static void drawLearn(void) {
-  drawUiBase("IR Learning");
-  tftPrint(0, "Press", 155, 72, SecondaryColor, SecondaryColorSmooth, 16);
+  drawUiBase(irLearningText[language]);
+  tftPrint(0, irPressText[language], 155, 72,
+           SecondaryColor, SecondaryColorSmooth, 16);
   tftPrint(0, kActionName[learnIndex], 155, 101,
            ActiveColor, ActiveColorSmooth, 28);
   tftPrint(0, String(learnIndex + 1) + "/" + String(EE_IR_KEY_COUNT),
            155, 145, PrimaryColor, PrimaryColorSmooth, 16);
-  tftPrint(0, "Physical OK cancels", 155, 199,
+  tftPrint(0, irPhysicalOkCancelsText[language], 155, 199,
            SecondaryColor, SecondaryColorSmooth, 16);
 }
 
 static void drawLearnRelease(void) {
-  drawUiBase("IR Learning");
-  tftPrint(0, "Release key...", 155, 96, ActiveColor, ActiveColorSmooth, 28);
+  drawUiBase(irLearningText[language]);
+  tftPrint(0, irReleaseKeyText[language], 155, 96,
+           ActiveColor, ActiveColorSmooth, 28);
   tftPrint(0, String(learnIndex) + "/" + String(EE_IR_KEY_COUNT),
            155, 145, PrimaryColor, PrimaryColorSmooth, 16);
-  tftPrint(0, "Physical OK cancels", 155, 199,
+  tftPrint(0, irPhysicalOkCancelsText[language], 155, 199,
            SecondaryColor, SecondaryColorSmooth, 16);
 }
 
 static void drawClear(void) {
-  drawUiBase("IR Remote");
-  tftPrint(0, "Clear learned remote?", 155, 82,
+  drawUiBase(irRemoteText[language]);
+  tftPrint(0, irClearLearnedRemoteText[language], 155, 82,
            ActiveColor, ActiveColorSmooth, 28);
-  tftPrint(0, clearYes ? "No     > Yes" : "> No     Yes", 155, 132,
+
+  String choices;
+  if (clearYes)
+    choices = String(irNoText[language]) + "     > " + irYesText[language];
+  else
+    choices = String("> ") + irNoText[language] + "     " + irYesText[language];
+
+  tftPrint(0, choices, 155, 132,
            PrimaryColor, PrimaryColorSmooth, 28);
 }
 
@@ -368,28 +384,42 @@ static String hex16(uint16_t value) {
 }
 
 static void drawTest(const IRData* data = nullptr) {
-  drawUiBase("IR Test");
+  drawUiBase(irTestTitleText[language]);
   if (!data) {
-    tftPrint(0, "Press a remote key", 155, 90,
+    tftPrint(0, irPressRemoteKeyText[language], 155, 90,
              ActiveColor, ActiveColorSmooth, 28);
-    tftPrint(0, "Physical OK exits", 155, 195,
+    tftPrint(0, irPhysicalOkExitsText[language], 155, 195,
              SecondaryColor, SecondaryColorSmooth, 16);
     return;
   }
+
   const IrAction action = findAction(*data);
-  tftPrint(-1, String("Protocol: ") + getProtocolString(data->protocol), 28, 55,
-           PrimaryColor, PrimaryColorSmooth, 16);
-  tftPrint(-1, String("Address:  0x") + hex16(data->address), 28, 80,
-           PrimaryColor, PrimaryColorSmooth, 16);
-  tftPrint(-1, String("Command:  0x") + hex16(data->command), 28, 105,
-           PrimaryColor, PrimaryColorSmooth, 16);
-  tftPrint(-1, String("Action:   ") +
-                   (action == IR_ACTION_NONE ? "NOT ASSIGNED" : kActionName[action]),
+  tftPrint(-1,
+           String(irProtocolText[language]) + ": " +
+               getProtocolString(data->protocol),
+           28, 55, PrimaryColor, PrimaryColorSmooth, 16);
+  tftPrint(-1,
+           String(irAddressText[language]) + ":  0x" +
+               hex16(data->address),
+           28, 80, PrimaryColor, PrimaryColorSmooth, 16);
+  tftPrint(-1,
+           String(irCommandText[language]) + ":  0x" +
+               hex16(data->command),
+           28, 105, PrimaryColor, PrimaryColorSmooth, 16);
+  tftPrint(-1,
+           String(irActionText[language]) + ":   " +
+               (action == IR_ACTION_NONE
+                    ? String(irNotAssignedText[language])
+                    : String(kActionName[action])),
            28, 130, ActiveColor, ActiveColorSmooth, 16);
-  tftPrint(-1, String("Repeat:   ") +
-                   ((data->flags & (IRDATA_FLAGS_IS_REPEAT | IRDATA_FLAGS_IS_AUTO_REPEAT)) ? "YES" : "NO"),
+  tftPrint(-1,
+           String(irRepeatText[language]) + ":   " +
+               ((data->flags &
+                 (IRDATA_FLAGS_IS_REPEAT | IRDATA_FLAGS_IS_AUTO_REPEAT))
+                    ? String(irYesText[language])
+                    : String(irNoText[language])),
            28, 155, SecondaryColor, SecondaryColorSmooth, 16);
-  tftPrint(0, "Physical OK exits", 155, 200,
+  tftPrint(0, irPhysicalOkExitsText[language], 155, 200,
            SecondaryColor, SecondaryColorSmooth, 16);
 }
 
@@ -478,10 +508,10 @@ bool IrRemoteUiPress(void) {
       }
       if (!IrRemotePrepare()) {
         uiState = UI_NOTICE;
-        drawUiBase("IR Remote");
-        tftPrint(0, "IR memory error", 155, 102,
+        drawUiBase(irRemoteText[language]);
+        tftPrint(0, irMemoryErrorText[language], 155, 102,
                  ActiveColor, ActiveColorSmooth, 28);
-        tftPrint(0, "Press OK", 155, 145,
+        tftPrint(0, irPressOkText[language], 155, 145,
                  SecondaryColor, SecondaryColorSmooth, 16);
         return false;
       }
@@ -492,6 +522,7 @@ bool IrRemoteUiPress(void) {
       uiState = UI_LEARN;
       drawLearn();
       return false;
+
     case 1: // Clear
       if (!profileValid) {
         drawMenu();
@@ -501,6 +532,7 @@ bool IrRemoteUiPress(void) {
       uiState = UI_CLEAR_CONFIRM;
       drawClear();
       return false;
+
     case 2: // Test
       if (!receiverStarted) {
         uiState = UI_NOTICE;
@@ -510,6 +542,7 @@ bool IrRemoteUiPress(void) {
       uiState = UI_TEST;
       drawTest();
       return false;
+
     default: // Back
       uiState = UI_NONE;
       return true;

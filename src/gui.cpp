@@ -410,10 +410,14 @@ void ShowOneLine(byte position, byte item, bool selected) {
         break;
 
       case 9:
-        FullLineSprite.drawString("IR Remote", 6, 3);
+        FullLineSprite.drawString(irRemoteText[language], 6, 3);
         FullLineSprite.setTextDatum(TR_DATUM);
         FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
-        FullLineSprite.drawString(IrRemoteHasProfile() ? "learned >" : ">", 300, 3);
+        FullLineSprite.drawString(
+            IrRemoteHasProfile()
+                ? String(irLearnedShortText[language]) + " >"
+                : String(">"),
+            300, 3);
         break;
 
       case 10:

@@ -391,7 +391,7 @@ void LogRamUsage(const char* tag) {
 #endif
 
   Serial.printf("[RAM] %s slideshow single MOT buffer=%u bytes\n",
-                tag ? tag : "-", 80U * 512U);
+                tag ? tag : "-", (unsigned)radio.slideshowCapacity());
 }
 
 void MarkEepromDirty(void) {
@@ -497,8 +497,7 @@ static void MigrateSchema4ToCurrent(void) {
 // DAB records keep their original byte-for-byte schema. FM records are loaded
 // separately because schema 4+ stores an absolute uint16_t frequency and PI.
 void LoadPresets(void) {
-  for (int i = 0; i < EE_PRESETS_CNT; ++i) {
-    if (radioMode == RADIO_MODE_FM) {
+  for (int i = 0; i < EE_PRESETS_CNT; ++i) {    if (radioMode == RADIO_MODE_FM) {
       EEPROM.get(EE_FM_PRESETS_FREQ_START + i * 2,
                  fmMemory[i].Frequency10kHz);
       EEPROM.get(EE_FM_PRESETS_PI_START + i * 2, fmMemory[i].ProgramId);
@@ -738,7 +737,7 @@ void ExitSettingsMenu(void) {
 
   if (gpio12Changed) {
     FlushEeprom();
-    ShowStatusOverlay("Restarting...");
+    ShowStatusOverlay(restartingText[language]);
     delay(250);
     // Match the FM/DAB transition behaviour: hide the TFT reset/boot interval
     // so the panel cannot flash white or show partial reset contents.

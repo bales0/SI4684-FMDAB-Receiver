@@ -178,6 +178,7 @@ class DAB {
     bool isTunePending(void) const { return tunePending; }
     const uint8_t* slideshowData(void) const { return slideshowSegBuf; }
     uint32_t slideshowSize(void) const { return SlideShowAvailable ? slideshowRamSize : 0; }
+    size_t slideshowCapacity(void) const { return SLS_BUFFER_BYTES; }
 
   private:
     enum class DabCommand : uint8_t {
@@ -229,10 +230,13 @@ class DAB {
     uint32_t slideshowRamSize;
 
     // Segment buffering for faster slideshow assembly
-    uint8_t SlideShowSegmentBitmap[32];  // Bitmap for up to 256 segments
-    uint8_t SlideShowTotalSegments;       // Total segments expected (0 = unknown)
-    uint8_t SlideShowHighestSegment;      // Highest segment number seen
-    uint16_t SlideShowTransportID;        // Current transport ID
+    uint8_t SlideShowSegmentBitmap[32];   // Bitmap for segment numbers 0..255
+    uint16_t SlideShowTotalSegments;      // 0 = unknown, otherwise 1..256
+    uint8_t SlideShowHighestSegment;
+    uint16_t SlideShowTransportID;
+    bool SlideShowTransportIDValid;
+    bool SlideShowLastSegmentValid;
+    uint8_t SlideShowLastSegment;
     uint32_t SlideShowLastActivity;       // millis() of last new segment received
 
     // Cooperative DAB command scheduler. startCommand() retains the reply
@@ -270,19 +274,23 @@ class DAB {
     uint32_t dabDataComponentId = 0;
     uint8_t dabDsrvBurstCount = 0;
 
-    // One 40 KB MOT buffer with adaptive fixed slots. Services seen in the
-    // field use 512-, 1024- or 2000-byte DSRV blocks. Large slots use the
-    // actual block size (up to 2048 B), preserving all 40960 reserved bytes.
-    static const uint8_t  SLS_MAX_SEGMENTS   = 80;
-    static const uint16_t SLS_BASE_SEG_SIZE  = 512;
+    // One RAM-only MOT buffer. Received segments are kept packed in ascending
+    // SegmentNumber order, so all 51200 bytes are usable payload capacity even
+    // when segment sizes vary or segments arrive out of order.
+    static const uint16_t SLS_MAX_SEGMENTS   = 256;
     static const uint16_t SLS_MAX_SEG_SIZE   = 2048;
-    static const size_t   SLS_BUFFER_BYTES   = 80U * 512U;
-    uint8_t  slideshowSegBuf[SLS_BUFFER_BYTES];
+    static const size_t   SLS_BUFFER_BYTES   = 50U * 1024U;
+    // Allocated once from internal 8-bit heap in begin(). A static 50 KiB
+    // member overflows the classic ESP32 dram0 linker segment in this build.
+    uint8_t* slideshowSegBuf = nullptr;
     uint16_t slideshowSegLen[SLS_MAX_SEGMENTS];
-    uint16_t slideshowSlotSize;
     void beginSlideshowReception(void);
-    bool ensureSlideshowSlotSize(uint16_t dataLength);
+    bool storeSlideshowSegment(uint8_t segmentNumber,
+                               const uint8_t* data,
+                               uint16_t dataLength);
     void clearSegmentBuffer(void);
+    void resetSlideshowCollector(void);
+    void lockSlideshowTransport(uint16_t transportId);
 
     void assembleSlideshow(void);
     bool allSegmentsReceived(void);
