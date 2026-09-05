@@ -294,6 +294,11 @@ struct PJDecoder {
   int totalImageBlocks;
 };
 
+// Persistent decoder state. The old implementation calloc/free'd this ~8 kB
+// object for every image. The receiver is single-threaded, so one zeroed
+// instance can be safely reused for every slideshow decode.
+static PJDecoder pjDecoderState;
+
 // --- Compute global block offsets after SOF parsing ---
 static void pjComputeBlockOffsets(PJDecoder* d) {
   int offset = 0;
@@ -971,7 +976,8 @@ static bool pjProcessFileForRow(MemoryFile& f, PJDecoder* d, int16_t* rowCoefs,
 // Single-pass baseline decoder: walks the file once, decoding and rendering
 // each MCU row on the fly. Used for SOF0 images where no multi-pass needed.
 static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
-                                  int offsetX, int offsetY) {
+                                  int offsetX, int offsetY,
+                                  uint8_t* workspace, size_t workspaceSize) {
   f.seek(0);
   if (pjRead8(f) != 0xFF || pjRead8(f) != M_SOI) return false;
 
@@ -1004,8 +1010,20 @@ static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
         size_t coefSize = blocksPerRow * 64 * sizeof(int16_t);
         size_t pixelBufSize = blocksPerRow * 64;
         size_t totalSize = coefSize + pixelBufSize;
-        uint8_t* baseBuf = (uint8_t*)malloc(totalSize);
+
+        // Normal path: borrow the persistent slideshow workspace. Only fall
+        // back to the legacy temporary allocation if an unusual image needs
+        // more than the shared arena.
+        bool ownsBaseBuf = false;
+        uint8_t* baseBuf = nullptr;
+        if (workspace && workspaceSize >= totalSize) {
+          baseBuf = workspace;
+        } else {
+          baseBuf = (uint8_t*)malloc(totalSize);
+          ownsBaseBuf = true;
+        }
         if (!baseBuf) return false;
+
         int16_t* rowCoefs = (int16_t*)baseBuf;
         uint8_t* allBlocks = baseBuf + coefSize;
 
@@ -1046,7 +1064,7 @@ static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
           if (d->br.hitMarker) break;
         }
 
-        free(baseBuf);
+        if (ownsBaseBuf) free(baseBuf);
         return true;
       }
       default:
@@ -1067,12 +1085,13 @@ static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
 // either the single-pass baseline decoder (SOF0) or the multi-pass
 // progressive decoder (SOF2). Returns true on success.
 bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
-                 int displayWidth, int displayHeight) {
+                 int displayWidth, int displayHeight,
+                 uint8_t* workspace, size_t workspaceSize) {
   MemoryFile f(data, size);
   if (!f) return false;
 
-  PJDecoder* d = (PJDecoder*)calloc(1, sizeof(PJDecoder));
-  if (!d) { f.close(); return false; }
+  PJDecoder* d = &pjDecoderState;
+  memset(d, 0, sizeof(*d));
 
   // Pre-scan to get dimensions and type
   f.seek(0);
@@ -1095,7 +1114,7 @@ bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
   }
 
   if (!foundSOF || d->width == 0 || d->height == 0) {
-    free(d); f.close(); return false;
+    f.close(); return false;
   }
 
   int offsetX = (displayWidth - d->width) / 2;
@@ -1103,7 +1122,8 @@ bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
 
   bool result;
   if (isBaseline) {
-    result = pjDecodeBaselinePass(f, d, tft, offsetX, offsetY);
+    result = pjDecodeBaselinePass(f, d, tft, offsetX, offsetY,
+                                  workspace, workspaceSize);
   } else {
     // Progressive: multi-pass row-by-row decode
     // Single allocation to reduce heap fragmentation on ESP32
@@ -1113,20 +1133,40 @@ bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
     size_t bitmapSize = d->totalImageBlocks * 8;
     size_t totalSize = coefSize + pixelBufSize + bitmapSize;
 
-    uint8_t* progBuf = (uint8_t*)calloc(1, totalSize);
-    uint8_t* nzBitmap;
-    if (!progBuf) {
-      // Fallback: allocate without nzBitmap (AC refine may be slightly degraded)
-      bitmapSize = 0;
-      totalSize = coefSize + pixelBufSize;
-      progBuf = (uint8_t*)calloc(1, totalSize);
-      if (!progBuf) {
-        free(d); f.close();
-        return false;
-      }
-      nzBitmap = nullptr;
-    } else {
+    uint8_t* progBuf = nullptr;
+    uint8_t* nzBitmap = nullptr;
+    bool ownsProgBuf = false;
+
+    if (workspace && workspaceSize >= totalSize) {
+      progBuf = workspace;
+      memset(progBuf, 0, totalSize);
       nzBitmap = progBuf + coefSize + pixelBufSize;
+    } else {
+      // Compatibility fallback for an image larger than the shared arena:
+      // preserve the original full-bitmap allocation attempt first.
+      progBuf = (uint8_t*)calloc(1, totalSize);
+      ownsProgBuf = (progBuf != nullptr);
+      if (progBuf) {
+        nzBitmap = progBuf + coefSize + pixelBufSize;
+      } else {
+        // Original low-memory fallback: decode without nzBitmap. If the
+        // persistent arena is large enough for this reduced requirement, use
+        // it before attempting another temporary heap allocation.
+        bitmapSize = 0;
+        totalSize = coefSize + pixelBufSize;
+        if (workspace && workspaceSize >= totalSize) {
+          progBuf = workspace;
+          memset(progBuf, 0, totalSize);
+        } else {
+          progBuf = (uint8_t*)calloc(1, totalSize);
+          ownsProgBuf = (progBuf != nullptr);
+        }
+        if (!progBuf) {
+          f.close();
+          return false;
+        }
+        nzBitmap = nullptr;
+      }
     }
 
     int16_t* rowCoefs = (int16_t*)progBuf;
@@ -1139,11 +1179,10 @@ bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
       pjOutputMCURow(d, rowCoefs, row, tft, offsetX, offsetY, allBlocks);
     }
 
-    free(progBuf);
+    if (ownsProgBuf) free(progBuf);
     result = true;
   }
 
-  free(d);
   f.close();
   return result;
 }

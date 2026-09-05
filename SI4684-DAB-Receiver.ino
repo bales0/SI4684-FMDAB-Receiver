@@ -1091,6 +1091,12 @@ void setup(void) {
     for (;;) delay(1000);
   }
 
+  // Reserve the shared PNG/JPEG scratch arena only after the TFT sprites,
+  // fonts, SI4684 workspace and 50 kB MOT buffer are already established.
+  // A failure is non-fatal: slideshow keeps its legacy compatibility
+  // allocation fallbacks.
+  SlideshowPrepareWorkspace();
+
   // Firmware identity is detected from the chip; never hard-code it here.
   const String detectedRadioVersion =
       String(radio.getChipID()) + " v" + String(radio.getFirmwareVersion());

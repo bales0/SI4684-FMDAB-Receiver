@@ -17,6 +17,11 @@ extern byte ContrastSet;            // backlight level used during fade-in/out
 extern TFT_eSPI tft;
 extern DAB radio;
 
+// Reserve the persistent shared PNG/JPEG decoder workspace once. Call after
+// the radio/MOT and TFT runtime allocations are established. Failure is
+// non-fatal: the decoders keep their compatibility fallback paths.
+bool SlideshowPrepareWorkspace(void);
+
 // Decode and display the current RAM image; called from the main loop when
 // radio.SlideShowAvailable && radio.SlideShowUpdate are set.
 bool ShowSlideShow(void);
