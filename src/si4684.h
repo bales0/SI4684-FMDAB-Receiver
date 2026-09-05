@@ -180,6 +180,8 @@ class DAB {
     const uint8_t* slideshowData(void) const { return slideshowSegBuf; }
     uint32_t slideshowSize(void) const { return SlideShowAvailable ? slideshowRamSize : 0; }
     size_t slideshowCapacity(void) const { return SLS_BUFFER_BYTES; }
+    uint32_t slideshowReceivedBytes(void) const { return SlideShowByteCounter; }
+    uint32_t slideshowExpectedBytes(void) const { return SlideShowLength; }
     // Release the published single-buffer image after the UI has completed
     // its hash/decode step. Until then incoming MOT objects are drained but
     // must not overwrite slideshowSegBuf.

@@ -250,6 +250,20 @@ static uint32_t slsDisplayedSize = 0;
 static uint32_t slsWaitingOverlayRssiStamp = 0;
 static bool slsReceiveIndicatorDrawn = false;
 
+// MOT receive progress is intentionally heap-free. The UI keeps only a few
+// scalar cache values and paints the 30x4 bar directly to the TFT.
+static bool slsProgressDrawn = false;
+static uint8_t slsProgressModeOld = 0xFF;
+static uint8_t slsProgressPixelsOld = 0xFF;
+static uint8_t slsProgressAnimPosOld = 0xFF;
+
+static constexpr int16_t SLS_PROGRESS_X = 10;
+static constexpr int16_t SLS_PROGRESS_Y = 211;
+static constexpr int16_t SLS_PROGRESS_W = 30;
+static constexpr int16_t SLS_PROGRESS_H = 4;
+static constexpr uint8_t SLS_PROGRESS_RUNNER_W = 7;
+static constexpr uint32_t SLS_PROGRESS_ANIM_MS = 120U;
+
 void SlideshowReceptionState(bool active) {
   if (slsReceiving == active) return;
   slsReceiving = active;
@@ -261,6 +275,9 @@ void SlideshowReceptionState(bool active) {
     SlideShowAvailableOld = !radio.SlideShowAvailable;
   }
   slsReceiveIndicatorDrawn = false;
+  slsProgressModeOld = 0xFF;
+  slsProgressPixelsOld = 0xFF;
+  slsProgressAnimPosOld = 0xFF;
 
   Serial.printf("[SLS/UI] reception=%s\n", active ? "IN PROGRESS" : "IDLE");
 }
@@ -314,14 +331,102 @@ static void DrawSlideshowLoadingIcon(int16_t x, int16_t y, bool flatBackground) 
   tft.pushImage(x, y, 30, 22, loadingIcon);
 }
 
+enum SlsProgressMode : uint8_t {
+  SLS_PROGRESS_INDETERMINATE = 0,
+  SLS_PROGRESS_EXACT = 1
+};
+
+static void RestoreSlideshowProgressBackground(void) {
+  // Background[] has a 320-pixel stride, therefore restore one scanline at a
+  // time. This avoids a temporary pixel buffer and restores the exact artwork.
+  for (int16_t row = 0; row < SLS_PROGRESS_H; ++row) {
+    const uint32_t offset =
+        static_cast<uint32_t>(SLS_PROGRESS_Y + row) * 320U +
+        static_cast<uint32_t>(SLS_PROGRESS_X);
+    tft.pushImage(SLS_PROGRESS_X, SLS_PROGRESS_Y + row,
+                  SLS_PROGRESS_W, 1, Background + offset);
+  }
+}
+
+static void DrawSlideshowProgressTrack(uint8_t pixels, uint16_t color) {
+  if (pixels > SLS_PROGRESS_W) pixels = SLS_PROGRESS_W;
+  tft.fillRect(SLS_PROGRESS_X, SLS_PROGRESS_Y,
+               SLS_PROGRESS_W, SLS_PROGRESS_H, GreyoutColor);
+  if (pixels != 0U) {
+    tft.fillRect(SLS_PROGRESS_X, SLS_PROGRESS_Y,
+                 pixels, SLS_PROGRESS_H, color);
+  }
+  slsProgressDrawn = true;
+}
+
+static void DrawSlideshowProgressRunner(uint8_t pos) {
+  const uint8_t maxPos = SLS_PROGRESS_W - SLS_PROGRESS_RUNNER_W;
+  if (pos > maxPos) pos = maxPos;
+  tft.fillRect(SLS_PROGRESS_X, SLS_PROGRESS_Y,
+               SLS_PROGRESS_W, SLS_PROGRESS_H, GreyoutColor);
+  tft.fillRect(SLS_PROGRESS_X + pos, SLS_PROGRESS_Y,
+               SLS_PROGRESS_RUNNER_W, SLS_PROGRESS_H, TFT_RED);
+  slsProgressDrawn = true;
+}
+
 static void ShowSlideshowReceiveIndicator(void) {
   if (radioMode != RADIO_MODE_DAB || radio.SlideShowAvailable || !slsReceiving) {
     slsReceiveIndicatorDrawn = false;
+    if (slsProgressDrawn) {
+      RestoreSlideshowProgressBackground();
+      slsProgressDrawn = false;
+    }
+    slsProgressModeOld = 0xFF;
+    slsProgressPixelsOld = 0xFF;
+    slsProgressAnimPosOld = 0xFF;
     return;
   }
-  if (slsReceiveIndicatorDrawn && !displayreset) return;
-  DrawSlideshowLoadingIcon(10, 187, false);
-  slsReceiveIndicatorDrawn = true;
+
+  if (!slsReceiveIndicatorDrawn || displayreset) {
+    DrawSlideshowLoadingIcon(10, 187, false);
+    slsReceiveIndicatorDrawn = true;
+  }
+
+  const uint32_t receivedBytes = radio.slideshowReceivedBytes();
+  const uint32_t expectedBytes = radio.slideshowExpectedBytes();
+
+  if (expectedBytes != 0U) {
+    // MOT BodySize is authoritative. From this point the bar is exact and uses
+    // the theme ActiveColor. Before BodySize is known we deliberately do not
+    // estimate progress from segment numbers because that state is not useful
+    // in the receiver's actual MOT delivery sequence.
+    uint32_t clampedBytes = receivedBytes;
+    if (clampedBytes > expectedBytes) clampedBytes = expectedBytes;
+    const uint8_t pixels = static_cast<uint8_t>(
+        (clampedBytes * static_cast<uint32_t>(SLS_PROGRESS_W)) /
+        expectedBytes);
+
+    if (displayreset || slsProgressModeOld != SLS_PROGRESS_EXACT ||
+        slsProgressPixelsOld != pixels) {
+      DrawSlideshowProgressTrack(pixels, static_cast<uint16_t>(ActiveColor));
+      slsProgressModeOld = SLS_PROGRESS_EXACT;
+      slsProgressPixelsOld = pixels;
+      slsProgressAnimPosOld = 0xFF;
+    }
+    return;
+  }
+
+  // BodySize is not known yet: show only a low-cost red runner. Derive the
+  // position directly from millis(), so no timer object, String, sprite, or
+  // heap allocation is needed. The triangular phase makes it bounce at both
+  // ends.
+  const uint8_t travel = SLS_PROGRESS_W - SLS_PROGRESS_RUNNER_W;
+  const uint32_t tick = millis() / SLS_PROGRESS_ANIM_MS;
+  const uint8_t phase = static_cast<uint8_t>(tick % (2U * travel));
+  const uint8_t pos = phase <= travel ? phase : static_cast<uint8_t>(2U * travel - phase);
+
+  if (displayreset || slsProgressModeOld != SLS_PROGRESS_INDETERMINATE ||
+      slsProgressAnimPosOld != pos) {
+    DrawSlideshowProgressRunner(pos);
+    slsProgressModeOld = SLS_PROGRESS_INDETERMINATE;
+    slsProgressPixelsOld = 0xFF;
+    slsProgressAnimPosOld = pos;
+  }
 }
 
 static void ShowSlideshowWaitingOverlay(void) {
