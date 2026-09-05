@@ -1298,6 +1298,22 @@ void ProcessDAB(void) {
             slsWaitingOverlayRssiStamp != rssiTimer)
           ShowSlideshowWaitingOverlay();
       }
+
+      // In manual slideshow mode a newly completed image is cached for the
+      // SL button, but it is not rendered immediately. Release the single MOT
+      // buffer ownership after the main UI has observed the READY state so a
+      // following TransportId can start reception. SlideShowAvailable and the
+      // image bytes remain valid until the first segment of that next object;
+      // pressing SL before then re-arms SlideShowUpdate and displays the cache.
+      // Without this acknowledge, slideshowPublishedPending stays set forever
+      // after a background completion and every later TID is ignored as
+      // "Hold published image".
+      if (!SlideShowView && !autoslideshow &&
+          radioMode == RADIO_MODE_DAB && radio.SlideShowAvailable &&
+          radio.SlideShowUpdate) {
+        radio.acknowledgeSlideshow();
+        Serial.println("[SLS/UI] image cached for manual view; collector released");
+      }
     }
   } else {
     if (radio.SlideShowAvailable && radio.SlideShowUpdate && !menu) {
@@ -1327,7 +1343,7 @@ void ProcessDAB(void) {
           RestoreMainDisplayAfterSlideshow();
         }
       }
-      radio.SlideShowUpdate = false;
+      radio.acknowledgeSlideshow();
       slsWaitingView = false;
       LogRamUsage("after slideshow display");
     }

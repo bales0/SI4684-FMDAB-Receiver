@@ -179,6 +179,10 @@ class DAB {
     const uint8_t* slideshowData(void) const { return slideshowSegBuf; }
     uint32_t slideshowSize(void) const { return SlideShowAvailable ? slideshowRamSize : 0; }
     size_t slideshowCapacity(void) const { return SLS_BUFFER_BYTES; }
+    // Release the published single-buffer image after the UI has completed
+    // its hash/decode step. Until then incoming MOT objects are drained but
+    // must not overwrite slideshowSegBuf.
+    void acknowledgeSlideshow(void);
 
   private:
     enum class DabCommand : uint8_t {
@@ -235,6 +239,9 @@ class DAB {
     uint8_t SlideShowHighestSegment;
     uint16_t SlideShowTransportID;
     bool SlideShowTransportIDValid;
+    uint16_t lastCompletedTransportId;
+    bool lastCompletedTransportIdValid;
+    bool slideshowPublishedPending;
     bool SlideShowLastSegmentValid;
     uint8_t SlideShowLastSegment;
     uint32_t SlideShowLastActivity;       // millis() of last new segment received

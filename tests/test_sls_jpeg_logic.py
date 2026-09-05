@@ -8,7 +8,15 @@ protocol edge cases can be exercised with Python's standard library.
 from __future__ import annotations
 
 import unittest
+from io import BytesIO
 from pathlib import Path
+
+from jpeg_fixture_matrix import DHT, make_jpeg, remove_header_marker, scan_count
+
+try:
+    from PIL import Image
+except ImportError:  # Optional reference decoder used by the extended matrix.
+    Image = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +28,10 @@ class MotCollectorModel:
     MAX_SEGMENT_SIZE = 2048
 
     def __init__(self) -> None:
+        self.last_completed: int | None = None
+        self.published_pending = False
+        self.update = False
+        self.published_data = b""
         self.reset()
 
     def reset(self) -> None:
@@ -40,8 +52,12 @@ class MotCollectorModel:
     def header(self, transport_id: int, body_size: int) -> bool:
         if not 0 < body_size <= self.CAPACITY:
             return False
-        if self.transport_id is not None and transport_id != self.transport_id:
+        if transport_id == self.last_completed:
             return False
+        if self.published_pending or self.update:
+            return False
+        if self.transport_id is not None and transport_id != self.transport_id:
+            self._lock(transport_id)
         if self.transport_id is None:
             self._lock(transport_id)
         if self.body_size is not None and self.body_size != body_size:
@@ -56,6 +72,16 @@ class MotCollectorModel:
             return "invalid"
         if not 0 < len(payload) <= self.MAX_SEGMENT_SIZE:
             return "invalid"
+        if transport_id == self.last_completed:
+            return "completed"
+        if self.published_pending or self.update:
+            return "published"
+        if (
+            self.transport_id is not None
+            and transport_id != self.transport_id
+            and number == 0
+        ):
+            self._lock(transport_id)
         if self.transport_id is None:
             self._lock(transport_id)
         if transport_id != self.transport_id:
@@ -80,6 +106,18 @@ class MotCollectorModel:
             self.reset()
             return "invalid"
         return "complete" if self.complete else "stored"
+
+    def publish(self) -> None:
+        if not self.complete or self.transport_id is None:
+            raise AssertionError("cannot publish incomplete object")
+        self.last_completed = self.transport_id
+        self.published_data = bytes(self.data)
+        self.published_pending = True
+        self.update = True
+
+    def acknowledge(self) -> None:
+        self.update = False
+        self.published_pending = False
 
     @property
     def highest_segment(self) -> int:
@@ -154,8 +192,6 @@ class EntropyReaderModel:
     def boundary_marker(self) -> int | None:
         if self.bits > 7:
             return None
-        if self.bits and self.buf & ((1 << self.bits) - 1) != (1 << self.bits) - 1:
-            return None
         self.bits = 0
         self.buf = 0
         if self.pending is not None:
@@ -195,14 +231,15 @@ class MotCollectorTests(unittest.TestCase):
         self.assertEqual(c.segment(1, 0, b"abc"), "duplicate")
         self.assertEqual(c.byte_count, 3)
 
-    def test_same_size_foreign_tid_never_mixes(self) -> None:
+    def test_foreign_header_switches_without_mixing(self) -> None:
         c = MotCollectorModel()
         c.header(10, 4)
         c.segment(10, 0, b"AA")
         self.assertFalse(c.header(11, 4))
-        self.assertEqual(c.segment(11, 1, b"BB", last=True), "foreign")
-        self.assertEqual(c.segment(10, 1, b"aa", last=True), "complete")
-        self.assertEqual(c.data, b"AAaa")
+        self.assertEqual(c.transport_id, 11)
+        self.assertEqual(c.segment(11, 0, b"BB"), "stored")
+        self.assertEqual(c.segment(11, 1, b"bb", last=True), "complete")
+        self.assertEqual(c.data, b"BBbb")
 
     def test_late_header_preserves_segments(self) -> None:
         c = MotCollectorModel()
@@ -211,12 +248,42 @@ class MotCollectorTests(unittest.TestCase):
         self.assertTrue(c.header(22, 2))
         self.assertEqual(c.data, b"AB")
 
-    def test_foreign_header_does_not_replace_partial_object(self) -> None:
+    def test_tune_mid_object_switches_at_next_header(self) -> None:
         c = MotCollectorModel()
-        c.segment(31, 0, b"A")
-        self.assertFalse(c.header(32, 1))
-        self.assertEqual(c.transport_id, 31)
+        c.segment(31, 5, b"F")
+        c.segment(31, 6, b"G")
+        c.segment(31, 7, b"H", last=True)
+        self.assertFalse(c.header(32, 4))
+        self.assertEqual(c.transport_id, 32)
+        self.assertEqual(c.data, b"")
+        self.assertEqual(c.segment(32, 0, b"A"), "stored")
+        self.assertEqual(c.segment(32, 1, b"B"), "stored")
+        self.assertEqual(c.segment(32, 2, b"C"), "stored")
+        self.assertEqual(c.segment(32, 3, b"D", last=True), "complete")
+
+    def test_foreign_segment_zero_switches_but_later_segment_does_not(self) -> None:
+        c = MotCollectorModel()
+        c.segment(100, 2, b"C")
+        self.assertEqual(c.segment(202, 8, b"x"), "foreign")
+        self.assertEqual(c.transport_id, 100)
+        self.assertEqual(c.segment(101, 0, b"A"), "stored")
+        self.assertEqual(c.transport_id, 101)
         self.assertEqual(c.data, b"A")
+
+    def test_published_buffer_waits_for_ui_and_completed_tid_is_ignored(self) -> None:
+        c = MotCollectorModel()
+        c.header(101, 2)
+        c.segment(101, 0, b"A")
+        self.assertEqual(c.segment(101, 1, b"B", last=True), "complete")
+        c.publish()
+        original = c.published_data
+        self.assertFalse(c.header(102, 2))
+        self.assertEqual(c.segment(102, 0, b"X"), "published")
+        self.assertEqual(c.published_data, original)
+        self.assertEqual(c.segment(101, 0, b"A"), "completed")
+        c.acknowledge()
+        self.assertFalse(c.header(102, 2))
+        self.assertEqual(c.segment(102, 0, b"X"), "stored")
 
     def test_transport_id_zero_is_valid(self) -> None:
         c = MotCollectorModel()
@@ -281,7 +348,7 @@ class JpegBitBoundaryTests(unittest.TestCase):
         self.assertEqual(reader.get_bits(1), 0)
         self.assertEqual(reader.boundary_marker(), 0xD9)
 
-    def test_boundary_rejects_unconsumed_byte_or_zero_padding(self) -> None:
+    def test_boundary_rejects_unconsumed_byte_but_tolerates_padding_value(self) -> None:
         full_byte = EntropyReaderModel(bytes((0xFF, 0x00, 0xFF, 0xD9)))
         self.assertFalse(full_byte.fill(16))
         self.assertIsNone(full_byte.boundary_marker())
@@ -289,7 +356,7 @@ class JpegBitBoundaryTests(unittest.TestCase):
         zero_padding = EntropyReaderModel(bytes((0b10000000, 0xFF, 0xD9)))
         self.assertFalse(zero_padding.fill(16))
         self.assertEqual(zero_padding.get_bits(1), 1)
-        self.assertIsNone(zero_padding.boundary_marker())
+        self.assertEqual(zero_padding.boundary_marker(), 0xD9)
 
     def test_production_sources_keep_required_states(self) -> None:
         jpeg = (ROOT / "src" / "JPEGdecoder.cpp").read_text(encoding="utf-8")
@@ -297,10 +364,97 @@ class JpegBitBoundaryTests(unittest.TestCase):
         header = (ROOT / "src" / "si4684.h").read_text(encoding="utf-8")
         self.assertIn("pendingMarker", jpeg)
         self.assertNotIn("hitMarker", jpeg)
+        self.assertIn("pjDecodeBaselineMultiPass", jpeg)
+        self.assertIn("pjInstallStandardHuffman", jpeg)
+        self.assertIn("uint8_t* nzBitmap = static_cast<uint8_t*>(calloc", jpeg)
         self.assertIn("storeSlideshowSegment", mot)
+        self.assertIn("acknowledgeSlideshow", mot + header)
+        self.assertIn("lastCompletedTransportId", mot + header)
         self.assertNotIn("slideshowSlotSize", mot + header)
         self.assertIn("SlideShowTransportIDValid", header)
         self.assertIn("50U * 1024U", header)
+
+
+class SyntheticJpegMatrixTests(unittest.TestCase):
+    CASES = {
+        "baseline_444": dict(sampling="444"),
+        "baseline_422": dict(sampling="422"),
+        "baseline_420": dict(sampling="420"),
+        "baseline_440": dict(sampling="440"),
+        "baseline_411": dict(sampling="411"),
+        "baseline_max10_blocks": dict(sampling="max10"),
+        "baseline_gray": dict(sampling="gray"),
+        "baseline_odd_size": dict(width=319, height=237, sampling="420"),
+        "baseline_restart": dict(sampling="420", restart=7),
+        "baseline_app_com_fill": dict(sampling="444", extras=True,
+                                       marker_fill=True),
+        "baseline_multi_tables": dict(sampling="420", multiple_tables=True),
+        "baseline_separate_scans": dict(sampling="420", separate=True),
+        "baseline_repeated_tables": dict(sampling="420", separate=True,
+                                          repeat_tables=True),
+        "progressive_444": dict(sampling="444", progressive=True),
+        "progressive_420": dict(sampling="420", progressive=True),
+        "progressive_gray": dict(sampling="gray", progressive=True),
+        "progressive_refine": dict(sampling="420", progressive=True,
+                                   refine=True),
+        "progressive_repeated_tables": dict(sampling="420", progressive=True,
+                                             refine=True, repeat_tables=True),
+        "progressive_restart": dict(sampling="420", progressive=True,
+                                    refine=True, restart=11),
+    }
+
+    def test_generated_scan_matrix_has_complete_marker_structure(self) -> None:
+        for name, options in self.CASES.items():
+            with self.subTest(name=name):
+                jpeg = make_jpeg(**options)
+                self.assertEqual(jpeg[:2], b"\xff\xd8")
+                self.assertEqual(jpeg[-2:], b"\xff\xd9")
+                scans = scan_count(jpeg)
+                self.assertGreaterEqual(scans, 1)
+                if options.get("separate"):
+                    self.assertEqual(scans, 3)
+                if options.get("progressive"):
+                    self.assertGreaterEqual(scans, 3)
+
+    @unittest.skipIf(Image is None, "Pillow reference decoder not installed")
+    def test_reference_decoder_accepts_supported_matrix(self) -> None:
+        for name, options in self.CASES.items():
+            with self.subTest(name=name):
+                jpeg = make_jpeg(**options)
+                with Image.open(BytesIO(jpeg)) as image:
+                    image.load()
+                    self.assertEqual(image.size,
+                                     (options.get("width", 320),
+                                      options.get("height", 240)))
+
+    @unittest.skipIf(Image is None, "Pillow reference decoder not installed")
+    def test_reference_decoder_rejects_truncated_entropy(self) -> None:
+        jpeg = make_jpeg(sampling="420", progressive=True, refine=True)
+        with self.assertRaises(Exception):
+            with Image.open(BytesIO(jpeg[:-17])) as image:
+                image.load()
+
+    @unittest.skipIf(Image is None, "Pillow reference decoder not installed")
+    def test_reference_decoder_accepts_annex_k_defaults_without_dht(self) -> None:
+        image = Image.new("RGB", (31, 29), (20, 90, 170))
+        encoded = BytesIO()
+        image.save(encoded, "JPEG", quality=83, subsampling=2,
+                   optimize=False)
+        without_dht = remove_header_marker(encoded.getvalue(), DHT)
+        with Image.open(BytesIO(without_dht)) as decoded:
+            decoded.load()
+            self.assertEqual(decoded.size, (31, 29))
+
+    def test_progressive_444_workspace_is_split_below_observed_limit(self) -> None:
+        blocks_per_row = 40 * 3
+        row_workspace = blocks_per_row * 64 * (2 + 1)
+        nonzero_bitmap = (40 * 30 * 3) * 8
+        old_combined = row_workspace + nonzero_bitmap
+        self.assertEqual(row_workspace, 23040)
+        self.assertEqual(nonzero_bitmap, 28800)
+        self.assertGreater(old_combined, 51188)
+        self.assertLess(row_workspace, 51188)
+        self.assertLess(nonzero_bitmap, 51188)
 
 
 if __name__ == "__main__":

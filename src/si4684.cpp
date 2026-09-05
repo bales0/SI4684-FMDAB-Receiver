@@ -525,6 +525,14 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   ServiceStart = false;
   ServiceIndex = 0;
   numberofservices = 0;
+  SlideShowAvailable = false;
+  SlideShowUpdate = false;
+  SlideShowUpdate2 = false;
+  slideshowRamSize = 0;
+  slideshowPublishedPending = false;
+  lastCompletedTransportId = 0;
+  lastCompletedTransportIdValid = false;
+  resetSlideshowCollector();
   dabRssi10 = 0;
   dabSignalTimer = 0;
   dabCommand = DabCommand::None;
@@ -1310,14 +1318,27 @@ void DAB::getServiceData(void) {
             if (SlideShowDebug)
               Serial.printf("[SLS] Reject header TID=%u length=%u\n",
                             transportID, newLength);
-          } else if (SlideShowTransportIDValid &&
-                     transportID != SlideShowTransportID) {
-            // One-buffer policy: never replace or mix an active partial object.
+          } else if (lastCompletedTransportIdValid &&
+                     transportID == lastCompletedTransportId) {
             if (SlideShowDebug)
-              Serial.printf("[SLS] Ignore header TID=%u while collecting TID=%u\n",
-                            transportID, SlideShowTransportID);
+              Serial.printf("[SLS] Ignore repeated completed header TID=%u\n",
+                            transportID);
+          } else if (slideshowPublishedPending || SlideShowUpdate) {
+            // The only image-sized buffer is still owned by the UI. DSRV is
+            // deliberately drained, but no new object may claim the buffer.
+            if (SlideShowDebug)
+              Serial.printf("[SLS] Hold published image; ignore header TID=%u\n",
+                            transportID);
           } else {
-            if (!SlideShowTransportIDValid) lockSlideshowTransport(transportID);
+            if (SlideShowTransportIDValid &&
+                transportID != SlideShowTransportID) {
+              if (SlideShowDebug)
+                Serial.printf("[SLS] Partial TID=%u abandoned; new header TID=%u\n",
+                              SlideShowTransportID, transportID);
+              lockSlideshowTransport(transportID);
+            } else if (!SlideShowTransportIDValid) {
+              lockSlideshowTransport(transportID);
+            }
 
             bool metadataChanged = SlideShowLength == 0U;
             if (SlideShowLength != 0U && SlideShowLength != newLength) {
@@ -1364,88 +1385,109 @@ void DAB::getServiceData(void) {
           const bool lastSegment = (SPIbuffer[27] & 0x80U) != 0U;
           const uint16_t dataLen = static_cast<uint16_t>(byte_count - 11U);
 
-          if (!SlideShowTransportIDValid) {
-            lockSlideshowTransport(transportID);
-            if (SlideShowDebug)
-              Serial.printf("[SLS] Collector locked to TID=%u\n", transportID);
-          }
-
-          if (transportID != SlideShowTransportID) {
-            if (SlideShowDebug)
-              Serial.printf("[SLS] Ignore seg=%u TID=%u (collecting TID=%u)\n",
-                            segmentNumber, transportID,
-                            SlideShowTransportID);
+          if (lastCompletedTransportIdValid &&
+              transportID == lastCompletedTransportId) {
+            if (SlideShowDebug && segmentNumber == 0U)
+              Serial.printf("[SLS] Ignore repeated completed TID=%u\n",
+                            transportID);
+          } else if (slideshowPublishedPending || SlideShowUpdate) {
+            // Preserve the complete image until acknowledgeSlideshow().
+            if (SlideShowDebug && segmentNumber == 0U)
+              Serial.printf("[SLS] Hold published image; ignore seg=0 TID=%u\n",
+                            transportID);
           } else {
-            const uint8_t byteIndex = segmentNumber / 8U;
-            const uint8_t bitIndex = segmentNumber % 8U;
-            const uint8_t bitMask = static_cast<uint8_t>(1U << bitIndex);
+            if (SlideShowTransportIDValid &&
+                transportID != SlideShowTransportID && segmentNumber == 0U) {
+              if (SlideShowDebug)
+                Serial.printf("[SLS] Partial TID=%u abandoned; new seg=0 TID=%u\n",
+                              SlideShowTransportID, transportID);
+              lockSlideshowTransport(transportID);
+            } else if (!SlideShowTransportIDValid) {
+              lockSlideshowTransport(transportID);
+              if (SlideShowDebug)
+                Serial.printf("[SLS] Collector locked to TID=%u\n", transportID);
+            }
 
-            if ((SlideShowSegmentBitmap[byteIndex] & bitMask) == 0U) {
-              const bool lastConflict =
-                  lastSegment && SlideShowLastSegmentValid &&
-                  segmentNumber != SlideShowLastSegment;
-              const bool pastKnownEnd =
-                  SlideShowLastSegmentValid &&
-                  segmentNumber > SlideShowLastSegment;
-              const bool lastBeforeHighest =
-                  lastSegment && SlideShowByteCounter != 0U &&
-                  segmentNumber < SlideShowHighestSegment;
+            if (transportID != SlideShowTransportID) {
+              if (SlideShowDebug)
+                Serial.printf("[SLS] Ignore seg=%u TID=%u (collecting TID=%u)\n",
+                              segmentNumber, transportID,
+                              SlideShowTransportID);
+            } else {
+              const uint8_t byteIndex = segmentNumber / 8U;
+              const uint8_t bitIndex = segmentNumber % 8U;
+              const uint8_t bitMask = static_cast<uint8_t>(1U << bitIndex);
 
-              if (lastConflict || pastKnownEnd || lastBeforeHighest ||
-                  dataLen > SLS_MAX_SEG_SIZE ||
-                  SlideShowByteCounter > SLS_BUFFER_BYTES - dataLen) {
-                if (SlideShowDebug)
-                  Serial.printf("[SLS] Invalid seg=%u len=%u last=%u; reset TID=%u\n",
-                                segmentNumber, dataLen,
-                                lastSegment ? 1U : 0U, transportID);
-                resetSlideshowCollector();
-              } else {
-                if (!storeSlideshowSegment(segmentNumber,
-                                            SPIbuffer + 34, dataLen)) {
+              if ((SlideShowSegmentBitmap[byteIndex] & bitMask) == 0U) {
+                const bool lastConflict =
+                    lastSegment && SlideShowLastSegmentValid &&
+                    segmentNumber != SlideShowLastSegment;
+                const bool pastKnownEnd =
+                    SlideShowLastSegmentValid &&
+                    segmentNumber > SlideShowLastSegment;
+                const bool lastBeforeHighest =
+                    lastSegment && SlideShowByteCounter != 0U &&
+                    segmentNumber < SlideShowHighestSegment;
+
+                if (lastConflict || pastKnownEnd || lastBeforeHighest ||
+                    dataLen > SLS_MAX_SEG_SIZE ||
+                    SlideShowByteCounter > SLS_BUFFER_BYTES - dataLen) {
                   if (SlideShowDebug)
-                    Serial.printf("[SLS] Seg=%u len=%u does not fit packed buffer\n",
-                                  segmentNumber, dataLen);
+                    Serial.printf("[SLS] Invalid seg=%u len=%u last=%u; reset TID=%u\n",
+                                  segmentNumber, dataLen,
+                                  lastSegment ? 1U : 0U, transportID);
                   resetSlideshowCollector();
                 } else {
+                  // Invalidate the previous published view before the first
+                  // write, not afterwards. slideshowPublishedPending above
+                  // guarantees the UI has already finished using its bytes.
                   if (SlideShowByteCounter == 0U) {
                     beginSlideshowReception();
                     slideshowFirstSegmentMs = millis();
                   }
 
-                  SlideShowSegmentBitmap[byteIndex] |= bitMask;
-                  SlideShowByteCounter += dataLen;
-                  if (segmentNumber > SlideShowHighestSegment)
-                    SlideShowHighestSegment = segmentNumber;
-
-                  if (lastSegment) {
-                    SlideShowLastSegmentValid = true;
-                    SlideShowLastSegment = segmentNumber;
-                    SlideShowTotalSegments =
-                        static_cast<uint16_t>(segmentNumber) + 1U;
-                  }
-
-                  SlideShowInit = true;
-                  SlideShowLastActivity = millis();
-                  if (SlideShowDebug)
-                    Serial.printf("[SLS] Saved TID=%u seg=%u len=%u bytes=%u/%u%s\n",
-                                  transportID, segmentNumber, dataLen,
-                                  SlideShowByteCounter, SlideShowLength,
-                                  lastSegment ? " LAST" : "");
-
-                  if (SlideShowLength != 0U &&
-                      SlideShowByteCounter > SlideShowLength) {
+                  if (!storeSlideshowSegment(segmentNumber,
+                                              SPIbuffer + 34, dataLen)) {
                     if (SlideShowDebug)
-                      Serial.println("[SLS] Segment data exceed BodySize; reset");
+                      Serial.printf("[SLS] Seg=%u len=%u does not fit packed buffer\n",
+                                    segmentNumber, dataLen);
                     resetSlideshowCollector();
-                  } else if (allSegmentsReceived() &&
-                             ((SlideShowLength != 0U &&
-                               SlideShowByteCounter == SlideShowLength) ||
-                              (SlideShowLength == 0U &&
-                               SlideShowLastSegmentValid))) {
-                    if (SlideShowTotalSegments == 0U)
+                  } else {
+                    SlideShowSegmentBitmap[byteIndex] |= bitMask;
+                    SlideShowByteCounter += dataLen;
+                    if (segmentNumber > SlideShowHighestSegment)
+                      SlideShowHighestSegment = segmentNumber;
+
+                    if (lastSegment) {
+                      SlideShowLastSegmentValid = true;
+                      SlideShowLastSegment = segmentNumber;
                       SlideShowTotalSegments =
-                          static_cast<uint16_t>(SlideShowHighestSegment) + 1U;
-                    assembleSlideshow();
+                          static_cast<uint16_t>(segmentNumber) + 1U;
+                    }
+
+                    SlideShowInit = true;
+                    SlideShowLastActivity = millis();
+                    if (SlideShowDebug)
+                      Serial.printf("[SLS] Saved TID=%u seg=%u len=%u bytes=%u/%u%s\n",
+                                    transportID, segmentNumber, dataLen,
+                                    SlideShowByteCounter, SlideShowLength,
+                                    lastSegment ? " LAST" : "");
+
+                    if (SlideShowLength != 0U &&
+                        SlideShowByteCounter > SlideShowLength) {
+                      if (SlideShowDebug)
+                        Serial.println("[SLS] Segment data exceed BodySize; reset");
+                      resetSlideshowCollector();
+                    } else if (allSegmentsReceived() &&
+                               ((SlideShowLength != 0U &&
+                                 SlideShowByteCounter == SlideShowLength) ||
+                                (SlideShowLength == 0U &&
+                                 SlideShowLastSegmentValid))) {
+                      if (SlideShowTotalSegments == 0U)
+                        SlideShowTotalSegments =
+                            static_cast<uint16_t>(SlideShowHighestSegment) + 1U;
+                      assembleSlideshow();
+                    }
                   }
                 }
               }
@@ -1466,6 +1508,11 @@ void DAB::beginSlideshowReception(void) {
   SlideShowUpdate2 = false;
   slideshowRamSize = 0;
   SlideshowReceptionState(true);
+}
+
+void DAB::acknowledgeSlideshow(void) {
+  SlideShowUpdate = false;
+  slideshowPublishedPending = false;
 }
 
 // Insert one new segment into the single buffer while keeping already received
@@ -1596,6 +1643,9 @@ void DAB::assembleSlideshow(void) {
     SlideShowUpdate = true;
     SlideShowUpdate2 = true;
     SlideShowAvailable = true;
+    slideshowPublishedPending = true;
+    lastCompletedTransportId = SlideShowTransportID;
+    lastCompletedTransportIdValid = SlideShowTransportIDValid;
 
     if (SlideShowDebug) {
       Serial.printf("[SLS] RAM image ready: %s, %u bytes\n",
@@ -1667,7 +1717,11 @@ void DAB::setFreq(uint8_t freq) {
   dataServiceCheck = 0;
   ServiceStart = false;
   SlideShowAvailable = false;
+  SlideShowUpdate = false;
+  SlideShowUpdate2 = false;
   slideshowRamSize = 0;
+  slideshowPublishedPending = false;
+  lastCompletedTransportIdValid = false;
   resetSlideshowCollector();
 
   signallock = false;
@@ -1722,7 +1776,11 @@ void DAB::clearFmData(void) {
   EnsembleLabelCharset = 0;
   SlideShowAvailable = false;
   SlideShowUpdate = false;
+  SlideShowUpdate2 = false;
   slideshowRamSize = 0;
+  slideshowPublishedPending = false;
+  lastCompletedTransportIdValid = false;
+  resetSlideshowCollector();
   signallock = false;
 }
 
@@ -2039,6 +2097,10 @@ void DAB::setService(uint8_t _index) {
   memset(PStext, 0, sizeof(PStext));
   slideshowRamSize = 0;
   SlideShowAvailable = false;
+  SlideShowUpdate = false;
+  SlideShowUpdate2 = false;
+  slideshowPublishedPending = false;
+  lastCompletedTransportIdValid = false;
   ServiceStart = false;
   ServiceIndex = _index;
   ecc = 0;  // Reset so ServiceInfo() picks up the new service's ECC
