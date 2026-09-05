@@ -3,7 +3,7 @@
 
 #include "FmRegion.h"
 
-#define VERSION "v1.0"
+#define VERSION "v2.0b"
 
 // [number of languages][number of texts]
 // *** means the text is the same as in English
@@ -36,16 +36,16 @@ static const char* const myLanguage[8][82] PROGMEM = {
     "Off",                        // 24
     "Time-out Timer",             // 25
     "Min.",                       // 26
-    "Service Information",        // 27
-    "Frequency",                  // 28
-    "Ensemblename",               // 29
-    "Servicename",                // 30
-    "Program type",               // 31
-    "Protectionlevel",            // 32
-    "Samplerate",                 // 33
-    "Bitrate",                    // 34
-    "Audio mode",                 // 35
-    "Signal information",         // 36
+    "System info",                          // 27
+    "Tuner",                                // 28
+    "Radio control",                        // 29
+    "GPIO12",                               // 30
+    "VDD_SDIO",                             // 31
+    "ESP32 / software",                     // 32
+    "Uptime",                               // 33
+    "Reset reason",                         // 34
+    "RAM free / min",                       // 35
+    "Heap block / frag.",                   // 36
     "Unknown",                    // 37
     "News",                       // 38
     "Current Affairs",            // 39
@@ -121,16 +121,16 @@ static const char* const myLanguage[8][82] PROGMEM = {
     "Uit",                              // 24
     "Auto uitschakelen",                // 25
     "Min.",                             // 26
-    "Service informatie",               // 27
-    "Frequentie",                       // 28
-    "Ensemblenaam",                     // 29
-    "Servicenaam",                      // 30
-    "Programma type",                   // 31
-    "Protectionniveau",                 // 32
-    "Bemonst. frequentie",              // 33
-    "Bitsnelheid",                      // 34
-    "Audio modus",                      // 35
-    "Signaal informatie",               // 36
+    "Systeeminfo",                          // 27
+    "Tuner",                                // 28
+    "Radiobesturing",                       // 29
+    "GPIO12",                               // 30
+    "VDD_SDIO",                             // 31
+    "ESP32 / software",                     // 32
+    "Bedrijfstijd",                         // 33
+    "Resetreden",                           // 34
+    "RAM vrij / min",                       // 35
+    "Heapblok / frag.",                     // 36
     "Onbekend",                         // 37
     "Nieuws",                           // 38
     "Actualiteit",                      // 39
@@ -206,16 +206,16 @@ static const char* const myLanguage[8][82] PROGMEM = {
     "Ανενεργό",                              // 24
     "Χρονοδιακόπτης λήξης",                  // 25
     "λεπτά",                                 // 26
-    "Πληροφορίες υπηρεσίας",                 // 27
-    "Συχνότητα",                             // 28
-    "Όνομα μπουκέτου",                       // 29
-    "Όνομα υπηρεσίας",                       // 30
-    "Τύπος προγράμματος",                    // 31
-    "Επίπεδο προστασίας",                    // 32
-    "Samplerate",                            // 33 (technical term)
-    "Ρυθμός bit",                            // 34
-    "Λειτουργία ήχου",                       // 35
-    "Πληροφορίες σήματος",                   // 36
+    "Στοιχεία συστήματος",                  // 27
+    "Tuner",                                // 28
+    "Έλεγχος radio",                        // 29
+    "GPIO12",                               // 30
+    "VDD_SDIO",                             // 31
+    "ESP32 / λογισμικό",                    // 32
+    "Χρόνος λειτουργ.",                     // 33
+    "Αιτία reset",                          // 34
+    "RAM ελεύθ./ελάχ.",                     // 35
+    "Heap block / frag.",                   // 36
     "Άγνωστο",                               // 37
     "Ειδήσεις",                              // 38
     "Επικαιρότητα",                          // 39
@@ -291,16 +291,16 @@ static const char* const myLanguage[8][82] PROGMEM = {
     "Aus",                              // 24
     "Zeit bis Standby",                 // 25
     "Min.",                             // 26
-    "Serviceinformationen",             // 27
-    "Frequenz",                         // 28
-    "Ensemblename",                     // 29
-    "Servicename",                      // 30
-    "Programmtyp",                      // 31
-    "Fehlerschutz",                     // 32
-    "Samplingrate",                     // 33
-    "Bitrate",                          // 34
-    "Audio-Modus",                      // 35
-    "Signalinformationen",              // 36
+    "Systeminfo",                           // 27
+    "Tuner",                                // 28
+    "Radiosteuerung",                       // 29
+    "GPIO12",                               // 30
+    "VDD_SDIO",                             // 31
+    "ESP32 / Software",                     // 32
+    "Laufzeit",                             // 33
+    "Reset-Grund",                          // 34
+    "RAM frei / min",                       // 35
+    "Heapblock / Frag.",                    // 36
     "Unbekannt",                        // 37
     "Nachrichten",                      // 38
     "Aktuelle Ereignisse",              // 39
@@ -376,16 +376,16 @@ static const char* const myLanguage[8][82] PROGMEM = {
     "Arrêt",                             // 24
     "Temporisation",                     // 25
     "Min.",                              // 26
-    "Informations service",              // 27
-    "Fréquence",                         // 28
-    "Nom ensemble",                      // 29
-    "Nom de service",                    // 30
-    "Type de programme",                 // 31
-    "Niveau de protection",              // 32
-    "Échantillonnage",                   // 33
-    "Débit",                             // 34
-    "Mode audio",                        // 35
-    "Informations signal",               // 36
+    "Infos système",                        // 27
+    "Tuner",                                // 28
+    "Contrôle radio",                       // 29
+    "GPIO12",                               // 30
+    "VDD_SDIO",                             // 31
+    "ESP32 / logiciel",                     // 32
+    "Durée active",                         // 33
+    "Cause reset",                          // 34
+    "RAM libre / min",                      // 35
+    "Bloc heap / frag.",                    // 36
     "Inconnu",                           // 37
     "Nouvelles",                         // 38
     "Actualité",                         // 39
@@ -461,16 +461,16 @@ static const char* const myLanguage[8][82] PROGMEM = {
     "Apagado",                       // 24
     "Tiempo",                        // 25
     "Mín.",                          // 26
-    "Información del servicio",      // 27
-    "Frecuencia",                    // 28
-    "Nombre del conjunto",           // 29
-    "Nombre del servicio",           // 30
-    "Tipo de programa",              // 31
-    "Nivel de protección",           // 32
-    "Muestreo",                      // 33
-    "Tasa de bits",                  // 34
-    "Modo de audio",                 // 35
-    "Información de la señal",       // 36
+    "Info del sistema",                     // 27
+    "Sintonizador",                         // 28
+    "Control radio",                        // 29
+    "GPIO12",                               // 30
+    "VDD_SDIO",                             // 31
+    "ESP32 / software",                     // 32
+    "Tiempo activo",                        // 33
+    "Causa reinicio",                       // 34
+    "RAM libre / mín.",                     // 35
+    "Bloque heap / frag.",                  // 36
     "Desconocido",                   // 37
     "Noticias",                      // 38
     "Actualidad",                    // 39
@@ -546,16 +546,16 @@ static const char* const myLanguage[8][82] PROGMEM = {
     "Wyłącz",                            // 24
     "Czas do wyłączenia",                // 25
     "Min.",                              // 26
-    "Informacje o serwisie",             // 27
-    "Częstotliwość",                     // 28
-    "Nazwa multipleksu",                 // 29
-    "Nazwa stacji",                      // 30
-    "Rodzaj programu",                   // 31
-    "Poziom ochrony",                    // 32
-    "Częst. próbkowania",                // 33
-    "Bitrate",                           // 34 (technical term)
-    "Tryb audio",                        // 35
-    "Informacje o sygnale",              // 36
+    "Info systemowe",                       // 27
+    "Tuner",                                // 28
+    "Sterowanie radia",                     // 29
+    "GPIO12",                               // 30
+    "VDD_SDIO",                             // 31
+    "ESP32 / program",                      // 32
+    "Czas pracy",                           // 33
+    "Przyczyna resetu",                     // 34
+    "RAM wolna / min",                      // 35
+    "Blok heap / frag.",                    // 36
     "Nieznany",                          // 37
     "Wiadomości",                        // 38
     "Aktualności",                       // 39
@@ -631,16 +631,16 @@ static const char* const myLanguage[8][82] PROGMEM = {
     "Oprit",                                // 24
     "Oprire după",                          // 25
     "Min.",                                 // 26
-    "Informații program",                   // 27
-    "Frecvență",                            // 28
-    "Nume multiplex",                       // 29
-    "Nume program",                         // 30
-    "Tip program",                          // 31
-    "Nivel protecție",                      // 32
-    "Samplerate",                           // 33 (technical term)
-    "Bitrate",                              // 34 (technical term)
-    "Mod audio",                            // 35
-    "Informații semnal",                    // 36
+    "Info sistem",                          // 27
+    "Tuner",                                // 28
+    "Control radio",                        // 29
+    "GPIO12",                               // 30
+    "VDD_SDIO",                             // 31
+    "ESP32 / software",                     // 32
+    "Timp activ",                           // 33
+    "Cauză reset",                          // 34
+    "RAM liber / min",                      // 35
+    "Bloc heap / frag.",                    // 36
     "Necunoscut",                           // 37
     "Știri",                                // 38
     "Actualități",                          // 39
@@ -687,6 +687,20 @@ static const char* const myLanguage[8][82] PROGMEM = {
     "Grafică",                              // 80
     "Despre"                                // 81
   }
+};
+
+// Reset reason strings used by System info. Technical fault names such as WDT,
+// Brownout and SDIO stay recognizable across languages; ordinary states are
+// localized. The table lives in flash and adds no runtime heap allocation.
+static const char* const systemResetReasonText[8][9] PROGMEM = {
+  {"Power-on", "External", "Software", "Panic", "WDT", "Deep sleep", "Brownout", "SDIO", "Unknown"},
+  {"Inschakelen", "Extern", "Software", "Panic", "WDT", "Diepe slaap", "Brownout", "SDIO", "Onbekend"},
+  {"Εκκίνηση", "Εξωτερικό", "Λογισμικό", "Panic", "WDT", "Βαθύς ύπνος", "Brownout", "SDIO", "Άγνωστο"},
+  {"Einschalten", "Extern", "Software", "Panic", "WDT", "Tiefschlaf", "Brownout", "SDIO", "Unbekannt"},
+  {"Mise sous tension", "Externe", "Logiciel", "Panic", "WDT", "Sommeil profond", "Brownout", "SDIO", "Inconnu"},
+  {"Encendido", "Externo", "Software", "Panic", "WDT", "Sueño profundo", "Brownout", "SDIO", "Desconocido"},
+  {"Zasilanie", "Zewnętrzny", "Programowy", "Panic", "WDT", "Głęboki sen", "Brownout", "SDIO", "Nieznany"},
+  {"Pornire", "Extern", "Software", "Panic", "WDT", "Somn profund", "Brownout", "SDIO", "Necunoscut"}
 };
 
 // FM-only labels that have no DAB counterpart in the legacy 82-string table.
@@ -819,6 +833,10 @@ static const char* const irProfileEmptyText[8] PROGMEM = {
 static const char* const irLearnedShortText[8] PROGMEM = {
   "learned", "geleerd", "εκμαθημένο", "gelernt",
   "appris", "aprendido", "nauczony", "învățat"
+};
+static const char* const irEmptyShortText[8] PROGMEM = {
+  "empty", "leeg", "κενό", "leer",
+  "vide", "vacío", "pusty", "gol"
 };
 static const char* const irSetGpio12Text[8] PROGMEM = {
   "Set GPIO12 to IR", "GPIO12 op IR zetten", "GPIO12 σε IR", "GPIO12 auf IR",

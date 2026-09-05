@@ -6,6 +6,13 @@
 
 #include "gui.h"
 #include "ir_remote.h"
+#include <esp_efuse.h>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
+#include <esp_timer.h>
+#include "esp_efuse_table.h"
+#include "soc/gpio_reg.h"
+#include "soc/soc.h"
 
 // Defined by the FM RDS decoder in si4684.cpp. PTY=0 is a real value, so
 // this flag distinguishes "not received yet" from a valid PTY 0 (Unknown).
@@ -166,144 +173,221 @@ void doTheme(void) {  // Use this to put your own colors in: http://www.barth-de
   }
 }
 
-// Full-screen overlay listing every metadata field for the current service
-// (chip, firmware, ensemble, ECC, PTY, audio mode, bitrate, sample rate).
-void ShowServiceInfo(void) {
-  setvolume = false;
-  displayreset = true;
-  tft.pushImage(0, 0, 320, 240, serviceinfobackground);
-  tftPrintFixed(0, myLanguage[language][27], 155, 4,
-                ActiveColor, ActiveColorSmooth, 28);
+// Full-screen technical diagnostics. The legacy function name is kept to
+// minimise cross-module churn, but the user-facing page is now "System info".
+// GPIO12 runtime state and its boot-time MTDI strap are deliberately shown as
+// separate facts: the pin is reused as INTB or IR after the reset sample.
+static uint32_t systemInfoRefreshTimer = 0;
+static constexpr uint32_t SYSTEM_INFO_REFRESH_MS = 1000UL;
+static constexpr int16_t SYSTEM_INFO_VALUE_X = 166;
+static constexpr int16_t SYSTEM_INFO_VALUE_W = 146;
+static constexpr int16_t SYSTEM_INFO_ROW_H = 20;
 
-  char value[80];
+static void RestoreSystemInfoValueRow(uint8_t row) {
+  const int16_t y = static_cast<int16_t>(36 + row * 20);
+  for (int16_t line = 0; line < SYSTEM_INFO_ROW_H; ++line) {
+    const uint32_t offset =
+        static_cast<uint32_t>(y + line) * 320U +
+        static_cast<uint32_t>(SYSTEM_INFO_VALUE_X);
+    tft.pushImage(SYSTEM_INFO_VALUE_X, y + line,
+                  SYSTEM_INFO_VALUE_W, 1,
+                  serviceinfobackground + offset);
+  }
+}
 
-  if (radio.isFm()) {
-    const char* labels[] = {
-        myLanguage[language][28], myLanguage[language][36], fmPsText[language],
-        myLanguage[language][31], fmPiText[language], fmMultipathText[language],
-        fmStereoBlendText[language], myLanguage[language][35],
-        radio.isRbds() ? fmRbdsText[language] : fmRdsText[language]};
-    for (uint8_t i = 0; i < 9; ++i)
-      tftPrintFixed(-1, labels[i], 8, 36 + i * 20,
-                    ActiveColor, ActiveColorSmooth, 16);
+static uint8_t SystemResetReasonIndex(void) {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return 0;
+    case ESP_RST_EXT:       return 1;
+    case ESP_RST_SW:        return 2;
+    case ESP_RST_PANIC:     return 3;
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:       return 4;
+    case ESP_RST_DEEPSLEEP: return 5;
+    case ESP_RST_BROWNOUT:  return 6;
+    case ESP_RST_SDIO:      return 7;
+    default:                return 8;
+  }
+}
 
-    snprintf(value, sizeof(value), "%u.%u MHz",
-             static_cast<unsigned>(fmfreq / 100),
-             static_cast<unsigned>((fmfreq % 100) / 10));
-    tftPrintFixed(-1, value, 166, 36, PrimaryColor, PrimaryColorSmooth, 16);
+// GPIO_STRAP_REG retains the strapping-pin levels sampled at reset. On the
+// classic ESP32, MTDI/GPIO12 is bit 5. This is intentionally NOT a
+// digitalRead(GPIO12): the live pin can later be INTB, IR, or an unused input.
+static bool Gpio12BootMtdiHigh(void) {
+  return (REG_READ(GPIO_STRAP_REG) & (1U << 5)) != 0U;
+}
 
-    if (radio.fmAfcRail) {
-      snprintf(value, sizeof(value), "%d/%d dB %s",
-               static_cast<int>(radio.fmRssi), static_cast<int>(radio.fmSnr),
-               fmAfcRailText[language]);
-    } else {
-      snprintf(value, sizeof(value), "%d/%d dB",
-               static_cast<int>(radio.fmRssi), static_cast<int>(radio.fmSnr));
-    }
-    tftPrintFixed(-1, value, 166, 56, PrimaryColor, PrimaryColorSmooth, 16);
+// Show the role GPIO12 is actually serving now, not only the value saved in
+// Settings. AUTO can resolve to INTB, detection, or an unused input when the
+// radio runs in polling mode. The final H/L is the live electrical pin level.
+static void FormatGpio12RuntimeStatus(char* output, size_t outputSize) {
+  const uint8_t configuredMode = sanitizeGpio12Mode(gpio12Mode);
+  const RadioControlMode controlMode = radio.controlMode();
+  const char level =
+      digitalRead(SI4684_INTB_PIN) == HIGH ? 'H' : 'L';
 
-    const char* ps = PSold[0] != '\0' ? PSold : "--------";
-    tftPrintFixed(-1, ps, 166, 76, PrimaryColor, PrimaryColorSmooth, 16);
-
-    value[0] = '\0';
-    if (!tuning && fmPtyValid && radio.fmPty > 0 && radio.fmPty <= 31) {
-      snprintf(value, sizeof(value), "%u: %s",
-               static_cast<unsigned>(radio.fmPty),
-               myLanguage[language][37 + radio.fmPty]);
-    }
-    tftPrintFixed(-1, value, 166, 96, PrimaryColor, PrimaryColorSmooth, 16);
-
-    if (radio.fmPi) {
-      snprintf(value, sizeof(value), "%04X", static_cast<unsigned>(radio.fmPi));
-      tftPrintFixed(-1, value, 166, 116, PrimaryColor, PrimaryColorSmooth, 16);
-    } else {
-      tftPrintFixed(-1, "-", 166, 116, PrimaryColor, PrimaryColorSmooth, 16);
-    }
-
-    snprintf(value, sizeof(value), "%u%%", static_cast<unsigned>(radio.fmMultipath));
-    tftPrintFixed(-1, value, 166, 136, PrimaryColor, PrimaryColorSmooth, 16);
-
-    snprintf(value, sizeof(value), "%u%%", static_cast<unsigned>(radio.fmStereoBlend));
-    tftPrintFixed(-1, value, 166, 156, PrimaryColor, PrimaryColorSmooth, 16);
-
-    tftPrintFixed(-1, radio.fmPilot ? fmStereoText[language] : fmMonoText[language],
-                  166, 176, PrimaryColor, PrimaryColorSmooth, 16);
-    tftPrintFixed(-1, radio.fmPi ? myLanguage[language][23] : "-",
-                  166, 196, PrimaryColor, PrimaryColorSmooth, 16);
+  if (configuredMode == GPIO12_IR) {
+    snprintf(output, outputSize, "IR / %c / %s", level,
+             IrRemoteHasProfile()
+                 ? irLearnedShortText[language]
+                 : irEmptyShortText[language]);
     return;
   }
 
-  tftPrintFixed(-1, myLanguage[language][28], 8, 36, ActiveColor, ActiveColorSmooth, 16);
-  tftPrintFixed(-1, myLanguage[language][36], 8, 56, ActiveColor, ActiveColorSmooth, 16);
-  tftPrintFixed(-1, myLanguage[language][29], 8, 76, ActiveColor, ActiveColorSmooth, 16);
-  tftPrintFixed(-1, myLanguage[language][30], 8, 96, ActiveColor, ActiveColorSmooth, 16);
-  tftPrintFixed(-1, myLanguage[language][31], 8, 116, ActiveColor, ActiveColorSmooth, 16);
-  tftPrintFixed(-1, myLanguage[language][32], 8, 136, ActiveColor, ActiveColorSmooth, 16);
-  tftPrintFixed(-1, myLanguage[language][33], 8, 156, ActiveColor, ActiveColorSmooth, 16);
-  tftPrintFixed(-1, myLanguage[language][34], 8, 176, ActiveColor, ActiveColorSmooth, 16);
-  tftPrintFixed(-1, myLanguage[language][35], 8, 196, ActiveColor, ActiveColorSmooth, 16);
+  const char* activeRole = "INPUT";
+  if (controlMode == RADIO_CTRL_INTB)
+    activeRole = "INTB";
+  else if (controlMode == RADIO_CTRL_DETECT)
+    activeRole = "DETECT";
 
-  const uint32_t dabFrequency = radio.getFreq(dabfreq);
-  snprintf(value, sizeof(value), "%s - %lu.%03lu MHz",
-           radio.getChannel(dabfreq),
-           static_cast<unsigned long>(dabFrequency / 1000UL),
-           static_cast<unsigned long>(dabFrequency % 1000UL));
-  tftPrintFixed(-1, value, 166, 36, PrimaryColor, PrimaryColorSmooth, 16);
-
-  snprintf(value, sizeof(value), "%s  MER:", unitString[unit]);
-  tftPrintFixed(-1, value, 193, 56, PrimaryColor, PrimaryColorSmooth, 16);
-  tftPrintFixed(-1, "dB", 286, 56, PrimaryColor, PrimaryColorSmooth, 16);
-
-  // Reuse the already converted/cached main-screen labels here. Opening the
-  // information page must not create another set of temporary Arduino Strings.
-  tftPrintFixed(-1, EnsembleNameOld, 166, 76,
-                PrimaryColor, PrimaryColorSmooth, 16);
-  tftPrintFixed(-1, PSold, 166, 96,
-                PrimaryColor, PrimaryColorSmooth, 16);
-
-  value[0] = '\0';
-  if (radio.ServiceStart && radio.pty > 0 && radio.pty <= 29) {
-    snprintf(value, sizeof(value), "%u: %s",
-             static_cast<unsigned>(radio.pty),
-             myLanguage[language][37 + radio.pty]);
+  if (configuredMode == GPIO12_AUTO) {
+    snprintf(output, outputSize, "AUTO>%s / %c", activeRole, level);
+  } else if (configuredMode == GPIO12_INTB &&
+             controlMode != RADIO_CTRL_INTB) {
+    // A runtime safety fallback can leave the fixed INTB setting configured
+    // while radio control has already fallen back to polling.
+    snprintf(output, outputSize, "INTB>%s / %c", activeRole, level);
+  } else {
+    snprintf(output, outputSize, "%s / %c", activeRole, level);
   }
-  tftPrintFixed(-1, value, 166, 116, PrimaryColor, PrimaryColorSmooth, 16);
+}
 
-  const char* protectionInfo =
-      (radio.ServiceStart && radio.protectionlevel > 0 && radio.protectionlevel < 14)
-          ? ProtectionText[radio.protectionlevel]
-          : "";
-  tftPrintFixed(-1, protectionInfo, 166, 136,
-                PrimaryColor, PrimaryColorSmooth, 16);
+// VDD_SDIO is selected either by the boot-latched MTDI level or permanently
+// by eFuse. XPD_SDIO_FORCE explicitly makes the ROM ignore GPIO12 for this
+// purpose; XPD_SDIO_TIEH then selects 3.3 V/1.8 V when the regulator is
+// enabled. The MTDI sample is still displayed even when eFuse overrides it.
+static void FormatVddSdioStatus(char* output, size_t outputSize) {
+  const bool mtdiHigh = Gpio12BootMtdiHigh();
+  const bool force =
+      esp_efuse_read_field_bit(ESP_EFUSE_SDIO_FORCE);
 
-  value[0] = '\0';
-  if (radio.ServiceStart && radio.samplerate != 0) {
-    char sampleRate[16];
-    snprintf(sampleRate, sizeof(sampleRate), "%u",
-             static_cast<unsigned>(radio.samplerate));
-    const size_t sampleRateLen = strlen(sampleRate);
-    if (sampleRateLen > 2 && sampleRateLen + 1 < sizeof(sampleRate)) {
-      // Preserve the original display format exactly: insert a decimal point
-      // after the first two digits (48000 -> 48.000).
-      memmove(sampleRate + 3, sampleRate + 2, sampleRateLen - 1);
-      sampleRate[2] = '.';
+  if (!force) {
+    snprintf(output, outputSize, "%s MTDI:%c/STRAP",
+             mtdiHigh ? "1.8V" : "3.3V",
+             mtdiHigh ? 'H' : 'L');
+    return;
+  }
+
+  const bool regulatorEnabled =
+      esp_efuse_read_field_bit(ESP_EFUSE_XPD_SDIO_REG);
+  const bool tieHigh =
+      esp_efuse_read_field_bit(ESP_EFUSE_SDIO_TIEH);
+
+  if (regulatorEnabled) {
+    snprintf(output, outputSize, "%s MTDI:%c/EFUSE",
+             tieHigh ? "3.3V" : "1.8V",
+             mtdiHigh ? 'H' : 'L');
+  } else {
+    // Internal VDD_SDIO regulator is forced off. The actual voltage, if any,
+    // must come from the board externally and cannot be inferred in software.
+    snprintf(output, outputSize, "EXT? MTDI:%c/EFUSE",
+             mtdiHigh ? 'H' : 'L');
+  }
+}
+
+void ShowServiceInfo(void) {
+  const bool fullRedraw =
+      !ShowServiceInformation || setvolume || displayreset;
+  setvolume = false;
+
+  char value[80];
+
+  if (fullRedraw) {
+    tft.pushImage(0, 0, 320, 240, serviceinfobackground);
+    tftPrintFixed(0, myLanguage[language][27], 155, 4,
+                  ActiveColor, ActiveColorSmooth, 28);
+
+    // Logical order: tuner/radio, GPIO12 runtime + boot supply selection,
+    // then ESP32 runtime and memory diagnostics.
+    for (uint8_t row = 0; row < 9; ++row) {
+      tftPrintFixed(-1, myLanguage[language][28 + row],
+                    8, 36 + row * 20,
+                    ActiveColor, ActiveColorSmooth, 16);
     }
-    snprintf(value, sizeof(value), "%s Hz", sampleRate);
-  }
-  tftPrintFixed(-1, value, 166, 156, PrimaryColor, PrimaryColorSmooth, 16);
 
-  value[0] = '\0';
-  if (radio.ServiceStart && radio.bitrate != 0) {
-    snprintf(value, sizeof(value), "%u kb/s", static_cast<unsigned>(radio.bitrate));
-  }
-  tftPrintFixed(-1, value, 166, 176, PrimaryColor, PrimaryColorSmooth, 16);
+    snprintf(value, sizeof(value), "%s / %s / %s",
+             radio.getChipID(), radio.getFirmwareVersion(),
+             radio.isFm() ? "FM" : "DAB");
+    tftPrintFixed(-1, value, 166, 36,
+                  PrimaryColor, PrimaryColorSmooth, 16);
 
-  value[0] = '\0';
-  if (radio.ServiceStart && radio.servicetype < 9 && radio.audiomode <= 3) {
-    snprintf(value, sizeof(value), "%s - %s",
-             ServiceTypeText[radio.servicetype], AudioModeText[radio.audiomode]);
+    FormatVddSdioStatus(value, sizeof(value));
+    tftPrintFixed(-1, value, 166, 96,
+                  PrimaryColor, PrimaryColorSmooth, 16);
+
+    snprintf(value, sizeof(value), "rev%u / %uM / %s",
+             static_cast<unsigned>(ESP.getChipRevision()),
+             static_cast<unsigned>(ESP.getCpuFreqMHz()),
+             VERSION);
+    tftPrintFixed(-1, value, 166, 116,
+                  PrimaryColor, PrimaryColorSmooth, 16);
+
+    tftPrintFixed(-1,
+                  systemResetReasonText[language][SystemResetReasonIndex()],
+                  166, 156, PrimaryColor, PrimaryColorSmooth, 16);
+
+    systemInfoRefreshTimer = 0;
   }
-  tftPrintFixed(-1, value, 166, 196, PrimaryColor, PrimaryColorSmooth, 16);
+
+  const uint32_t now = millis();
+  if (!fullRedraw &&
+      static_cast<uint32_t>(now - systemInfoRefreshTimer) <
+          SYSTEM_INFO_REFRESH_MS) {
+    return;
+  }
+  systemInfoRefreshTimer = now;
+
+  // Radio control and GPIO12 are live states, so refresh both once per second.
+  RestoreSystemInfoValueRow(1);
+  tftPrintFixed(-1, radio.controlModeName(), 166, 56,
+                PrimaryColor, PrimaryColorSmooth, 16);
+
+  RestoreSystemInfoValueRow(2);
+  FormatGpio12RuntimeStatus(value, sizeof(value));
+  tftPrintFixed(-1, value, 166, 76,
+                PrimaryColor, PrimaryColorSmooth, 16);
+
+  RestoreSystemInfoValueRow(5);
+  {
+    const uint64_t uptimeSeconds =
+        static_cast<uint64_t>(esp_timer_get_time()) / 1000000ULL;
+    const uint64_t totalHours = uptimeSeconds / 3600ULL;
+    const uint64_t minutes = (uptimeSeconds / 60ULL) % 60ULL;
+    const uint64_t seconds = uptimeSeconds % 60ULL;
+    snprintf(value, sizeof(value), "%02llu:%02llu:%02llu",
+             static_cast<unsigned long long>(totalHours),
+             static_cast<unsigned long long>(minutes),
+             static_cast<unsigned long long>(seconds));
+  }
+  tftPrintFixed(-1, value, 166, 136,
+                PrimaryColor, PrimaryColorSmooth, 16);
+
+  RestoreSystemInfoValueRow(7);
+  snprintf(value, sizeof(value), "%lu / %lu kB",
+           static_cast<unsigned long>(ESP.getFreeHeap() / 1024UL),
+           static_cast<unsigned long>(ESP.getMinFreeHeap() / 1024UL));
+  tftPrintFixed(-1, value, 166, 176,
+                PrimaryColor, PrimaryColorSmooth, 16);
+
+  RestoreSystemInfoValueRow(8);
+  {
+    const size_t freeHeap =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t largestBlock =
+        heap_caps_get_largest_free_block(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint32_t fragmentation = 0;
+    if (freeHeap != 0U && largestBlock <= freeHeap) {
+      fragmentation = 100U -
+          static_cast<uint32_t>((largestBlock * 100U) / freeHeap);
+    }
+    snprintf(value, sizeof(value), "%lu kB / %lu%%",
+             static_cast<unsigned long>(largestBlock / 1024U),
+             static_cast<unsigned long>(fragmentation));
+  }
+  tftPrintFixed(-1, value, 166, 196,
+                PrimaryColor, PrimaryColorSmooth, 16);
 }
 
 // Render the scrollable list of services in the current ensemble. Used as
@@ -1018,6 +1102,11 @@ void Infoboxprint(const char* input) {
 // variable and only pushes its sprite/region to the TFT when something changed.
 
 void ShowFreq(void) {
+  // Frequency belongs exclusively to the normal radio screen. AUTO seek or a
+  // tune already running before System info was opened may still update the
+  // radio state in the background, but must never paint through this overlay.
+  if (ShowServiceInformation) return;
+
   char value[12];
 
   if (radio.isFm() || radioMode == RADIO_MODE_FM) {
@@ -1083,6 +1172,10 @@ void ShowPTY(void) {
 }
 
 void ShowRT(void) {
+  // System info is a pure diagnostic page. Never paint normal-screen
+  // radiotext/DLS over it.
+  if (ShowServiceInformation) return;
+
   // The 20-pixel radiotext interior is y=219..238; row 239 is the black edge
   // of every background. Always sample and push that same region so clearing
   // an empty label cannot leave a stale row behind.
@@ -1633,6 +1726,14 @@ void ShowVolume(void) {
 // the displayed IIR average; feeding an already averaged CNR back into the
 // filter on every fast loop pass made the two modes drift differently.
 void ShowSignalLevel(void) {
+  // ProcessDAB() already calls ShowSignalLevel() while System info is open.
+  // Reuse that existing call as the lightweight refresh hook and do not draw
+  // main-screen signal widgets over the diagnostics page.
+  if (ShowServiceInformation) {
+    ShowServiceInfo();
+    return;
+  }
+
   if (!displayreset && millis() - rssiTimer < 100UL) return;
   rssiTimer = millis();
 

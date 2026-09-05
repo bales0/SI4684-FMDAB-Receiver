@@ -1861,10 +1861,12 @@ void KeyUp(void) {
   tottimer = millis();
   rotary = 0;
   rotary2 = 0;
+  // System info is a modal diagnostics page. Encoder/IR Up must not leave the
+  // page and must never start MAN/AUTO/MEM tuning underneath it.
+  if (ShowServiceInformation) return;
   if (SlideShowView) SlideShowButtonPress();
   if (!menu) {
     if (!ChannelListView) {
-      if (ShowServiceInformation) BuildDisplay();
       switch (tunemode) {
         case TUNE_MAN:
           if (radioMode == RADIO_MODE_FM) {
@@ -1958,10 +1960,11 @@ void KeyDown(void) {
   tottimer = millis();
   rotary = 0;
   rotary2 = 0;
+  // See KeyUp(): keep System info modal and block all tune actions.
+  if (ShowServiceInformation) return;
   if (SlideShowView) SlideShowButtonPress();
   if (!menu) {
     if (!ChannelListView) {
-      if (ShowServiceInformation) BuildDisplay();
       switch (tunemode) {
         case TUNE_MAN:
           if (radioMode == RADIO_MODE_FM) {
@@ -2057,7 +2060,10 @@ void KeyUp2(void) {
   tottimer = millis();
 
   if (setvolume) {
+    // Volume remains available only after explicitly opening its overlay.
     RemoteVolumeStep(+2);
+  } else if (ShowServiceInformation) {
+    // Never use rotary 2 as an FM fine-tune control while System info is open.
   } else if (radioMode == RADIO_MODE_FM) {
     const uint8_t spacing = fmRegionProfile(fmRegion).seekSpacing10kHz;
     fmfreq = stepFmFrequency(fmfreq, spacing, fmRegion);
@@ -2069,7 +2075,7 @@ void KeyUp2(void) {
     ShowFreq();
     Serial.printf("[FM/UI] rotary2 UP -> +%u kHz, %.1f MHz\n",
                   spacing * 10U, fmfreq / 100.0f);
-  } else if (SlideShowView || ShowServiceInformation || ChannelListView) {
+  } else if (SlideShowView || ChannelListView) {
     // Full-screen overlays do not assign an implicit rotary-2 action. Volume
     // remains available only after explicitly pressing the rotary-2 button.
   } else {
@@ -2089,7 +2095,10 @@ void KeyDown2(void) {
   rotary2 = 0;
 
   if (setvolume) {
+    // Volume remains available only after explicitly opening its overlay.
     RemoteVolumeStep(-2);
+  } else if (ShowServiceInformation) {
+    // Never use rotary 2 as an FM fine-tune control while System info is open.
   } else if (radioMode == RADIO_MODE_FM) {
     const uint8_t spacing = fmRegionProfile(fmRegion).seekSpacing10kHz;
     fmfreq = stepFmFrequency(fmfreq, -static_cast<int16_t>(spacing), fmRegion);
@@ -2101,7 +2110,7 @@ void KeyDown2(void) {
     ShowFreq();
     Serial.printf("[FM/UI] rotary2 DOWN -> -%u kHz, %.1f MHz\n",
                   spacing * 10U, fmfreq / 100.0f);
-  } else if (SlideShowView || ShowServiceInformation || ChannelListView) {
+  } else if (SlideShowView || ChannelListView) {
     // See KeyUp2(): do not enter volume mode from rotation alone.
   } else {
     if (radio.numberofservices > 0) DABSelectService(0);
