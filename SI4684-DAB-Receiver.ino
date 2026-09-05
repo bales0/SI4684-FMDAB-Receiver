@@ -140,17 +140,16 @@ int16_t SAvg2;
 int16_t SignalLevel;
 int8_t CNR;
 int8_t CNRold;
-String clockstringOld;
-String datestringOld;
-String EIDold;
-String EnsembleNameOld;
-String dabfreqStringOld;
-String ITUold;
-String PLold;
-String PSold;
-String RTold;
-String SIDold;
-String SignalLeveloldString;
+char clockstringOld[6] = "";
+char datestringOld[11] = "";
+char EIDold[5] = "";
+char EnsembleNameOld[65] = "";
+char dabfreqStringOld[12] = "";
+char ITUold[4] = "";
+char PLold[9] = "";
+char PSold[65] = "";
+char RTold[RT_TEXT_BUFFER_SIZE] = "";
+char SIDold[5] = "";
 uint16_t BitrateOld;
 uint32_t _serviceID;
 uint8_t freq = 0;
@@ -2206,6 +2205,74 @@ void tftReplace(int8_t offset, const String & textold, const String & text, int1
   modifiedText.replace("\n", " ");
 
   tft.drawString(modifiedText, x, y);
+}
+
+
+// Heap-stable variant for already formatted fixed char buffers.
+// Unlike tftReplace(String), this path does not construct or modify an Arduino
+// String, so frequently changing numeric status fields do not churn the heap.
+void tftReplaceFixed(int8_t offset, const char *textold, const char *text,
+                     int16_t x, int16_t y, int color, int smoothcolor,
+                     int backcolor, uint8_t fontsize) {
+  const uint8_t *selectedFont = nullptr;
+  if (fontsize == 16) selectedFont = FONT16;
+  if (fontsize == 28) selectedFont = FONT28;
+  if (fontsize == 52) selectedFont = FREQFONT;
+
+  if (currentFont != selectedFont || resetFontOnNextCall) {
+    if (currentFont != nullptr) tft.unloadFont();
+
+    tft.loadFont(selectedFont);
+    currentFont = selectedFont;
+    resetFontOnNextCall = false;
+  }
+
+  switch (offset) {
+    case -1: tft.setTextDatum(TL_DATUM); break;
+    case 0: tft.setTextDatum(TC_DATUM); break;
+    case 1: tft.setTextDatum(TR_DATUM); break;
+  }
+
+  tft.setTextColor(backcolor, backcolor, false);
+  tft.drawString(textold != nullptr ? textold : "", x, y);
+
+  tft.setTextColor(color, smoothcolor, false);
+  tft.drawString(text != nullptr ? text : "", x, y);
+}
+
+
+// Heap-stable print variant for fixed char buffers.
+void tftPrintFixed(int8_t offset, const char *text, int16_t x, int16_t y,
+                   int color, int smoothcolor, uint8_t fontsize) {
+  // This lower status field uses FONT16. Characters with descenders (j/p/q/g/y)
+  // extend below the nominal 16 px field, so restore the complete glyph area
+  // before redrawing. The original String-based tftPrint() already did this;
+  // keep the fixed-buffer path visually identical.
+  if (fontsize == 16 && offset == 0 && x == 238 && y == 162) {
+    tft.fillRect(165, 159, 149, 23, BackgroundColor4);
+  }
+
+  const uint8_t *selectedFont = nullptr;
+  if (fontsize == 16) selectedFont = FONT16;
+  if (fontsize == 28) selectedFont = FONT28;
+  if (fontsize == 52) selectedFont = FREQFONT;
+
+  if (currentFont != selectedFont || resetFontOnNextCall) {
+    if (currentFont != nullptr) tft.unloadFont();
+    tft.loadFont(selectedFont);
+    currentFont = selectedFont;
+    resetFontOnNextCall = false;
+  }
+
+  tft.setTextColor(color, smoothcolor, (fontsize == 52 ? true : false));
+
+  switch (offset) {
+    case -1: tft.setTextDatum(TL_DATUM); break;
+    case 0: tft.setTextDatum(TC_DATUM); break;
+    case 1: tft.setTextDatum(TR_DATUM); break;
+  }
+
+  tft.drawString(text != nullptr ? text : "", x, y, 1);
 }
 
 void tftPrint(int8_t offset, const String & text, int16_t x, int16_t y, int color, int smoothcolor, uint8_t fontsize) {

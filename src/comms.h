@@ -14,7 +14,6 @@
 #include "language.h"
 #include "constants.h"
 #include "si4684.h"
-#include "mbedtls/base64.h"
 
 extern bool ChannelListView;
 extern bool menu;

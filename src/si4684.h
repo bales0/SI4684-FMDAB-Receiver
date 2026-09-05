@@ -119,6 +119,7 @@ class DAB {
     const char* getChannel(uint8_t freq);
     DABService service[32];
     String ASCII(const char* input, uint8_t charset);
+    void ASCIIToBuffer(const char* input, uint8_t charset, char* output, size_t outputSize);
     uint16_t bitrate;
     uint16_t ecc;
     uint16_t ensembleEcc;

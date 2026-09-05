@@ -90,17 +90,17 @@ extern int16_t SAvg;
 extern int16_t SAvg2;
 extern int8_t CNR;
 extern int8_t CNRold;
-extern String clockstringOld;
-extern String dabfreqStringOld;
-extern String datestringOld;
-extern String EnsembleNameOld;
-extern String EIDold;
-extern String ITUold;
-extern String PLold;
-extern String PSold;
-extern String RTold;
-extern String SIDold;
-extern String SignalLeveloldString;
+extern char clockstringOld[6];
+extern char dabfreqStringOld[12];
+extern char datestringOld[11];
+extern char EnsembleNameOld[65];
+extern char EIDold[5];
+extern char ITUold[4];
+extern char PLold[9];
+extern char PSold[65];
+static constexpr size_t RT_TEXT_BUFFER_SIZE = 385;  // 128 EBU bytes * max 3 UTF-8 bytes + NUL
+extern char RTold[RT_TEXT_BUFFER_SIZE];
+extern char SIDold[5];
 extern uint16_t BitrateOld;
 extern unsigned long rssiTimer;
 extern unsigned long rtticker;
@@ -152,6 +152,11 @@ extern void tftPrint(int8_t offset, const String & text, int16_t x, int16_t y,
 extern void tftReplace(int8_t offset, const String & textold, const String & text,
                        int16_t x, int16_t y, int color, int smoothcolor,
                        int backcolor, uint8_t fontsize);
+extern void tftReplaceFixed(int8_t offset, const char *textold, const char *text,
+                            int16_t x, int16_t y, int color, int smoothcolor,
+                            int backcolor, uint8_t fontsize);
+extern void tftPrintFixed(int8_t offset, const char *text, int16_t x, int16_t y,
+                          int color, int smoothcolor, uint8_t fontsize);
 extern void loadFonts(bool option);
 extern bool IsStationEmpty(void);
 extern void MarkEepromDirty(void);

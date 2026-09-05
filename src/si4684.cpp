@@ -48,6 +48,17 @@ uint8_t DabServiceLabelCharset(uint8_t serviceIndex) {
   return serviceIndex < 32 ? dabServiceCharsetValue[serviceIndex] : 0;
 }
 
+// Read-only DLS metadata for GUI-side radiotext caching. These accessors do
+// not alter the DAB receive/scheduler path; they only let ShowRT detect when
+// the same byte payload needs decoding under a different DLS charset/length.
+uint8_t DabDynamicLabelCharsetValue(void) {
+  return dabDynamicLabelCharset;
+}
+
+uint8_t DabDynamicLabelLengthValue(void) {
+  return dabDynamicLabelLength;
+}
+
 uint8_t slaveSelectPin;
 
 static si468x::Si468x chip;
@@ -2695,6 +2706,83 @@ void DAB::Update(void) {
   }
 }
 
+// Encode wchar_t code points into a caller-owned UTF-8 buffer.  This is the
+// fixed-allocation counterpart of convertToUTF8() for hot GUI paths.
+static void convertToUTF8Buffer(const wchar_t* input, char* output, size_t outputSize) {
+  if (!output || outputSize == 0) return;
+  output[0] = '\0';
+  if (!input) return;
+
+  size_t out = 0;
+  while (*input && out + 1 < outputSize) {
+    const uint32_t unicode = static_cast<uint32_t>(*input++);
+    uint8_t bytes[4];
+    size_t count = 0;
+
+    if (unicode < 0x80U) {
+      bytes[0] = static_cast<uint8_t>(unicode);
+      count = 1;
+    } else if (unicode < 0x800U) {
+      bytes[0] = static_cast<uint8_t>(0xC0U | (unicode >> 6));
+      bytes[1] = static_cast<uint8_t>(0x80U | (unicode & 0x3FU));
+      count = 2;
+    } else if (unicode < 0x10000U) {
+      bytes[0] = static_cast<uint8_t>(0xE0U | (unicode >> 12));
+      bytes[1] = static_cast<uint8_t>(0x80U | ((unicode >> 6) & 0x3FU));
+      bytes[2] = static_cast<uint8_t>(0x80U | (unicode & 0x3FU));
+      count = 3;
+    } else {
+      bytes[0] = static_cast<uint8_t>(0xF0U | (unicode >> 18));
+      bytes[1] = static_cast<uint8_t>(0x80U | ((unicode >> 12) & 0x3FU));
+      bytes[2] = static_cast<uint8_t>(0x80U | ((unicode >> 6) & 0x3FU));
+      bytes[3] = static_cast<uint8_t>(0x80U | (unicode & 0x3FU));
+      count = 4;
+    }
+
+    if (out + count >= outputSize) break;
+    for (size_t i = 0; i < count; ++i) output[out++] = static_cast<char>(bytes[i]);
+  }
+  output[out] = '\0';
+}
+
+// Convert a fixed DAB/RDS label directly into caller-owned storage.  This keeps
+// frequently refreshed station/ensemble-name paths off the heap while preserving
+// exactly the same charset handling as ASCII().
+void DAB::ASCIIToBuffer(const char* input, uint8_t charset, char* output, size_t outputSize) {
+  if (!output || outputSize == 0) return;
+  output[0] = '\0';
+  if (!input) return;
+
+  if (charset == 0x0F) {
+    snprintf(output, outputSize, "%s", input);
+    return;
+  }
+
+  if (charset == 0x06) {
+    wchar_t temp[9];
+    size_t out = 0;
+    for (size_t i = 0; i + 1 < 16 && out < 8; i += 2) {
+      const uint16_t code =
+          (static_cast<uint16_t>(static_cast<uint8_t>(input[i])) << 8) |
+          static_cast<uint8_t>(input[i + 1]);
+      if (code == 0) break;
+      temp[out++] = static_cast<wchar_t>(code);
+    }
+    temp[out] = L'\0';
+    convertToUTF8Buffer(temp, output, outputSize);
+    return;
+  }
+
+  if (charset != 0x00) {
+    snprintf(output, outputSize, "%s", input);
+    return;
+  }
+
+  wchar_t temp[128];
+  charConverter(input, temp, sizeof(temp) / sizeof(wchar_t));
+  convertToUTF8Buffer(temp, output, outputSize);
+}
+
 // Convert a label/text from the DAB-side character set to UTF-8 for the TFT.
 String DAB::ASCII(const char* input, uint8_t charset) {
   if (!input) return String();
@@ -2835,11 +2923,15 @@ static String convertToUTF8(const wchar_t* input) {
 
 }
 
-// Decode the currently assembled DAB Dynamic Label using its own charset and
-// explicit byte length. The explicit length is essential for UTF-16BE because
-// ordinary ASCII-range UTF-16 characters contain zero bytes.
-String DabDynamicLabelText(const char* input) {
-  if (!input || dabDynamicLabelLength == 0) return String();
+// Decode the currently assembled DAB Dynamic Label directly into caller-owned
+// UTF-8 storage. The explicit source length is essential for UTF-16BE because
+// ordinary ASCII-range UTF-16 characters contain zero bytes. This is the
+// fixed-allocation counterpart of the former String-returning helper used by
+// ShowRT().
+void DabDynamicLabelTextToBuffer(const char* input, char* output, size_t outputSize) {
+  if (!output || outputSize == 0) return;
+  output[0] = '\0';
+  if (!input || dabDynamicLabelLength == 0) return;
 
   if (dabDynamicLabelCharset == 0x06) {
     wchar_t temp[65];
@@ -2861,7 +2953,8 @@ String DabDynamicLabelText(const char* input) {
         temp[out++] = static_cast<wchar_t>(code);
     }
     temp[out] = L'\0';
-    return convertToUTF8(temp);
+    convertToUTF8Buffer(temp, output, outputSize);
+    return;
   }
 
   char temp[129];
@@ -2871,14 +2964,16 @@ String DabDynamicLabelText(const char* input) {
   temp[len] = '\0';
 
   if (dabDynamicLabelCharset == 0x0F) {
-    String output(temp);
-    output.replace("\n", " ");
-    String headlineBreak; headlineBreak += static_cast<char>(0x0B);
-    String wordBreak; wordBreak += static_cast<char>(0x1F);
-    output.replace(headlineBreak, " ");
-    output.replace(wordBreak, "-");
-    return output;
+    // Preserve the UTF-8 bytes exactly; only DLS layout hints are flattened.
+    for (size_t i = 0; i < len && temp[i] != '\0'; ++i) {
+      const uint8_t code = static_cast<uint8_t>(temp[i]);
+      if (code == 0x0AU || code == 0x0BU) temp[i] = ' ';
+      else if (code == 0x1FU) temp[i] = '-';
+    }
+    snprintf(output, outputSize, "%s", temp);
+    return;
   }
+
   if (dabDynamicLabelCharset == 0x00) {
     // DLS defines these three bytes as layout hints independently of the
     // selected charset. Flatten them for our one-line ticker before EBU decode.
@@ -2889,7 +2984,9 @@ String DabDynamicLabelText(const char* input) {
     }
     wchar_t wide[129];
     charConverter(temp, wide, sizeof(wide) / sizeof(wide[0]));
-    return convertToUTF8(wide);
+    convertToUTF8Buffer(wide, output, outputSize);
+    return;
   }
-  return String(temp);
+
+  snprintf(output, outputSize, "%s", temp);
 }

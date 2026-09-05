@@ -274,46 +274,27 @@ static void doEnableConnection(void) {
   if (radio.SlideShowAvailable) radio.SlideShowUpdate2 = true; else DataPrint("$M=SLIDESHOW=0\n");
 }
 
-// When a new slideshow is ready, stream its RAM buffer to the host as base64
-// in a single "$M=SLIDESHOW=..." line so a client can preview it.
+// When a new slideshow is ready, report only its type to the serial client.
+// The image bytes stay in the radio RAM buffer; Base64 streaming is deliberately
+// disabled so serial output cannot stall the cooperative radio scheduler.
 static void doMOTShow(void) {
-  if (radio.SlideShowAvailable && radio.SlideShowUpdate2) {
-    DataPrint("$M=SLIDESHOW=");
+  if (!radio.SlideShowAvailable || !radio.SlideShowUpdate2) return;
 
-    const uint8_t* image = radio.slideshowData();
-    const size_t size = radio.slideshowSize();
-    if (!image || size < 8) {
-      DataPrint("3\n");
-      radio.SlideShowUpdate2 = false;
-      return;
-    }
+  const uint8_t* image = radio.slideshowData();
+  const size_t size = radio.slideshowSize();
+  uint8_t type = 3;
 
-    if (image[0] == 0x89 && image[1] == 0x50 && image[2] == 0x4E && image[3] == 0x47 && image[4] == 0x0D && image[5] == 0x0A && image[6] == 0x1A && image[7] == 0x0A) {
-      DataPrint("2,");
+  if (image && size >= 8) {
+    if (image[0] == 0x89 && image[1] == 0x50 && image[2] == 0x4E &&
+        image[3] == 0x47 && image[4] == 0x0D && image[5] == 0x0A &&
+        image[6] == 0x1A && image[7] == 0x0A) {
+      type = 2;
     } else if (image[0] == 0xFF && image[1] == 0xD8 && image[2] == 0xFF) {
-      DataPrint("1,");
-    } else {
-      DataPrint("3\n");
-      radio.SlideShowUpdate2 = false;
-      return;
+      type = 1;
     }
-
-    DataPrint("BASE64=");
-    uint8_t encoded[769];
-    for (size_t offset = 0; offset < size; offset += 576) {
-      const size_t count = (size - offset) < 576 ? (size - offset) : 576;
-      size_t encodedSize = 0;
-      if (mbedtls_base64_encode(encoded, sizeof(encoded) - 1, &encodedSize,
-                                image + offset, count) != 0) {
-        DataPrint("\n");
-        radio.SlideShowUpdate2 = false;
-        return;
-      }
-      encoded[encodedSize] = '\0';
-      DataPrint(reinterpret_cast<char*>(encoded));
-    }
-
-    DataPrint("\n");
-    radio.SlideShowUpdate2 = false;
   }
+
+  Serial.printf("$M=SLIDESHOW=%u\n", static_cast<unsigned>(type));
+  radio.SlideShowUpdate2 = false;
 }
+
