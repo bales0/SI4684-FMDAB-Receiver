@@ -20,7 +20,7 @@ extern uint8_t gpio12Mode;
 #undef interrupts
 #endif
 #include "vendor/si468x/Si468x.h"
-// V15 A/B test: use the newer DAB 6.0.9 application image.
+// DAB uses the supplied 6.0.9 application image.
 #include "vendor/si468x/dab_6_0_9.h"
 #include "vendor/si468x/fmhd_5_3_3.h"
 
@@ -639,15 +639,13 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
 
   pinMode(slaveSelectPin, OUTPUT);
   digitalWrite(slaveSelectPin, HIGH);
-  // V16: the Arduino SPI object is initialised once in setup() BEFORE the
-  // shared GPIO17 reset and before TFT_eSPI init.  Do not call SPI.begin()
-  // again here; all radio traffic is wrapped in beginTransaction/endTransaction.
-  Serial.println("[RADIO] V16 shared SPI already initialised in setup; SPI.begin SKIPPED");
+  // The Arduino SPI object is initialised once in setup(). Do not call
+  // SPI.begin() again here; all radio traffic uses transactions.
+  Serial.println("[RADIO] shared SPI already initialised; SPI.begin skipped");
   digitalWrite(slaveSelectPin, HIGH);
 #ifdef TFT_CS
   pinMode(TFT_CS, OUTPUT);
   digitalWrite(TFT_CS, HIGH);
-  Serial.printf("[RADIO] V16 TFT_CS=%d forced HIGH before radio traffic\n", TFT_CS);
 #endif
   Serial.println("[RADIO] SPI ready");
 
@@ -688,7 +686,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   const bool reuseRunningImage =
       preResult == si468x::Result::Ok && preState.image == expected;
 
-  // V9: do not touch the shared GPIO17 reset when the requested application is
+  // Do not touch the shared GPIO17 reset when the requested application is
   // already running.  This preserves the TFT controller state.  A fresh/cold
   // Si4684 STARTUP state (for example the diagnostic image value seen as 9) is
   // still allowed to continue through POWER_UP + HOST_LOAD + BOOT.  If a real
@@ -700,15 +698,15 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
       Serial.println("[RADIO/IRQ] running image without startup POWER_UP; INTB detection inconclusive");
       return false;
     }
-    Serial.printf("[RADIO] V9 active image already matches requested=%u - REUSE, no POWER_UP/upload\n",
+    Serial.printf("[RADIO] active image already matches requested=%u - REUSE, no POWER_UP/upload\n",
                   static_cast<unsigned>(expected));
   } else if (preResult == si468x::Result::Ok &&
              (preState.image == si468x::Image::DAB || preState.image == si468x::Image::FMHD)) {
-    Serial.printf("[RADIO] V9 opposite active application image=%u requested=%u - refusing shared reset\n",
+    Serial.printf("[RADIO] opposite active application image=%u requested=%u - refusing shared reset\n",
                   static_cast<unsigned>(preState.image), static_cast<unsigned>(expected));
     return false;
   } else {
-    Serial.printf("[RADIO] V9 startup/bootloader state image=%u - boot sequence required\n",
+    Serial.printf("[RADIO] startup/bootloader state image=%u - boot sequence required\n",
                   preResult == si468x::Result::Ok ? static_cast<unsigned>(preState.image) : 255U);
   }
 
@@ -724,10 +722,8 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   power.cTune = 0x1F;
   power.iBiasRun = 0x18;
 
-  // V15 clean A/B test:
-  //   FM  -> FMHD 5.3.3 (unchanged)
-  //   DAB -> DAB 6.0.9 (only firmware-image change versus V14.1)
-  // Reset handling, TFT recovery, patch and SPI timing remain unchanged.
+  // Select the firmware image for the requested radio mode.
+  // Reset handling, TFT recovery, patch and SPI timing are mode-independent.
   const uint8_t* image =
       requestedMode == RADIO_MODE_FM ? si468x_fmhd_5_3_3 : si468x_dab_6_0_9;
   const uint32_t imageSize =
@@ -831,7 +827,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     }
 
   } else {
-    Serial.println("[RADIO] V9 bootHostImage skipped; preserving running image and TFT state");
+    Serial.println("[RADIO] bootHostImage skipped; preserving running image and TFT state");
   }
 
   // If POWER_UP itself was silent, DETECT stayed armed through the complete
@@ -1868,10 +1864,10 @@ void DAB::processFmRds(void) {
     finishCommandDiagnostics(clearResult);
     return;
   }
-  // PI and TP/PTY are current-channel status fields. They can already be
-  // valid when the RDS group FIFO is momentarily empty, especially just after
-  // tuning or with marginal reception. Capture them before any FIFO-dependent
-  // early return so the UI can publish PI/PTY at the first valid opportunity.
+  // PI and TP/PTY are current-channel status fields, not FIFO payload. Use
+  // them as soon as the Si4684 marks them valid, even when no complete RDS
+  // group is waiting in the FIFO yet. This improves acquisition after retune
+  // on marginal signals without increasing the RDS polling rate.
   if (group.piValid) fmPi = group.pi;
   if (group.tpPtyValid) {
     fmPty = group.pty;
@@ -1881,10 +1877,7 @@ void DAB::processFmRds(void) {
 
   if (!group.sync) return;
 
-  // FM_RDS_STATUS can legitimately report sync with an empty FIFO. Its block
-  // fields do not contain a new group in that case, so publishing them would
-  // corrupt candidate state and could replace an already stable PS. PI/PTY
-  // above are status fields and therefore do not depend on fifoUsed.
+  // Block A/B/C/D below are meaningful only when a complete FIFO group exists.
   if (group.fifoUsed == 0U) return;
   // BLE 0 and 1 are clean or corrected by at most two bits. Do not use BLE 2
   // for text: a 3-5 bit correction can otherwise become a visible character.

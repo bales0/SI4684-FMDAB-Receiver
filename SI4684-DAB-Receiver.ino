@@ -238,7 +238,7 @@ bool IsStationEmpty(void);
 void LoadPresets(void);
 bool SwitchRadioMode(RadioMode newMode, bool force = false);
 static void RestoreTftAfterSharedReset(const char* tag);
-static void RestoreTftControllerNoReset(const char* tag, bool reinitDma);
+static void RestoreTftControllerNoReset(const char* tag);
 void MarkEepromDirty(void);
 bool FlushEeprom(void);
 void LogRamUsage(const char* tag);
@@ -684,66 +684,67 @@ void LoadPresets(void) {
   }
 }
 
-static bool TftControllerRegistersAlive(const char* tag) {
-  // ILI9341 register reads are available because this PCB wires TFT MISO.
-  // RDMODE (0x0A) and RDPIXFMT (0x0C) should never both be 0x00/0xFF on a
-  // correctly initialised controller. Do not require exact clone-specific
-  // values; use the read only to detect an obviously missing controller.
-  const uint8_t mode = tft.readcommand8(0x0A);
-  const uint8_t pixelFormat = tft.readcommand8(0x0C);
-  const bool deadZero = mode == 0x00U && pixelFormat == 0x00U;
-  const bool deadHigh = mode == 0xFFU && pixelFormat == 0xFFU;
-  const bool alive = !deadZero && !deadHigh;
-  Serial.printf("[%s/TFT] RDMODE=0x%02X RDPIXFMT=0x%02X alive=%u\n",
-                tag ? tag : "TFT", mode, pixelFormat, alive ? 1U : 0U);
-  return alive;
-}
-
-static void RestoreTftControllerNoReset(const char* tag, bool reinitDma) {
-  // Never expose a half-initialised/white panel. GPIO17 is shared with the
-  // SI4684, so this recovery deliberately does NOT pulse hardware RESET.
-  // TFT_RST=-1 makes tft.init() issue the complete controller init sequence
-  // without touching GPIO17 or disturbing the already-running radio.
+static void RestoreTftControllerNoReset(const char* tag) {
+  // GPIO17 is shared with the SI4684, so runtime TFT recovery must never pulse
+  // the physical reset line. Re-program only the ILI9341 controller registers.
+  // This deliberately avoids another tft.init(): on ESP32 that would register
+  // the same SPI/APB callback again and produce addApbChangeCallback() errors.
   analogWrite(CONTRASTPIN, 0);
   pinMode(17, OUTPUT);
   digitalWrite(17, HIGH);
   digitalWrite(15, HIGH);  // keep SI4684 CS inactive during TFT traffic
 
-  Serial.printf("[%s/TFT] full controller init begin dma=%u\n",
-                tag ? tag : "TFT", reinitDma ? 1U : 0U);
+  Serial.printf("[%s/TFT] controller restore begin\n",
+                tag ? tag : "TFT");
 
-  tft.init();
+  // Software reset followed by the standard TFT_eSPI ILI9341 initialisation
+  // sequence. SPI/DMA objects remain initialised in ESP32 RAM; only the panel
+  // controller state is rebuilt.
+  tft.writecommand(0x01);  // SWRESET
+  delay(10);
+
+  tft.writecommand(0xEF); tft.writedata(0x03); tft.writedata(0x80); tft.writedata(0x02);
+  tft.writecommand(0xCF); tft.writedata(0x00); tft.writedata(0xC1); tft.writedata(0x30);
+  tft.writecommand(0xED); tft.writedata(0x64); tft.writedata(0x03); tft.writedata(0x12); tft.writedata(0x81);
+  tft.writecommand(0xE8); tft.writedata(0x85); tft.writedata(0x00); tft.writedata(0x78);
+  tft.writecommand(0xCB); tft.writedata(0x39); tft.writedata(0x2C); tft.writedata(0x00); tft.writedata(0x34); tft.writedata(0x02);
+  tft.writecommand(0xF7); tft.writedata(0x20);
+  tft.writecommand(0xEA); tft.writedata(0x00); tft.writedata(0x00);
+  tft.writecommand(0xC0); tft.writedata(0x23);                    // Power control 1
+  tft.writecommand(0xC1); tft.writedata(0x10);                    // Power control 2
+  tft.writecommand(0xC5); tft.writedata(0x3E); tft.writedata(0x28); // VCOM control 1
+  tft.writecommand(0xC7); tft.writedata(0x86);                    // VCOM control 2
+  tft.writecommand(0x3A); tft.writedata(0x55);                    // RGB565
+  tft.writecommand(0xB1); tft.writedata(0x00); tft.writedata(0x13);
+  tft.writecommand(0xB6); tft.writedata(0x08); tft.writedata(0x82); tft.writedata(0x27);
+  tft.writecommand(0xF2); tft.writedata(0x00);
+  tft.writecommand(0x26); tft.writedata(0x01);
+
+  tft.writecommand(0xE0);
+  const uint8_t gammaPos[] = {0x0F,0x31,0x2B,0x0C,0x0E,0x08,0x4E,0xF1,0x37,0x07,0x10,0x03,0x0E,0x09,0x00};
+  for (uint8_t v : gammaPos) tft.writedata(v);
+
+  tft.writecommand(0xE1);
+  const uint8_t gammaNeg[] = {0x00,0x0E,0x14,0x03,0x11,0x07,0x31,0xC1,0x48,0x08,0x0F,0x0C,0x31,0x36,0x0F};
+  for (uint8_t v : gammaNeg) tft.writedata(v);
+
+  tft.writecommand(0x11);  // SLPOUT
+  delay(120);
+  tft.writecommand(0x29);  // DISPON
   delay(20);
+
   tft.setRotation(displayflip == 0 ? 3 : 1);
   tft.setSwapBytes(true);
-  if (reinitDma) tft.initDMA();
   doTheme();
-
-  // A cold power-up or a marginal wake can very rarely leave the TFT white
-  // while the ESP32/radio continue running. When register reads show an
-  // obviously absent controller, retry the complete software init once. This
-  // still never toggles the shared GPIO17 reset line.
-  if (!TftControllerRegistersAlive(tag)) {
-    Serial.printf("[%s/TFT] controller check failed; retry after 120 ms\n",
-                  tag ? tag : "TFT");
-    delay(120);
-    digitalWrite(15, HIGH);
-    tft.init();
-    delay(20);
-    tft.setRotation(displayflip == 0 ? 3 : 1);
-    tft.setSwapBytes(true);
-    doTheme();
-    TftControllerRegistersAlive(tag);
-  }
-
   tft.fillScreen(BackgroundColor);
-  Serial.printf("[%s/TFT] full controller init complete; backlight OFF\n",
+
+  Serial.printf("[%s/TFT] controller restore complete; backlight OFF\n",
                 tag ? tag : "TFT");
 }
 
 static void RestoreTftAfterSharedReset(const char* tag) {
   Serial.printf("[%s] TFT full restore after shared reset begin\n", tag);
-  RestoreTftControllerNoReset(tag, true);
+  RestoreTftControllerNoReset(tag);
   // Sprite smooth-font state lives in ESP32 RAM, but the mode-switch path has
   // historically reloaded it after a shared hardware reset. Keep that proven
   // behaviour here; light-sleep wake does not need to reload sprite fonts.
@@ -799,8 +800,8 @@ bool SwitchRadioMode(RadioMode newMode, bool force) {
   digitalWrite(17, HIGH);
   delay(10);
 
-  // TFT and radio use separate SPI buses; TFT_RST=-1 guarantees tft.init()
-  // cannot pulse shared GPIO17. Restore it before the long radio upload.
+  // TFT and radio use separate SPI buses. Restore only the ILI9341 controller
+  // registers before the long radio upload; shared GPIO17 remains HIGH.
   RestoreTftAfterSharedReset("SWITCH");
   tft.pushImage(0, 0, 320, 240, Background);
   ShowStatusOverlay(switchText);
@@ -1358,14 +1359,8 @@ void setup(void) {
     if (defaultsSaved) ESP.restart();
   }
 
-  // V16 shared-reset recovery (same proven sequence as V14.1).
+  // One shared hardware reset is required for both devices at startup.
   // The TFT and SI4684 are on separate SPI buses; only GPIO17 RESET is shared.
-  Serial.println("[V16] shared-reset recovery START");
-  Serial.printf("[V16] TFT: CS=%d DC=%d TFT_RST=%d MOSI=%d MISO=%d SCLK=%d\n",
-                TFT_CS, TFT_DC, TFT_RST, TFT_MOSI, TFT_MISO, TFT_SCLK);
-  Serial.printf("[V16] SI4684: CS=15 RST=17 MOSI=13 MISO=16 SCLK=14; GPIO12=%s\n",
-                Gpio12ModeText[gpio12Mode]);
-
   // Initialise the radio SPI object on its own bus.
   pinMode(15, OUTPUT);
   digitalWrite(15, HIGH);
@@ -1373,19 +1368,18 @@ void setup(void) {
 
   // One physical reset affects both SI4684 RSTB and ILI9341 RESET.
   pinMode(17, OUTPUT);
-  Serial.println("[V16] GPIO17 shared reset LOW 20 ms");
+  Serial.println("[BOOT] shared reset LOW 20 ms");
   digitalWrite(17, LOW);
   delay(20);
   digitalWrite(17, HIGH);
-  Serial.println("[V16] GPIO17 shared reset HIGH; wait 200 ms");
+  Serial.println("[BOOT] shared reset HIGH; wait 200 ms");
   delay(200);
 
-  // Recover ILI9341 after the shared hardware reset using the same robust
-  // controller path as runtime recovery. It validates readable controller
-  // registers and retries once without ever pulsing the shared GPIO17 again.
+  // Recover ILI9341 after the shared hardware reset using the same controller
+  // register sequence as runtime recovery, without another TFT/SPI init.
   digitalWrite(15, HIGH);
-  Serial.println("[V16] TFT re-init after shared reset");
-  RestoreTftControllerNoReset("BOOT", true);
+  Serial.println("[BOOT] restoring TFT after shared reset");
+  RestoreTftControllerNoReset("BOOT");
 
   // Restore the normal boot logo after the real reset/re-init.
   Serial.println("[BOOT] drawing splash after TFT recovery");
@@ -1402,12 +1396,12 @@ void setup(void) {
   }
 
   // Start/reuse SI4684. Its SPI bus was already initialised above.
-  Serial.printf("[V16] radio.begin mode=%s\n",
+  Serial.printf("[BOOT] radio.begin mode=%s\n",
                 radioMode == RADIO_MODE_FM ? "FM" : "DAB");
   const bool radioBeginOk = radio.begin(15, radioMode);
-  Serial.printf("[V16] radio.begin returned=%u\n", radioBeginOk ? 1U : 0U);
+  Serial.printf("[BOOT] radio.begin returned=%u\n", radioBeginOk ? 1U : 0U);
   if (!radioBeginOk) {
-    Serial.println("[V16] radio.begin FAILED");
+    Serial.println("[BOOT] radio.begin FAILED");
     tftPrint(0, radioErrorText[language], 160, 210,
              TFT_RED, TFT_DARKGREY, 16);
     for (;;) delay(1000);
@@ -1416,7 +1410,7 @@ void setup(void) {
   // Firmware identity is detected from the chip; never hard-code it here.
   const String detectedRadioVersion =
       String(radio.getChipID()) + " v" + String(radio.getFirmwareVersion());
-  Serial.printf("[V16] detected radio: %s\n", detectedRadioVersion.c_str());
+  Serial.printf("[BOOT] detected radio: %s\n", detectedRadioVersion.c_str());
   radio.SlideShowDebug = true;
   Serial.println("[SLS] diagnostics ENABLED");
   tftPrint(0, detectedRadioVersion, 160, 210,
@@ -1590,7 +1584,7 @@ void ProcessDAB(void) {
     }
   }
 
-  // V8 diagnostic: automatic panic/recovery is intentionally disabled.
+  // Automatic panic/recovery is intentionally disabled.
   // With GPIO17 shared between SI4684 RSTB and TFT RESET, any recovery pulse
   // also blanks the display.  No DAB lock (e.g. with no antenna connected) is
   // not a reason to reset the tuner.  Re-enable recovery only after the display
@@ -2728,13 +2722,10 @@ static void EnterLightSleep(bool showStandbyScreen) {
   // the same LOW level would immediately be interpreted as a new press.
   standbyWakeReleaseGuard = wakeButtonLow;
 
-  // Reinitialise the ILI9341 completely while the backlight is still OFF.
-  // A simple Sleep-Out was usually sufficient, but a rare controller-state
-  // loss produced a white panel while the ESP32 and radio kept running. The
-  // full TFT_eSPI init is software-only because TFT_RST=-1; shared GPIO17 and
-  // therefore the Si4684 are never reset here. DMA/sprite/font RAM state is
-  // retained, so only controller registers are rebuilt.
-  RestoreTftControllerNoReset("WAKE", false);
+  // Rebuild the ILI9341 controller registers while the backlight is still OFF.
+  // SPI/DMA/sprite/font state stays resident in ESP32 RAM and GPIO17 is never
+  // pulsed, so the already-running Si4684 is not disturbed.
+  RestoreTftControllerNoReset("WAKE");
 
   // Service any status that accumulated while the CPU was asleep. In INTB
   // mode a falling edge may have happened during sleep and therefore been
