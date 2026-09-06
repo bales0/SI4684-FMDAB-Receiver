@@ -248,6 +248,7 @@ void CaptureSettingsSnapshot(void);
 void ExitSettingsMenu(void);
 void CycleTuneMode(void);
 void RemoteModeAction(void);
+void RemoteModeLongAction(void);
 void RemoteVolumeStep(int8_t delta);
 void RemoteTuneAction(int8_t direction, bool repeat);
 static void RedrawVolumeOverlay(void);
@@ -981,6 +982,30 @@ void RemoteModeAction(void) {
   if (menu) ExitSettingsMenu();
   else if (SlideShowView || ChannelListView || ShowServiceInformation) BuildDisplay();
   else CycleTuneMode();
+}
+
+// A one-second hold of the learned IR MODE key toggles the radio band. This is
+// intentionally separate from RemoteModeAction(): ir_remote.cpp calls exactly
+// one of short or long after it has classified the press. Learn/Test intercept
+// their IR frames before runtime dispatch, and Settings ignores the long form.
+void RemoteModeLongAction(void) {
+  tottimer = millis();
+  seek = false;
+  dabSeekStarted = false;
+  fmSeekStarted = false;
+
+  if (menu) {
+    Serial.println("[IR/MODE] long DAB/FM switch ignored while Settings is open");
+    return;
+  }
+
+  const RadioMode target =
+      radioMode == RADIO_MODE_DAB ? RADIO_MODE_FM : RADIO_MODE_DAB;
+  requestedRadioMode = target;
+  Serial.printf("[IR/MODE] switching %s -> %s\n",
+                radioMode == RADIO_MODE_DAB ? "DAB" : "FM",
+                target == RADIO_MODE_DAB ? "DAB" : "FM");
+  if (!SwitchRadioMode(target)) requestedRadioMode = radioMode;
 }
 
 void RemoteVolumeStep(int8_t delta) {

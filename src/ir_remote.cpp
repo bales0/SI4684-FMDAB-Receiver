@@ -15,6 +15,7 @@ extern void ButtonPress(void);
 extern void SlideShowButtonPress(void);
 extern void doStandby(void);
 extern void RemoteModeAction(void);
+extern void RemoteModeLongAction(void);
 extern void RemoteVolumeStep(int8_t delta);
 extern void RemoteTuneAction(int8_t direction, bool repeat);
 extern void MarkEepromDirty(void);
@@ -61,7 +62,16 @@ static uint32_t lastRuntimeFrameMs = 0;
 static uint32_t runtimePressStartMs = 0;
 static constexpr uint32_t IR_HELD_FRAME_GAP_MS = 220UL;
 static constexpr uint32_t IR_REPEAT_INITIAL_DELAY_MS = 500UL;
+static constexpr uint32_t IR_MODE_LONG_PRESS_MS = 1000UL;
 static constexpr uint32_t IR_LEARN_RELEASE_MS = 220UL;
+
+// MODE is delayed until release so one learned key can provide two mutually
+// exclusive actions: a short MODE keeps the existing tune-mode action, while
+// a continuous hold of at least one second switches DAB <-> FM exactly once.
+static bool modePressPending = false;
+static bool modeLongFired = false;
+static uint32_t modePressStartMs = 0U;
+static uint32_t modeLastFrameMs = 0U;
 // GPIO12 capture is fully local to this project. No external IR receive
 // library, sampling timer or receiver singleton is used. The ISR records only
 // real input transitions; decoding is done later in normal loop() context.
@@ -418,6 +428,59 @@ static int8_t findLearningDuplicate(const IrFrame& data) {
   return -1;
 }
 
+static void clearModePressState(void) {
+  modePressPending = false;
+  modeLongFired = false;
+  modePressStartMs = 0U;
+  modeLastFrameMs = 0U;
+}
+
+static void servicePendingModePress(uint32_t now) {
+  if (!modePressPending) return;
+
+  const uint32_t sinceLastFrame =
+      static_cast<uint32_t>(now - modeLastFrameMs);
+
+  // The threshold may fall between two IR repeat frames. A recently received
+  // MODE frame is enough evidence that the key is still held.
+  if (!modeLongFired &&
+      static_cast<uint32_t>(now - modePressStartMs) >= IR_MODE_LONG_PRESS_MS &&
+      sinceLastFrame < IR_HELD_FRAME_GAP_MS) {
+    modeLongFired = true;
+    Serial.printf("[IR/MODE] long press %lu ms -> DAB/FM switch\n",
+                  static_cast<unsigned long>(now - modePressStartMs));
+    RemoteModeLongAction();
+    return;
+  }
+
+  if (modeLongFired) {
+    // SwitchRadioMode() is deliberately blocking while the SI4684 image is
+    // reloaded. During that time MODE repeats can still hit the edge ISR even
+    // though foreground decoding is paused. Do not mistake that foreground
+    // pause for a key release: require the GPIO edge stream itself to have been
+    // quiet for the full held-frame gap before rearming MODE.
+    const uint32_t edgeQuietUs = static_cast<uint32_t>(micros() - edgeLastEdgeUs);
+    if (edgeQuietUs < IR_HELD_FRAME_GAP_MS * 1000UL) return;
+  } else if (sinceLastFrame < IR_HELD_FRAME_GAP_MS) {
+    return;
+  }
+
+  // Silence longer than the held-frame gap is the release event. If the long
+  // action has not fired, this is the one and only place the short action runs.
+  if (!modeLongFired) {
+    Serial.printf("[IR/MODE] short press released after %lu ms\n",
+                  static_cast<unsigned long>(modeLastFrameMs - modePressStartMs));
+    RemoteModeAction();
+  }
+
+  clearModePressState();
+  if (lastRuntimeAction == IR_ACTION_MODE) {
+    lastRuntimeAction = IR_ACTION_NONE;
+    lastRuntimeFrameMs = now;
+    runtimePressStartMs = 0U;
+  }
+}
+
 static bool actionRepeats(IrAction action) {
   return action == IR_ACTION_TUNE_UP || action == IR_ACTION_TUNE_DOWN ||
          action == IR_ACTION_VOL_UP || action == IR_ACTION_VOL_DOWN;
@@ -636,6 +699,7 @@ void IrRemoteBegin(void) {
   lastRuntimeAction = IR_ACTION_NONE;
   lastRuntimeFrameMs = 0;
   runtimePressStartMs = 0;
+  clearModePressState();
   lastTestDataValid = false;
   lastTestRepeatShown = false;
   lastTestFrameMs = 0;
@@ -662,6 +726,7 @@ void IrRemoteStop(void) {
   lastRuntimeAction = IR_ACTION_NONE;
   lastRuntimeFrameMs = 0;
   runtimePressStartMs = 0;
+  clearModePressState();
   lastTestDataValid = false;
   lastTestRepeatShown = false;
   lastTestFrameMs = 0;
@@ -902,6 +967,11 @@ void IrRemoteProcess(void) {
     drawLearn();
   }
 
+  // MODE short/long recognition must run even when no new frame arrives:
+  // release is represented by silence, and 1000 ms can fall between repeats.
+  // Learn/Test remain isolated because only the normal UI state reaches this.
+  if (uiState == UI_NONE) servicePendingModePress(millis());
+
   IrFrame data{};
   if (!takeDecodedFrame(data)) return;
 
@@ -989,15 +1059,58 @@ void IrRemoteProcess(void) {
   }
 
   if (action == IR_ACTION_NONE) {
+    // Before the long action fires, an unrelated/unassigned frame is an
+    // unambiguous MODE release. After a long action, malformed/overflowed
+    // frames can appear while SwitchRadioMode() was busy; keep the MODE release
+    // guard alive until the physical edge stream is really quiet.
+    if (modePressPending && !modeLongFired) {
+      modeLastFrameMs = now - IR_HELD_FRAME_GAP_MS;
+      servicePendingModePress(now);
+    }
+    if (modePressPending && modeLongFired) return;
     lastRuntimeAction = IR_ACTION_NONE;
     lastRuntimeFrameMs = now;
     runtimePressStartMs = 0;
     return;
   }
 
+  if (action != IR_ACTION_MODE && modePressPending) {
+    if (modeLongFired) {
+      // After the long switch, ignore every other IR action until MODE has
+      // physically gone quiet. This guarantees that the tail of a held key can
+      // never become a second short MODE or another accidental command.
+      return;
+    }
+    // A different valid key ends a still-pending short MODE immediately.
+    modeLastFrameMs = now - IR_HELD_FRAME_GAP_MS;
+    servicePendingModePress(now);
+    heldFrame = false;
+  }
+
+  if (action == IR_ACTION_MODE) {
+    if (!modePressPending) {
+      modePressPending = true;
+      modeLongFired = false;
+      modePressStartMs = now;
+      modeLastFrameMs = now;
+      lastRuntimeAction = IR_ACTION_MODE;
+      lastRuntimeFrameMs = now;
+      runtimePressStartMs = now;
+      Serial.println("[IR/MODE] press pending; long threshold=1000 ms");
+      return;
+    }
+
+    modeLastFrameMs = now;
+    lastRuntimeAction = IR_ACTION_MODE;
+    lastRuntimeFrameMs = now;
+    servicePendingModePress(now);
+    return;
+  }
+
   if (!heldFrame) {
     // First frame: execute once immediately, then require a deliberate hold
-    // before TUNE/VOL autorepeat is allowed to start.
+    // before TUNE/VOL autorepeat is allowed to start. MODE is handled above
+    // because its short action must wait until release.
     lastRuntimeAction = action;
     lastRuntimeFrameMs = now;
     runtimePressStartMs = now;
