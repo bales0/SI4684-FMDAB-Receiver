@@ -848,11 +848,13 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   const bool runtimeIntbRequested =
       configuredGpio12Mode != GPIO12_IR &&
       radioIntbCapability != RadioIntbCapability::Absent;
-  // In the IR hardware variant INTB is not physically connected to GPIO12, so
-  // do not unnecessarily disable the Si4684 INTB output itself. We simply do
-  // not route/service it in the ESP32 and keep the radio in polling mode.
-  const bool intbOutputEnabled =
-      configuredGpio12Mode == GPIO12_IR || runtimeIntbRequested;
+  const bool irPollingBootstrap = configuredGpio12Mode == GPIO12_IR;
+
+  // GPIO12=IR must leave the Si4684 in exactly the same application-side
+  // state as AUTO after a confirmed no-INTB fallback: audio outputs enabled,
+  // physical INTB output disabled, CTS/status bootstrap performed by polling.
+  // The only intended difference is ownership of ESP32 GPIO12 itself.
+  const bool intbOutputEnabled = runtimeIntbRequested;
   const uint16_t pinConfig = RADIO_PIN_CONFIG_AUDIO |
       (intbOutputEnabled ? RADIO_PIN_CONFIG_INTBOUTEN : 0U);
 
@@ -897,10 +899,12 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   si468x::Result runtimeCtsResult = si468x::Result::Ok;
   si468x::Result pendingStatusResult = si468x::Result::Ok;
   si468x::Status pendingStatus;
-  if (runtimeIntbRequested && pinConfigResult == si468x::Result::Ok) {
+  if ((runtimeIntbRequested || irPollingBootstrap) &&
+      pinConfigResult == si468x::Result::Ok) {
     runtimeCtsResult = chip.setInterruptEnable(si468x::INTERRUPT_CTS);
-    Serial.printf("[RADIO/IRQ] runtime sources=0x%04X stage=bootstrap result=%d\n",
+    Serial.printf("[RADIO/IRQ] runtime sources=0x%04X stage=%s result=%d\n",
                   static_cast<unsigned>(si468x::INTERRUPT_CTS),
+                  irPollingBootstrap ? "IR-poll-bootstrap" : "bootstrap",
                   static_cast<int>(runtimeCtsResult));
     if (runtimeCtsResult == si468x::Result::Ok) {
       pendingStatusResult = chip.readStatus(pendingStatus);
@@ -996,6 +1000,18 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     } else {
       useRuntimePollingFallback("runtime INTB bootstrap failed");
     }
+  } else if (irPollingBootstrap) {
+    if (runtimeCtsResult != si468x::Result::Ok ||
+        pendingStatusResult != si468x::Result::Ok) {
+      Serial.println("[RADIO/IRQ] ERROR: IR polling bootstrap failed");
+      return false;
+    }
+    // Keep the same bounded polling values used by AUTO after INTB absence.
+    radioControlMode = RADIO_CTRL_POLL;
+    radioIntbCapability = RadioIntbCapability::Absent;
+    chip.setCtsPollIntervalUs(1000UL);
+    chip.setIdleStatusPollIntervalUs(20000UL);
+    Serial.println("[RADIO/IRQ] IR polling bootstrap complete; AUTO fallback state matched");
   }
 
   // Start runtime edge telemetry after the one-shot application probe so its

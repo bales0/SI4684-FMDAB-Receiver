@@ -2,25 +2,10 @@
 // GPIO12 is initialized here only when Settings -> GPIO12 is explicitly IR.
 // AUTO never tries to autodetect an IR receiver.
 
-#define RAW_BUFFER_LENGTH 100
-#define NO_LED_FEEDBACK_CODE
-#define DECODE_DENON
-#define DECODE_JVC
-#define DECODE_KASEIKYO
-#define DECODE_LG
-#define DECODE_NEC
-#define DECODE_SAMSUNG
-#define DECODE_SONY
-#define DECODE_RC5
-#define DECODE_RC6
-#define DECODE_HASH
-#define EXCLUDE_EXOTIC_PROTOCOLS
-#include <IRremote.hpp>
-
 #include <EEPROM.h>
 #include <cstring>
-#include <cstdlib>
 #include "ir_remote.h"
+#include "ir_decode.h"
 #include "constants.h"
 #include "gui.h"
 
@@ -31,6 +16,7 @@ extern void SlideShowButtonPress(void);
 extern void doStandby(void);
 extern void RemoteModeAction(void);
 extern void RemoteVolumeStep(int8_t delta);
+extern void RemoteTuneAction(int8_t direction, bool repeat);
 extern void MarkEepromDirty(void);
 extern void FlushEeprom(void);
 
@@ -59,22 +45,52 @@ struct LearnedCode {
   uint64_t raw;
 };
 
-// Keep learned-code working sets off .bss. The classic ESP32 has a tighter
-// linker-visible DRAM segment than its total runtime heap. Both tables are
-// allocated once during boot when GPIO12 is configured for IR and are then
-// retained for the lifetime of the firmware. This avoids runtime malloc/free
-// churn and makes the IR path heap-fragmentation neutral after setup().
-static LearnedCode* learned = nullptr;
-static LearnedCode* learnWork = nullptr;
-static bool buffersPrepareAttempted = false;
-static bool buffersReady = false;
+// Standalone IR keeps both code tables in fixed storage. This deliberately
+// makes the heap layout identical in AUTO/POLL and GPIO12=IR boots: enabling
+// IR no longer inserts two early heap allocations before the TFT/radio setup.
+// EE_IR_KEY_COUNT is only eight entries, so the fixed 384-byte cost is small
+// and deterministic.
+static LearnedCode learned[EE_IR_KEY_COUNT] = {};
+static LearnedCode learnWork[EE_IR_KEY_COUNT] = {};
+static bool prepareLogged = false;
 static bool profileValid = false;
 static bool profileLoaded = false;
 static bool receiverStarted = false;
 static IrAction lastRuntimeAction = IR_ACTION_NONE;
 static uint32_t lastRuntimeFrameMs = 0;
+static uint32_t runtimePressStartMs = 0;
 static constexpr uint32_t IR_HELD_FRAME_GAP_MS = 220UL;
+static constexpr uint32_t IR_REPEAT_INITIAL_DELAY_MS = 500UL;
 static constexpr uint32_t IR_LEARN_RELEASE_MS = 220UL;
+// GPIO12 capture is fully local to this project. No external IR receive
+// library, sampling timer or receiver singleton is used. The ISR records only
+// real input transitions; decoding is done later in normal loop() context.
+static constexpr uint16_t IR_RAW_BUFFER_LENGTH = 100U;
+static constexpr uint32_t IR_FRAME_GAP_US = 8000UL;
+static constexpr uint32_t IR_EDGE_MIN_PULSE_US = 80UL;
+static volatile bool edgeCapturePaused = true;
+static volatile bool edgeFrameActive = false;
+static volatile bool edgeOverflow = false;
+static volatile uint16_t edgeDurationCount = 0;
+static volatile uint32_t edgeInitialGapUs = 0;
+static volatile uint32_t edgeLastEdgeUs = 0;
+static volatile uint16_t edgeDurationsUs[IR_RAW_BUFFER_LENGTH] = {0};
+static volatile uint32_t edgeTransitionCount = 0U;
+static volatile uint32_t edgeGlitchCount = 0U;
+static volatile uint32_t edgeOverflowCount = 0U;
+static uint16_t decodeDurationsUs[IR_RAW_BUFFER_LENGTH] = {0};
+static IrDecoderState decoderState{};
+static uint32_t edgeFrameCount = 0U;
+static uint32_t edgeDecodedCount = 0U;
+static uint32_t edgeDiagTimerMs = 0U;
+static uint32_t edgeDiagLastTransitions = 0U;
+
+// Test view keeps the last complete frame so a protocol-specific short repeat
+// frame can be displayed as a repeat of that key instead of as IR_PROTO_UNKNOWN.
+static IrFrame lastTestData{};
+static bool lastTestDataValid = false;
+static bool lastTestRepeatShown = false;
+static uint32_t lastTestFrameMs = 0;
 
 static constexpr uint8_t IR_PROFILE_VERSION = 1;
 static constexpr uint8_t kMagic[4] = {'I', 'R', '0', '1'};
@@ -98,22 +114,103 @@ static bool clearYes = false;
 static constexpr size_t IR_CODE_TABLE_BYTES =
     sizeof(LearnedCode) * EE_IR_KEY_COUNT;
 
-bool IrRemotePrepare(void) {
-  if (buffersPrepareAttempted) return buffersReady;
-  buffersPrepareAttempted = true;
+static void IRAM_ATTR irEdgeCaptureIsr(void) {
+  if (edgeCapturePaused) return;
+  ++edgeTransitionCount;
 
-  learned = static_cast<LearnedCode*>(calloc(EE_IR_KEY_COUNT, sizeof(LearnedCode)));
-  learnWork = static_cast<LearnedCode*>(calloc(EE_IR_KEY_COUNT, sizeof(LearnedCode)));
-  if (!learned || !learnWork) {
-    Serial.printf("[IR] buffer allocation failed (2 x %u bytes)\n",
-                  static_cast<unsigned>(IR_CODE_TABLE_BYTES));
-    buffersReady = false;
+  const uint32_t now = micros();
+  const bool levelHigh = digitalRead(SI4684_INTB_PIN) == HIGH;
+
+  if (!edgeFrameActive) {
+    // Demodulated IR receivers idle HIGH. A falling edge starts a frame.
+    if (!levelHigh) {
+      edgeInitialGapUs = now - edgeLastEdgeUs;
+      edgeDurationCount = 0U;
+      edgeOverflow = false;
+      edgeFrameActive = true;
+      edgeLastEdgeUs = now;
+    } else {
+      edgeLastEdgeUs = now;
+    }
+    return;
+  }
+
+  const uint32_t durationUs = now - edgeLastEdgeUs;
+  edgeLastEdgeUs = now;
+
+  // Ignore only unrealistically short glitches. A real demodulated IR symbol
+  // in every supported decoder is substantially longer than this threshold.
+  if (durationUs < IR_EDGE_MIN_PULSE_US) {
+    ++edgeGlitchCount;
+    edgeFrameActive = false;
+    edgeOverflow = false;
+    edgeDurationCount = 0U;
+    edgeInitialGapUs = 0U;
+    return;
+  }
+
+  if (edgeDurationCount < IR_RAW_BUFFER_LENGTH) {
+    edgeDurationsUs[edgeDurationCount++] =
+        static_cast<uint16_t>(durationUs > 0xFFFFU ? 0xFFFFU : durationUs);
+  } else {
+    if (!edgeOverflow) ++edgeOverflowCount;
+    edgeOverflow = true;
+  }
+}
+
+static void rearmEdgeCapture(void) {
+  noInterrupts();
+  edgeFrameActive = false;
+  edgeOverflow = false;
+  edgeDurationCount = 0U;
+  edgeInitialGapUs = 0U;
+  // Keep the timestamp of the previous frame's final rising edge. The next
+  // falling edge then gives the real inter-frame gap used for repeat decoding.
+  edgeCapturePaused = false;
+  interrupts();
+}
+
+static bool takeEdgeFrame(uint16_t& durationCount,
+                          uint32_t& initialGapUs,
+                          bool& overflow) {
+  if (edgeCapturePaused || !edgeFrameActive) return false;
+
+  const uint32_t now = micros();
+  if (digitalRead(SI4684_INTB_PIN) == LOW ||
+      static_cast<uint32_t>(now - edgeLastEdgeUs) < IR_FRAME_GAP_US)
+    return false;
+
+  noInterrupts();
+  const uint32_t lockedNow = micros();
+  if (!edgeFrameActive || digitalRead(SI4684_INTB_PIN) == LOW ||
+      static_cast<uint32_t>(lockedNow - edgeLastEdgeUs) < IR_FRAME_GAP_US) {
+    interrupts();
     return false;
   }
 
-  buffersReady = true;
-  Serial.printf("[IR] persistent heap buffers allocated: 2 x %u bytes\n",
-                static_cast<unsigned>(IR_CODE_TABLE_BYTES));
+  edgeCapturePaused = true;
+  edgeFrameActive = false;
+  durationCount = edgeDurationCount;
+  initialGapUs = edgeInitialGapUs;
+  overflow = edgeOverflow;
+  interrupts();
+
+  if (durationCount == 0U || durationCount > IR_RAW_BUFFER_LENGTH) {
+    rearmEdgeCapture();
+    return false;
+  }
+
+  for (uint16_t i = 0; i < durationCount; ++i)
+    decodeDurationsUs[i] = edgeDurationsUs[i];
+  return true;
+}
+
+bool IrRemotePrepare(void) {
+  if (!prepareLogged) {
+    prepareLogged = true;
+    Serial.printf("[IR] static code tables ready: 2 x %u bytes\n",
+                  static_cast<unsigned>(IR_CODE_TABLE_BYTES));
+  }
   return true;
 }
 
@@ -245,43 +342,43 @@ static void clearProfile(void) {
   }
   for (int i = 0; i < EE_IR_CONFIG_SIZE; ++i)
     EEPROM.writeByte(EE_IR_CONFIG_START + i, 0);
-  if (learned) memset(learned, 0, IR_CODE_TABLE_BYTES);
+  memset(learned, 0, IR_CODE_TABLE_BYTES);
   profileValid = false;
   lastRuntimeAction = IR_ACTION_NONE;
   lastRuntimeFrameMs = 0;
+  runtimePressStartMs = 0;
   MarkEepromDirty();
   FlushEeprom();
   Serial.println("[IR] learned profile cleared");
 }
 
-static LearnedCode fromFrame(const IRData& data) {
+static LearnedCode fromFrame(const IrFrame& data) {
   LearnedCode result{};
-  result.protocol = static_cast<uint8_t>(data.protocol);
+  result.protocol = data.protocol;
   result.address = data.address;
   result.command = data.command;
   result.extra = data.extra;
-  result.bits = data.numberOfBits;
-  result.raw = static_cast<uint64_t>(data.decodedRawData);
+  result.bits = data.bits;
+  result.raw = data.raw;
   return result;
 }
 
-static bool frameMatches(const LearnedCode& code, const IRData& data) {
-  if (code.protocol != static_cast<uint8_t>(data.protocol)) return false;
-  if (data.protocol == UNKNOWN)
-    return code.raw == static_cast<uint64_t>(data.decodedRawData);
+static bool frameMatches(const LearnedCode& code, const IrFrame& data) {
+  if (code.protocol != data.protocol) return false;
+  if (data.protocol == IR_PROTO_UNKNOWN)
+    return code.raw == data.raw;
   return code.address == data.address && code.command == data.command &&
-         code.extra == data.extra && code.bits == data.numberOfBits;
+         code.extra == data.extra && code.bits == data.bits;
 }
 
-static IrAction findAction(const IRData& data) {
+static IrAction findAction(const IrFrame& data) {
   if (!profileValid) return IR_ACTION_NONE;
   for (uint8_t i = 0; i < EE_IR_KEY_COUNT; ++i)
     if (frameMatches(learned[i], data)) return static_cast<IrAction>(i);
   return IR_ACTION_NONE;
 }
 
-static int8_t findLearningDuplicate(const IRData& data) {
-  if (!learnWork) return -1;
+static int8_t findLearningDuplicate(const IrFrame& data) {
   for (uint8_t i = 0; i < learnIndex; ++i)
     if (frameMatches(learnWork[i], data)) return static_cast<int8_t>(i);
   return -1;
@@ -292,10 +389,10 @@ static bool actionRepeats(IrAction action) {
          action == IR_ACTION_VOL_UP || action == IR_ACTION_VOL_DOWN;
 }
 
-static void dispatch(IrAction action) {
+static void dispatch(IrAction action, bool repeat) {
   switch (action) {
-    case IR_ACTION_TUNE_UP:    KeyUp(); break;
-    case IR_ACTION_TUNE_DOWN:  KeyDown(); break;
+    case IR_ACTION_TUNE_UP:    RemoteTuneAction(+1, repeat); break;
+    case IR_ACTION_TUNE_DOWN:  RemoteTuneAction(-1, repeat); break;
     case IR_ACTION_OK:         ButtonPress(); break;
     case IR_ACTION_VOL_UP:     if (!menu) RemoteVolumeStep(+2); break;
     case IR_ACTION_VOL_DOWN:   if (!menu) RemoteVolumeStep(-2); break;
@@ -311,20 +408,39 @@ static void drawUiBase(const char* title) {
   tftPrint(0, title, 155, 5, PrimaryColor, PrimaryColorSmooth, 28);
 }
 
+static void restoreUiBand(int16_t y, int16_t height) {
+  if (y < 0) {
+    height += y;
+    y = 0;
+  }
+  if (height <= 0 || y >= 240) return;
+  if (y + height > 240) height = 240 - y;
+  tft.pushImage(0, y, 320, height,
+                configurationbackground + static_cast<uint32_t>(y) * 320U);
+}
+
+static const char* menuItemText(uint8_t index) {
+  switch (index) {
+    case 0: return irLearnText[language];
+    case 1: return irClearText[language];
+    case 2: return irTestText[language];
+    default: return irBackText[language];
+  }
+}
+
+static void drawMenuRow(uint8_t index, bool restoreBackground) {
+  if (index >= 4U) return;
+  if (restoreBackground) restoreUiBand(48 + index * 32, 32);
+  const bool selected = index == uiSelection;
+  tftPrint(-1, String(selected ? "> " : "  ") + menuItemText(index),
+           70, 55 + index * 32,
+           selected ? ActiveColor : PrimaryColor,
+           selected ? ActiveColorSmooth : PrimaryColorSmooth, 28);
+}
+
 static void drawMenu(void) {
   drawUiBase(irRemoteText[language]);
-  const char* items[] = {
-    irLearnText[language],
-    irClearText[language],
-    irTestText[language],
-    irBackText[language]
-  };
-  for (uint8_t i = 0; i < 4; ++i) {
-    const int color = i == uiSelection ? ActiveColor : PrimaryColor;
-    const int smooth = i == uiSelection ? ActiveColorSmooth : PrimaryColorSmooth;
-    tftPrint(-1, String(i == uiSelection ? "> " : "  ") + items[i],
-             70, 55 + i * 32, color, smooth, 28);
-  }
+  for (uint8_t i = 0; i < 4; ++i) drawMenuRow(i, false);
   tftPrint(0,
            profileValid ? irProfileLearnedText[language]
                         : irProfileEmptyText[language],
@@ -361,11 +477,8 @@ static void drawLearnRelease(void) {
            SecondaryColor, SecondaryColorSmooth, 16);
 }
 
-static void drawClear(void) {
-  drawUiBase(irRemoteText[language]);
-  tftPrint(0, irClearLearnedRemoteText[language], 155, 82,
-           ActiveColor, ActiveColorSmooth, 28);
-
+static void drawClearChoices(bool restoreBackground) {
+  if (restoreBackground) restoreUiBand(122, 44);
   String choices;
   if (clearYes)
     choices = String(irNoText[language]) + "     > " + irYesText[language];
@@ -376,6 +489,13 @@ static void drawClear(void) {
            PrimaryColor, PrimaryColorSmooth, 28);
 }
 
+static void drawClear(void) {
+  drawUiBase(irRemoteText[language]);
+  tftPrint(0, irClearLearnedRemoteText[language], 155, 82,
+           ActiveColor, ActiveColorSmooth, 28);
+  drawClearChoices(false);
+}
+
 static String hex16(uint16_t value) {
   String s(value, HEX);
   s.toUpperCase();
@@ -383,20 +503,14 @@ static String hex16(uint16_t value) {
   return s;
 }
 
-static void drawTest(const IRData* data = nullptr) {
-  drawUiBase(irTestTitleText[language]);
-  if (!data) {
-    tftPrint(0, irPressRemoteKeyText[language], 155, 90,
-             ActiveColor, ActiveColorSmooth, 28);
-    tftPrint(0, irPhysicalOkExitsText[language], 155, 195,
-             SecondaryColor, SecondaryColorSmooth, 16);
-    return;
-  }
+static void drawTestData(const IrFrame* data, bool restoreBackground) {
+  if (!data) return;
+  if (restoreBackground) restoreUiBand(45, 136);
 
   const IrAction action = findAction(*data);
   tftPrint(-1,
            String(irProtocolText[language]) + ": " +
-               getProtocolString(data->protocol),
+               IrProtocolName(data->protocol),
            28, 55, PrimaryColor, PrimaryColorSmooth, 16);
   tftPrint(-1,
            String(irAddressText[language]) + ":  0x" +
@@ -415,10 +529,29 @@ static void drawTest(const IRData* data = nullptr) {
   tftPrint(-1,
            String(irRepeatText[language]) + ":   " +
                ((data->flags &
-                 (IRDATA_FLAGS_IS_REPEAT | IRDATA_FLAGS_IS_AUTO_REPEAT))
+                 (IR_FLAG_REPEAT | IR_FLAG_AUTO_REPEAT))
                     ? String(irYesText[language])
                     : String(irNoText[language])),
            28, 155, SecondaryColor, SecondaryColorSmooth, 16);
+}
+
+static void drawTestRepeatRow(bool repeat, bool restoreBackground) {
+  if (restoreBackground) restoreUiBand(147, 28);
+  tftPrint(-1,
+           String(irRepeatText[language]) + ":   " +
+               (repeat ? String(irYesText[language])
+                       : String(irNoText[language])),
+           28, 155, SecondaryColor, SecondaryColorSmooth, 16);
+}
+
+static void drawTest(const IrFrame* data = nullptr) {
+  drawUiBase(irTestTitleText[language]);
+  if (!data) {
+    tftPrint(0, irPressRemoteKeyText[language], 155, 90,
+             ActiveColor, ActiveColorSmooth, 28);
+  } else {
+    drawTestData(data, false);
+  }
   tftPrint(0, irPhysicalOkExitsText[language], 155, 200,
            SecondaryColor, SecondaryColorSmooth, 16);
 }
@@ -430,21 +563,59 @@ void IrRemoteBegin(void) {
     return;
   }
   if (!profileLoaded) loadProfile();
-  IrReceiver.begin(SI4684_INTB_PIN, false);
+
+  // The IR receive path is project-local: GPIO CHANGE ISR + ir_decode.cpp.
+  // No Arduino-IRremote begin/start/timer/global state exists anymore.
+  pinMode(SI4684_INTB_PIN, INPUT);
+  IrDecoderReset(decoderState);
+
+  noInterrupts();
+  edgeTransitionCount = 0U;
+  edgeGlitchCount = 0U;
+  edgeOverflowCount = 0U;
+  edgeCapturePaused = true;
+  edgeFrameActive = false;
+  edgeOverflow = false;
+  edgeDurationCount = 0U;
+  edgeInitialGapUs = 0U;
+  edgeLastEdgeUs = micros() - 100000UL;
+  interrupts();
+
+  attachInterrupt(digitalPinToInterrupt(SI4684_INTB_PIN), irEdgeCaptureIsr, CHANGE);
+  rearmEdgeCapture();
+
   receiverStarted = true;
   lastRuntimeAction = IR_ACTION_NONE;
   lastRuntimeFrameMs = 0;
-  Serial.printf("[IR] receiver started GPIO%u profile=%s\n",
-                SI4684_INTB_PIN, profileValid ? "learned" : "empty");
+  runtimePressStartMs = 0;
+  lastTestDataValid = false;
+  lastTestRepeatShown = false;
+  lastTestFrameMs = 0;
+  edgeFrameCount = 0U;
+  edgeDecodedCount = 0U;
+  edgeDiagTimerMs = millis();
+  edgeDiagLastTransitions = 0U;
+  Serial.printf("[IR] standalone edge receiver started GPIO%u profile=%s gap=%u us\n",
+                SI4684_INTB_PIN, profileValid ? "learned" : "empty",
+                static_cast<unsigned>(IR_FRAME_GAP_US));
 }
 
 void IrRemoteStop(void) {
   if (!receiverStarted) return;
-  IrReceiver.stop();
+  detachInterrupt(digitalPinToInterrupt(SI4684_INTB_PIN));
+  noInterrupts();
+  edgeCapturePaused = true;
+  edgeFrameActive = false;
+  interrupts();
+  // No external IR receive timer exists in standalone edge mode.
   receiverStarted = false;
   lastRuntimeAction = IR_ACTION_NONE;
   lastRuntimeFrameMs = 0;
-  Serial.println("[IR] receiver stopped");
+  runtimePressStartMs = 0;
+  lastTestDataValid = false;
+  lastTestRepeatShown = false;
+  lastTestFrameMs = 0;
+  Serial.println("[IR] edge receiver stopped");
 }
 
 bool IrRemoteHasProfile(void) {
@@ -471,22 +642,32 @@ void IrRemoteUiAbort(void) {
   learnWaitingRelease = false;
   learnLastFrameMs = 0;
   clearYes = false;
+  lastTestDataValid = false;
+  lastTestRepeatShown = false;
+  lastTestFrameMs = 0;
 }
 
 void IrRemoteUiRotate(int8_t direction) {
   if (uiState == UI_MENU) {
+    const uint8_t previous = uiSelection;
     if (direction > 0) uiSelection = (uiSelection + 1U) % 4U;
     else uiSelection = uiSelection == 0 ? 3 : uiSelection - 1;
-    drawMenu();
+    // Only the two affected rows are restored/redrawn. Repainting the complete
+    // 320x240 background on every encoder detent caused the visible flashing.
+    drawMenuRow(previous, true);
+    if (uiSelection != previous) drawMenuRow(uiSelection, true);
   } else if (uiState == UI_CLEAR_CONFIRM) {
     clearYes = !clearYes;
-    drawClear();
+    drawClearChoices(true);
   }
 }
 
 bool IrRemoteUiPress(void) {
   if (uiState == UI_LEARN || uiState == UI_TEST || uiState == UI_NOTICE) {
     uiState = UI_MENU;
+    lastTestDataValid = false;
+    lastTestRepeatShown = false;
+    lastTestFrameMs = 0;
     drawMenu();
     return false;
   }
@@ -540,6 +721,9 @@ bool IrRemoteUiPress(void) {
         return false;
       }
       uiState = UI_TEST;
+      lastTestDataValid = false;
+      lastTestRepeatShown = false;
+      lastTestFrameMs = 0;
       drawTest();
       return false;
 
@@ -552,6 +736,29 @@ bool IrRemoteUiPress(void) {
 void IrRemoteProcess(void) {
   if (!receiverStarted) return;
 
+  // Diagnostics are deliberately silent while GPIO12 is idle. If unexpected
+  // edge activity is starving the cooperative radio scheduler, the monitor
+  // will expose it without adding periodic UART traffic in the normal case.
+  const uint32_t diagNow = millis();
+  if (static_cast<uint32_t>(diagNow - edgeDiagTimerMs) >= 5000UL) {
+    edgeDiagTimerMs = diagNow;
+    const uint32_t transitions =
+        __atomic_load_n(&edgeTransitionCount, __ATOMIC_ACQUIRE);
+    if (transitions != edgeDiagLastTransitions) {
+      const uint32_t glitches =
+          __atomic_load_n(&edgeGlitchCount, __ATOMIC_ACQUIRE);
+      const uint32_t overflows =
+          __atomic_load_n(&edgeOverflowCount, __ATOMIC_ACQUIRE);
+      Serial.printf("[IR/EDGE] edges=%u frames=%u decoded=%u glitches=%u overflow=%u\n",
+                    static_cast<unsigned>(transitions),
+                    static_cast<unsigned>(edgeFrameCount),
+                    static_cast<unsigned>(edgeDecodedCount),
+                    static_cast<unsigned>(glitches),
+                    static_cast<unsigned>(overflows));
+      edgeDiagLastTransitions = transitions;
+    }
+  }
+
   // Between learning steps require a real release (a short quiet gap). This
   // prevents remotes that resend complete frames, not only explicit repeat
   // frames, from teaching one held key into multiple actions.
@@ -561,16 +768,25 @@ void IrRemoteProcess(void) {
     drawLearn();
   }
 
-  if (!IrReceiver.decode()) return;
+  uint16_t durationCount = 0U;
+  uint32_t initialGapUs = 0U;
+  bool overflow = false;
+  if (!takeEdgeFrame(durationCount, initialGapUs, overflow)) return;
+  ++edgeFrameCount;
 
-  const IRData data = IrReceiver.decodedIRData;
-  IrReceiver.resume();
+  IrFrame data{};
+  const bool decoded = !overflow &&
+      IrDecodeFrame(decodeDurationsUs, durationCount, initialGapUs,
+                    decoderState, data);
+  rearmEdgeCapture();
+  if (!decoded) return;
+  ++edgeDecodedCount;
 
-  if (data.flags & (IRDATA_FLAGS_WAS_OVERFLOW | IRDATA_FLAGS_PARITY_FAILED))
+  if (data.flags & (IR_FLAG_OVERFLOW | IR_FLAG_PARITY_FAILED))
     return;
 
   const bool repeat = data.flags &
-      (IRDATA_FLAGS_IS_REPEAT | IRDATA_FLAGS_IS_AUTO_REPEAT);
+      (IR_FLAG_REPEAT | IR_FLAG_AUTO_REPEAT);
   const uint32_t now = millis();
 
   if (uiState == UI_LEARN) {
@@ -588,8 +804,8 @@ void IrRemoteProcess(void) {
 
     learnWork[learnIndex] = fromFrame(data);
     Serial.printf("[IR/LEARN] %s protocol=%s address=0x%04X command=0x%04X bits=%u\n",
-                  kActionName[learnIndex], getProtocolString(data.protocol),
-                  data.address, data.command, data.numberOfBits);
+                  kActionName[learnIndex], IrProtocolName(data.protocol),
+                  data.address, data.command, data.bits);
     ++learnIndex;
     if (learnIndex >= EE_IR_KEY_COUNT) {
       saveProfile(learnWork);
@@ -605,7 +821,30 @@ void IrRemoteProcess(void) {
   }
 
   if (uiState == UI_TEST) {
-    drawTest(&data);
+    IrFrame displayData = data;
+    const bool shortUnknownFollowup =
+        data.protocol == IR_PROTO_UNKNOWN && lastTestDataValid &&
+        static_cast<uint32_t>(now - lastTestFrameMs) < IR_HELD_FRAME_GAP_MS;
+    if ((repeat || shortUnknownFollowup) && lastTestDataValid) {
+      // Protocol-specific repeat frames may not carry address/command and can
+      // fall through to HASH/IR_PROTO_UNKNOWN. Keep the previous key on screen. Only
+      // change the Repeat row once; repainting the whole data block for every
+      // held-key frame caused the Test view to flash continuously.
+      if (!lastTestRepeatShown) {
+        drawTestRepeatRow(true, true);
+        lastTestRepeatShown = true;
+      }
+      lastTestFrameMs = now;
+      return;
+    }
+
+    displayData.flags &= static_cast<uint8_t>(
+        ~(IR_FLAG_REPEAT | IR_FLAG_AUTO_REPEAT));
+    lastTestData = displayData;
+    lastTestDataValid = true;
+    lastTestRepeatShown = false;
+    lastTestFrameMs = now;
+    drawTestData(&displayData, true);
     return;
   }
 
@@ -614,25 +853,44 @@ void IrRemoteProcess(void) {
   IrAction action = IR_ACTION_NONE;
   bool heldFrame = false;
   if (repeat) {
-    action = lastRuntimeAction;
-    heldFrame = action != IR_ACTION_NONE;
+    // A repeat is valid only while it remains temporally attached to the last
+    // decoded key. A late/noisy repeat can therefore never resurrect an old
+    // action.
+    if (lastRuntimeAction != IR_ACTION_NONE &&
+        static_cast<uint32_t>(now - lastRuntimeFrameMs) < IR_HELD_FRAME_GAP_MS) {
+      action = lastRuntimeAction;
+      heldFrame = true;
+    }
   } else {
     action = findAction(data);
     heldFrame = action != IR_ACTION_NONE && action == lastRuntimeAction &&
-                now - lastRuntimeFrameMs < IR_HELD_FRAME_GAP_MS;
+                static_cast<uint32_t>(now - lastRuntimeFrameMs) <
+                    IR_HELD_FRAME_GAP_MS;
   }
 
   if (action == IR_ACTION_NONE) {
     lastRuntimeAction = IR_ACTION_NONE;
     lastRuntimeFrameMs = now;
+    runtimePressStartMs = 0;
     return;
   }
 
-  // Update the receive timestamp even for a suppressed one-shot held frame.
-  // Therefore a continuously held key can never retrigger every N ms.
+  if (!heldFrame) {
+    // First frame: execute once immediately, then require a deliberate hold
+    // before TUNE/VOL autorepeat is allowed to start.
+    lastRuntimeAction = action;
+    lastRuntimeFrameMs = now;
+    runtimePressStartMs = now;
+    dispatch(action, false);
+    return;
+  }
+
+  // Keep the held-key association alive even while repeats are deliberately
+  // suppressed during the initial delay.
   lastRuntimeAction = action;
   lastRuntimeFrameMs = now;
-  if (heldFrame && !actionRepeats(action)) return;
-
-  dispatch(action);
+  if (!actionRepeats(action)) return;
+  if (static_cast<uint32_t>(now - runtimePressStartMs) <
+      IR_REPEAT_INITIAL_DELAY_MS) return;
+  dispatch(action, true);
 }

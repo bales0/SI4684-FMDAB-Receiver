@@ -38,6 +38,9 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <EEPROM.h>
 #include <cstdlib>
 #include <Wire.h>
@@ -233,12 +236,15 @@ static void RestoreTftAfterSharedReset(const char* tag);
 void MarkEepromDirty(void);
 void FlushEeprom(void);
 void LogRamUsage(const char* tag);
+void LogMemoryIntegrity(const char* tag);
 void SlideshowReceptionState(bool active);
 void CaptureSettingsSnapshot(void);
 void ExitSettingsMenu(void);
 void CycleTuneMode(void);
 void RemoteModeAction(void);
 void RemoteVolumeStep(int8_t delta);
+void RemoteTuneAction(int8_t direction, bool repeat);
+static void RedrawVolumeOverlay(void);
 
 
 
@@ -496,6 +502,18 @@ void LogRamUsage(const char* tag) {
 
   Serial.printf("[RAM] %s slideshow single MOT buffer=%u bytes\n",
                 tag ? tag : "-", (unsigned)radio.slideshowCapacity());
+}
+
+void LogMemoryIntegrity(const char* tag) {
+  // heap_caps_check_integrity_all() validates every heap region and prints
+  // allocator diagnostics itself if corruption is detected. Stack HWM is
+  // logged in the native FreeRTOS units used by this ESP32 core.
+  const bool heapOk = heap_caps_check_integrity_all(true);
+  const UBaseType_t stackHwm = uxTaskGetStackHighWaterMark(nullptr);
+  Serial.printf("[MEMCHK] %s heap=%s free=%u min=%u maxblock=%u stackHWM=%u\n",
+                tag ? tag : "-", heapOk ? "OK" : "CORRUPT",
+                ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap(),
+                static_cast<unsigned>(stackHwm));
 }
 
 void MarkEepromDirty(void) {
@@ -903,6 +921,75 @@ void RemoteVolumeStep(int8_t delta) {
   ShowVolume();
 }
 
+// IR TUNE +/- shares the normal application controls, with two deliberate
+// remote-specific rules:
+//   - AUTO starts once on the first press; held-key repeats must not restart
+//     the already self-running seek/scan.
+//   - FM MAN uses the region channel spacing (fine tune) instead of rotary 1's
+//     deliberate 1 MHz coarse step, otherwise many stations are unreachable
+//     from a remote that has only one TUNE +/- pair.
+void RemoteTuneAction(int8_t direction, bool repeat) {
+  const bool up = direction > 0;
+
+  // In Settings / service list / slideshow / diagnostics keep exactly the same
+  // contextual behavior as the physical primary encoder.
+  if (menu || ChannelListView || SlideShowView || ShowServiceInformation) {
+    if (up) KeyUp(); else KeyDown();
+    return;
+  }
+
+  // AUTO seek is self-running. One IR press starts it; repeats from the held
+  // key are ignored until the key is released and pressed again.
+  if (repeat && tunemode == TUNE_AUTO) return;
+
+  // FM manual tuning needs the fine region spacing on IR. Do not call KeyUp2/
+  // KeyDown2 directly because rotary 2 has a separate volume-mode behavior.
+  if (radioMode == RADIO_MODE_FM && tunemode == TUNE_MAN) {
+    if (setvolume) closeVolume();
+    tottimer = millis();
+    rotary = 0;
+    rotary2 = 0;
+
+    const uint8_t spacing = fmRegionProfile(fmRegion).seekSpacing10kHz;
+    const int16_t step = up ? static_cast<int16_t>(spacing)
+                            : -static_cast<int16_t>(spacing);
+    fmfreq = stepFmFrequency(fmfreq, step, fmRegion);
+    tuning = true;
+    TuningTimer = millis();
+    radio.ServiceIndex = 0;
+    radio.ServiceStart = false;
+    memset(_serviceName, 0, sizeof(_serviceName));
+    ShowFreq();
+    Serial.printf("[FM/UI] IR MAN %s -> %c%u kHz, %.1f MHz\n",
+                  up ? "UP" : "DOWN", up ? '+' : '-',
+                  static_cast<unsigned>(spacing) * 10U,
+                  fmfreq / 100.0f);
+    return;
+  }
+
+  if (up) KeyUp(); else KeyDown();
+}
+
+// Repaint only the visual volume panel. Unlike ShowVolume(), this helper does
+// not touch the headphone amplifier and does not restart VolumeTimer. It is
+// used as the final compositing pass while the overlay is visible, just like
+// the slideshow-loading overlay is repainted after dynamic widgets below it.
+static void RedrawVolumeOverlay(void) {
+  uint8_t segments = map(volume, 0, 63, 0, 100);
+  if (segments > 100) segments = 100;
+
+  tft.pushImage(25, 46, 270, 50, volumebackground);
+  OneBigLineSprite.pushImage(0, 0, 270, 50, volumebackground);
+  OneBigLineSprite.fillRect(60, 9, 2 * segments, 9, BarInsignificantColor);
+  OneBigLineSprite.pushSprite(25, 46);
+
+  char value[5];
+  snprintf(value, sizeof(value), "%ld",
+           static_cast<long>(map(volume, 0, 62, 0, 100)));
+  tftPrintFixed(0, value, 190, 68,
+                ActiveColor, ActiveColorSmooth, 28);
+}
+
 
 // Edge-detect helper for buttons that have a single, immediate action.
 // Returns true exactly once per physical press; rearmed only after the
@@ -1012,11 +1099,9 @@ void setup(void) {
                 dabfreq, fmfreq, fmRegionProfile(fmRegion).menuName,
                 Gpio12ModeText[gpio12Mode], volume, CurrentTheme);
 
-  // IR tables live on the normal heap rather than linker-reserved .bss. In IR
-  // mode allocate both persistent tables once, early in boot, before the TFT
-  // and radio runtime can fragment the heap. They are never freed/reallocated.
-  if (gpio12Mode == GPIO12_IR && !IrRemotePrepare())
-    Serial.println("[BOOT] ERROR: IR persistent buffer allocation failed");
+  // Standalone IR uses fixed learned/work tables. Preparing IR no longer
+  // changes the heap allocation order between AUTO/POLL and GPIO12=IR boots.
+  if (gpio12Mode == GPIO12_IR) IrRemotePrepare();
 
   LoadPresets();
   Serial.printf("[BOOT] presets loaded; heap=%u\n", ESP.getFreeHeap());
@@ -1250,6 +1335,7 @@ void setup(void) {
   tottimer = millis();
   Serial.printf("[BOOT] SETUP COMPLETE free heap=%u min=%u\n",
                 ESP.getFreeHeap(), ESP.getMinFreeHeap());
+  LogMemoryIntegrity("setup-complete");
 }
 
 // Main cooperative scheduler. Three subsystems run every iteration:
@@ -1259,9 +1345,15 @@ void setup(void) {
 void loop(void) {
   ProcessDAB();
   Communication();
-  IrRemoteProcess();
   if (displayreset) ShowTuneModeCurrent();
   displayreset = false;
+
+  static uint32_t memoryIntegrityTimer = 0;
+  const uint32_t memoryIntegrityNow = millis();
+  if (memoryIntegrityNow - memoryIntegrityTimer >= 2000UL) {
+    memoryIntegrityTimer = memoryIntegrityNow;
+    LogMemoryIntegrity("runtime");
+  }
 
   if (eepromDirty && millis() - EepromDirtyTimer >= EEPROM_COMMIT_DELAY_MS) FlushEeprom();
   if (radioSwitchMuted && (!radio.isTunePending() || millis() - RadioSwitchMuteTimer >= 4000UL)) {
@@ -1323,6 +1415,14 @@ void loop(void) {
   if (!menu) StandbyButtonPress();                                              // self-checks pin (long-press)
   if (buttonEdge(ROTARY_BUTTON, rotArmed)) ButtonPress();
   if (!menu && buttonEdge(ROTARY_BUTTON2, rot2Armed)) Button2Press();
+
+  // IR is an input source just like the encoders/buttons. Process it after
+  // displayreset has been consumed for this frame, so an IR action that calls
+  // BuildDisplay() leaves displayreset=true for the NEXT ProcessDAB() pass.
+  // This makes return-from-list/slideshow redraw semantics identical to the
+  // mechanical controls. Learn/Test still intercept IR frames inside
+  // IrRemoteProcess() before normal action dispatch.
+  IrRemoteProcess();
 }
 
 // Pump the radio driver and refresh the on-screen indicators. Skipped while
@@ -1457,6 +1557,21 @@ void ProcessDAB(void) {
       slsWaitingView = false;
       LogRamUsage("after slideshow display");
     }
+  }
+
+  // Volume is a compact modal overlay drawn over live radio widgets. Let all
+  // normal widgets update first, then composite the volume panel back on top
+  // at the same 10 Hz cadence as the signal UI. Do not call ShowVolume() here:
+  // it would reset the 3-second close timer on every repaint.
+  static uint32_t volumeOverlayRefreshMs = 0;
+  if (setvolume && !menu) {
+    const uint32_t now = millis();
+    if (static_cast<uint32_t>(now - volumeOverlayRefreshMs) >= 100UL) {
+      volumeOverlayRefreshMs = now;
+      RedrawVolumeOverlay();
+    }
+  } else {
+    volumeOverlayRefreshMs = 0;
   }
 }
 
@@ -1894,7 +2009,14 @@ void KeyUp(void) {
         case TUNE_AUTO:
           radio.ServiceIndex = 0;
           radio.ServiceStart = false;
-          if (radioMode == RADIO_MODE_DAB) radio.clearData();
+          if (radioMode == RADIO_MODE_DAB) {
+            radio.clearData();
+            // Do not let the previous service label survive a new AUTO scan.
+            // Keep trysetservice untouched: it is the independent startup/MEM
+            // restore mechanism and may act later only after real service data
+            // has been received for a matching ensemble.
+            memset(_serviceName, 0, sizeof(_serviceName));
+          }
           direction = true;
           seek = true;
           break;
@@ -1992,7 +2114,12 @@ void KeyDown(void) {
         case TUNE_AUTO:
           radio.ServiceIndex = 0;
           radio.ServiceStart = false;
-          if (radioMode == RADIO_MODE_DAB) radio.clearData();
+          if (radioMode == RADIO_MODE_DAB) {
+            radio.clearData();
+            // Mirror KeyUp(): clear only the stale visible label. The pending
+            // service-restore state itself is not an AUTO-tune policy flag.
+            memset(_serviceName, 0, sizeof(_serviceName));
+          }
           direction = false;
           seek = true;
           break;
