@@ -1,7 +1,7 @@
 # Name      ,Type ,SubType ,Offset   ,Size
 # Single application image. Slideshow data is RAM-only, so the former 1 MiB
 # filesystem partition is assigned to the app to hold both supplied firmwares.
-# NVS uses all free pages up to the fixed app offset for additional wear-leveling
-# headroom; the app still starts at 0x10000 and keeps its full 0x3F0000 size.
-nvs         ,data ,nvs     ,0x9000   ,0x7000
+# Keep NVS below 0xE000: Arduino/PlatformIO writes boot_app0.bin at 0xE000
+# during upload. Extending NVS into 0xE000..0xFFFF corrupts EEPROM/NVS on programming.
+nvs         ,data ,nvs     ,0x9000   ,0x5000
 app         ,app  ,factory ,0x10000  ,0x3F0000

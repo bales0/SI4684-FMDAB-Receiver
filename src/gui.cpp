@@ -1271,8 +1271,13 @@ void ShowSID(void) {
     if (!tuning && fmPtyValid && radio.fmPty > 0 && radio.fmPty <= 31)
       snprintf(value, sizeof(value), "%u", static_cast<unsigned>(radio.fmPty));
   } else {
-    if (!radio.ServiceStart) radio.SID[0] = '\0';
-    snprintf(value, sizeof(value), "%s", radio.SID);
+    // Service start is asynchronous. During the short interval before
+    // START_DIGITAL_SERVICE completes, hide SID in the UI without modifying
+    // the driver's SID buffer. Clearing radio.SID here used to destroy the
+    // value prepared by setService(), so it never reappeared after ServiceStart
+    // became true.
+    if (radio.ServiceStart)
+      snprintf(value, sizeof(value), "%s", radio.SID);
   }
 
   if (strcmp(value, SIDold) != 0 || displayreset) {
