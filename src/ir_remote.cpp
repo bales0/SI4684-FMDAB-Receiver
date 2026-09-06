@@ -18,7 +18,7 @@ extern void RemoteModeAction(void);
 extern void RemoteVolumeStep(int8_t delta);
 extern void RemoteTuneAction(int8_t direction, bool repeat);
 extern void MarkEepromDirty(void);
-extern void FlushEeprom(void);
+extern bool FlushEeprom(void);
 
 enum IrAction : uint8_t {
   IR_ACTION_TUNE_UP = 0,
@@ -84,6 +84,10 @@ static uint32_t edgeFrameCount = 0U;
 static uint32_t edgeDecodedCount = 0U;
 static uint32_t edgeDiagTimerMs = 0U;
 static uint32_t edgeDiagLastTransitions = 0U;
+static uint32_t standbySuppressUntilMs = 0U;
+static volatile bool edgeWakeSeedPending = false;
+static volatile bool edgeWakeFirstMarkReady = false;
+static volatile uint16_t edgeWakeFirstMarkUs = 0U;
 
 // Test view keeps the last complete frame so a protocol-specific short repeat
 // frame can be displayed as a repeat of that key instead of as IR_PROTO_UNKNOWN.
@@ -150,8 +154,16 @@ static void IRAM_ATTR irEdgeCaptureIsr(void) {
   }
 
   if (edgeDurationCount < IR_RAW_BUFFER_LENGTH) {
-    edgeDurationsUs[edgeDurationCount++] =
+    const uint16_t storedDuration =
         static_cast<uint16_t>(durationUs > 0xFFFFU ? 0xFFFFU : durationUs);
+    edgeDurationsUs[edgeDurationCount++] = storedDuration;
+    if (edgeWakeSeedPending) {
+      // First rising edge after a light-sleep wake: this is the remaining
+      // duration of the MARK that woke the CPU. Log later from foreground.
+      edgeWakeFirstMarkUs = storedDuration;
+      edgeWakeFirstMarkReady = true;
+      edgeWakeSeedPending = false;
+    }
   } else {
     if (!edgeOverflow) ++edgeOverflowCount;
     edgeOverflow = true;
@@ -202,6 +214,24 @@ static bool takeEdgeFrame(uint16_t& durationCount,
 
   for (uint16_t i = 0; i < durationCount; ++i)
     decodeDurationsUs[i] = edgeDurationsUs[i];
+  return true;
+}
+
+static bool takeDecodedFrame(IrFrame& data) {
+  uint16_t durationCount = 0U;
+  uint32_t initialGapUs = 0U;
+  bool overflow = false;
+  if (!takeEdgeFrame(durationCount, initialGapUs, overflow)) return false;
+  ++edgeFrameCount;
+
+  const bool decoded = !overflow &&
+      IrDecodeFrame(decodeDurationsUs, durationCount, initialGapUs,
+                    decoderState, data);
+  rearmEdgeCapture();
+  if (!decoded) return false;
+  ++edgeDecodedCount;
+
+  if (data.flags & (IR_FLAG_OVERFLOW | IR_FLAG_PARITY_FAILED)) return false;
   return true;
 }
 
@@ -331,8 +361,10 @@ static void saveProfile(const LearnedCode* codes) {
   memcpy(learned, codes, IR_CODE_TABLE_BYTES);
   profileValid = true;
   MarkEepromDirty();
-  FlushEeprom();
-  Serial.println("[IR] learned profile saved");
+  if (FlushEeprom())
+    Serial.println("[IR] learned profile saved");
+  else
+    Serial.println("[IR] ERROR: learned profile commit failed");
 }
 
 static void clearProfile(void) {
@@ -348,8 +380,10 @@ static void clearProfile(void) {
   lastRuntimeFrameMs = 0;
   runtimePressStartMs = 0;
   MarkEepromDirty();
-  FlushEeprom();
-  Serial.println("[IR] learned profile cleared");
+  if (FlushEeprom())
+    Serial.println("[IR] learned profile cleared");
+  else
+    Serial.println("[IR] ERROR: learned profile clear commit failed");
 }
 
 static LearnedCode fromFrame(const IrFrame& data) {
@@ -398,7 +432,19 @@ static void dispatch(IrAction action, bool repeat) {
     case IR_ACTION_VOL_DOWN:   if (!menu) RemoteVolumeStep(-2); break;
     case IR_ACTION_MODE:       RemoteModeAction(); break;
     case IR_ACTION_SLIDESHOW:  if (!menu) SlideShowButtonPress(); break;
-    case IR_ACTION_STANDBY:    if (!menu) doStandby(); break;
+    case IR_ACTION_STANDBY:
+      if (!menu) {
+        const uint32_t now = millis();
+        if (static_cast<int32_t>(now - standbySuppressUntilMs) < 0) {
+          // An IR frame that woke the CPU must not immediately put the radio
+          // back to sleep. Non-repeat STANDBY is ignored only during this short
+          // post-wake window; normal runtime operation is unchanged afterwards.
+          Serial.println("[IR/SLEEP] wake STANDBY frame suppressed");
+        } else {
+          doStandby();
+        }
+      }
+      break;
     default: break;
   }
 }
@@ -441,10 +487,12 @@ static void drawMenuRow(uint8_t index, bool restoreBackground) {
 static void drawMenu(void) {
   drawUiBase(irRemoteText[language]);
   for (uint8_t i = 0; i < 4; ++i) drawMenuRow(i, false);
+  // Keep learned/empty state inside the same bottom information row used by
+  // the parent Settings screen. y=204 placed the text visibly above that band.
   tftPrint(0,
            profileValid ? irProfileLearnedText[language]
                         : irProfileEmptyText[language],
-           155, 204, SecondaryColor, SecondaryColorSmooth, 16);
+           155, 222, SecondaryColor, SecondaryColorSmooth, 16);
 }
 
 static void drawNeedIr(void) {
@@ -606,6 +654,8 @@ void IrRemoteStop(void) {
   noInterrupts();
   edgeCapturePaused = true;
   edgeFrameActive = false;
+  edgeWakeSeedPending = false;
+  edgeWakeFirstMarkReady = false;
   interrupts();
   // No external IR receive timer exists in standalone edge mode.
   receiverStarted = false;
@@ -616,6 +666,83 @@ void IrRemoteStop(void) {
   lastTestRepeatShown = false;
   lastTestFrameMs = 0;
   Serial.println("[IR] edge receiver stopped");
+}
+
+void IrRemoteResumeAfterLightSleep(bool seedActiveLowPulse) {
+  // Reinstall the project's normal CHANGE edge receiver after GPIO12 was used
+  // temporarily as a LOW-level light-sleep wake source.
+  IrRemoteBegin();
+  standbySuppressUntilMs = millis() + 1000UL;
+
+  if (!receiverStarted || !seedActiveLowPulse ||
+      digitalRead(SI4684_INTB_PIN) != LOW) {
+    Serial.printf("[IR/SLEEP] edge receiver resumed seed=%u level=%c\n",
+                  seedActiveLowPulse ? 1U : 0U,
+                  digitalRead(SI4684_INTB_PIN) == HIGH ? 'H' : 'L');
+    return;
+  }
+
+  // The wake-causing falling edge occurred while the CPU was asleep and could
+  // not run irEdgeCaptureIsr(). Start an in-progress frame now so the following
+  // rising edge measures the REMAINING part of that first MARK. For long-leader
+  // protocols this is often still within decoder tolerance. A deliberately
+  // long initial gap prevents the first full wake frame being tagged as repeat.
+  noInterrupts();
+  edgeCapturePaused = false;
+  edgeFrameActive = true;
+  edgeOverflow = false;
+  edgeDurationCount = 0U;
+  edgeInitialGapUs = 100000UL;
+  edgeLastEdgeUs = micros();
+  edgeWakeSeedPending = true;
+  edgeWakeFirstMarkReady = false;
+  edgeWakeFirstMarkUs = 0U;
+  interrupts();
+
+  Serial.println("[IR/SLEEP] wake LOW seeded as partial first MARK");
+}
+
+bool IrRemoteQualifyStandbyWake(uint32_t timeoutMs) {
+  if (!receiverStarted || !profileValid) return false;
+
+  const uint32_t started = millis();
+  while (static_cast<uint32_t>(millis() - started) < timeoutMs) {
+    IrFrame data{};
+    if (!takeDecodedFrame(data)) {
+      delay(1);
+      continue;
+    }
+
+    const bool repeat =
+        (data.flags & (IR_FLAG_REPEAT | IR_FLAG_AUTO_REPEAT)) != 0U;
+    const IrAction action = findAction(data);
+    Serial.printf("[IR/SLEEP] qualify protocol=%s action=%s repeat=%u elapsed=%lu ms\n",
+                  IrProtocolName(data.protocol),
+                  action == IR_ACTION_NONE ? "NONE" : kActionName[action],
+                  repeat ? 1U : 0U,
+                  static_cast<unsigned long>(millis() - started));
+
+    // Accept only the learned STANDBY action. The decoder state was reset when
+    // the edge receiver resumed, so a protocol repeat can map to STANDBY only
+    // after a real STANDBY frame in this same qualification window established
+    // its address/command. A stale pre-sleep repeat can therefore not qualify.
+    if (action == IR_ACTION_STANDBY) {
+      lastRuntimeAction = IR_ACTION_NONE;
+      lastRuntimeFrameMs = millis();
+      runtimePressStartMs = 0U;
+      standbySuppressUntilMs = millis() + 1000UL;
+      Serial.println("[IR/SLEEP] learned STANDBY wake accepted");
+      return true;
+    }
+  }
+
+  // Do not let a rejected wake candidate influence normal runtime repeat
+  // association if/when a later wake is accepted.
+  lastRuntimeAction = IR_ACTION_NONE;
+  lastRuntimeFrameMs = millis();
+  runtimePressStartMs = 0U;
+  Serial.println("[IR/SLEEP] wake rejected: learned STANDBY not confirmed");
+  return false;
 }
 
 bool IrRemoteHasProfile(void) {
@@ -736,6 +863,13 @@ bool IrRemoteUiPress(void) {
 void IrRemoteProcess(void) {
   if (!receiverStarted) return;
 
+  if (__atomic_exchange_n(&edgeWakeFirstMarkReady, false, __ATOMIC_ACQ_REL)) {
+    const uint16_t firstMark =
+        __atomic_load_n(&edgeWakeFirstMarkUs, __ATOMIC_ACQUIRE);
+    Serial.printf("[IR/SLEEP] residual first MARK=%u us (wake+resume time was already elapsed)\n",
+                  static_cast<unsigned>(firstMark));
+  }
+
   // Diagnostics are deliberately silent while GPIO12 is idle. If unexpected
   // edge activity is starving the cooperative radio scheduler, the monitor
   // will expose it without adding periodic UART traffic in the normal case.
@@ -768,22 +902,8 @@ void IrRemoteProcess(void) {
     drawLearn();
   }
 
-  uint16_t durationCount = 0U;
-  uint32_t initialGapUs = 0U;
-  bool overflow = false;
-  if (!takeEdgeFrame(durationCount, initialGapUs, overflow)) return;
-  ++edgeFrameCount;
-
   IrFrame data{};
-  const bool decoded = !overflow &&
-      IrDecodeFrame(decodeDurationsUs, durationCount, initialGapUs,
-                    decoderState, data);
-  rearmEdgeCapture();
-  if (!decoded) return;
-  ++edgeDecodedCount;
-
-  if (data.flags & (IR_FLAG_OVERFLOW | IR_FLAG_PARITY_FAILED))
-    return;
+  if (!takeDecodedFrame(data)) return;
 
   const bool repeat = data.flags &
       (IR_FLAG_REPEAT | IR_FLAG_AUTO_REPEAT);

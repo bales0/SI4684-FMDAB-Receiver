@@ -177,6 +177,10 @@ class DAB {
     const char* controlModeName(void) const;
     const char* intbHardwareName(void) const;
     bool isTunePending(void) const { return tunePending; }
+    // True only after a complete, structurally valid DAB service-list reply
+    // has been parsed for the currently tuned ensemble. This lets the UI make
+    // one-shot restore decisions without guessing from numberofservices.
+    bool isDabServiceListReady(void) const { return !isFm() && dabServiceListReady; }
     const uint8_t* slideshowData(void) const { return slideshowSegBuf; }
     uint32_t slideshowSize(void) const { return SlideShowAvailable ? slideshowRamSize : 0; }
     size_t slideshowCapacity(void) const { return SLS_BUFFER_BYTES; }
@@ -269,6 +273,7 @@ class DAB {
     uint32_t dabCommandComponentId = 0;
     bool dabServiceRequestPending = false;
     bool dabActiveServiceValid = false;
+    bool dabServiceListReady = false;
 
     bool dabSignalRefreshPending = false;
     bool dabServiceListRefreshPending = false;

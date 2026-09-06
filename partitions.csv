@@ -1,5 +1,7 @@
 # Name      ,Type ,SubType ,Offset   ,Size
 # Single application image. Slideshow data is RAM-only, so the former 1 MiB
 # filesystem partition is assigned to the app to hold both supplied firmwares.
-nvs         ,data ,nvs     ,0x9000   ,0x4000
+# NVS uses all free pages up to the fixed app offset for additional wear-leveling
+# headroom; the app still starts at 0x10000 and keeps its full 0x3F0000 size.
+nvs         ,data ,nvs     ,0x9000   ,0x7000
 app         ,app  ,factory ,0x10000  ,0x3F0000

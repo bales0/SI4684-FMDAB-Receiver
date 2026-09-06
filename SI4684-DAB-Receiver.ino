@@ -38,6 +38,9 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "esp_system.h"
+#include "esp_sleep.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -75,6 +78,7 @@ bool SlideShowAvailableOld;
 bool SlideShowView;
 bool store;
 bool trysetservice;
+uint8_t trysetserviceFreq = 0xFF;
 bool tuned;
 bool tuning;
 bool eepromDirty;
@@ -207,14 +211,14 @@ DABMemory memory[EE_PRESETS_CNT];
 FmMemory* fmMemory = nullptr;
 
 // Forward declarations
-void DefaultSettings(void);
+bool DefaultSettings(void);
 void read_encoder(void);
 void read_encoder2(void);
 void DoMemoryPosTune(void);
 void ProcessDAB(void);
 void Seek(bool mode);
 void deepSleep(void);
-void StoreFrequency(void);
+bool StoreFrequency(void);
 void closeVolume(void);
 void KeyUp(void);
 void KeyDown(void);
@@ -228,13 +232,15 @@ void ButtonPress(void);
 void Button2Press(void);
 void doRecovery(void);
 void doStandby(void);
+bool ActivateCurrentService(void);
 void DABSelectService(bool dir);
 bool IsStationEmpty(void);
 void LoadPresets(void);
 bool SwitchRadioMode(RadioMode newMode, bool force = false);
 static void RestoreTftAfterSharedReset(const char* tag);
+static void RestoreTftControllerNoReset(const char* tag, bool reinitDma);
 void MarkEepromDirty(void);
-void FlushEeprom(void);
+bool FlushEeprom(void);
 void LogRamUsage(const char* tag);
 void LogMemoryIntegrity(const char* tag);
 void SlideshowReceptionState(bool active);
@@ -245,7 +251,8 @@ void RemoteModeAction(void);
 void RemoteVolumeStep(int8_t delta);
 void RemoteTuneAction(int8_t direction, bool repeat);
 static void RedrawVolumeOverlay(void);
-
+static bool WaitPinHighStable(uint8_t pin, uint32_t stableMs, uint32_t timeoutMs);
+static void EnterLightSleep(bool showStandbyScreen);
 
 
 static bool slsReceiving = false;
@@ -254,6 +261,8 @@ static bool slsDisplayedFingerprintValid = false;
 static uint32_t slsDisplayedHash = 0;
 static uint32_t slsDisplayedSize = 0;
 static uint32_t slsWaitingOverlayRssiStamp = 0;
+static uint32_t volumeOverlayRssiStamp = 0;
+static bool standbyWakeReleaseGuard = false;
 static bool slsReceiveIndicatorDrawn = false;
 
 // MOT receive progress is intentionally heap-free. The UI keeps only a few
@@ -521,10 +530,24 @@ void MarkEepromDirty(void) {
   EepromDirtyTimer = millis();
 }
 
-void FlushEeprom(void) {
-  if (!eepromDirty) return;
-  EEPROM.commit();
-  eepromDirty = false;
+static bool CommitEepromNow(const char* reason) {
+  if (EEPROM.commit()) {
+    eepromDirty = false;
+    return true;
+  }
+
+  // Keep the dirty flag set so the periodic 3-second path can retry. Critical
+  // callers (restart/standby/IR learn) also receive the failure immediately.
+  eepromDirty = true;
+  EepromDirtyTimer = millis();
+  Serial.printf("[EEPROM] ERROR: commit failed (%s); dirty retained\n",
+                reason ? reason : "unspecified");
+  return false;
+}
+
+bool FlushEeprom(void) {
+  if (!eepromDirty) return true;
+  return CommitEepromNow("flush");
 }
 
 static void ClearIrProfileStorage(void) {
@@ -544,7 +567,7 @@ static void WriteEmptyFmPresetsV4(void) {
   }
 }
 
-static void MigrateSchema2ToCurrent(void) {
+static bool MigrateSchema2ToCurrent(void) {
   Serial.println("[EEPROM] migrate schema 2 -> 5");
   // Schema 2 has no FM records. Preserve every DAB byte and initialise only
   // the newly allocated FM settings/tail.
@@ -555,11 +578,10 @@ static void MigrateSchema2ToCurrent(void) {
   WriteEmptyFmPresetsV4();
   ClearIrProfileStorage();
   EEPROM.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
-  EEPROM.commit();
-  eepromDirty = false;
+  return CommitEepromNow("schema 2 -> 5");
 }
 
-static void MigrateSchema3ToCurrent(void) {
+static bool MigrateSchema3ToCurrent(void) {
   struct LegacyFmPreset {
     uint8_t frequencyIndex;
     uint32_t pi;
@@ -600,20 +622,19 @@ static void MigrateSchema3ToCurrent(void) {
   EEPROM.writeByte(EE_BYTE_GPIO12_MODE, GPIO12_AUTO);
   ClearIrProfileStorage();
   EEPROM.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
-  EEPROM.commit();
-  eepromDirty = false;
+  const bool committed = CommitEepromNow("schema 3 -> 5");
   Serial.printf("[EEPROM] migrated %u FM presets\n", migrated);
+  return committed;
 }
 
-static void MigrateSchema4ToCurrent(void) {
+static bool MigrateSchema4ToCurrent(void) {
   Serial.println("[EEPROM] migrate schema 4 -> 5 (GPIO12/IR metadata only)");
   // Schema 4 already has the final DAB/FM layout. Preserve every existing
   // setting and preset; initialize only bytes that were reserved in schema 4.
   EEPROM.writeByte(EE_BYTE_GPIO12_MODE, GPIO12_AUTO);
   ClearIrProfileStorage();
   EEPROM.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
-  EEPROM.commit();
-  eepromDirty = false;
+  return CommitEepromNow("schema 4 -> 5");
 }
 
 // DAB records keep their original byte-for-byte schema. FM records are loaded
@@ -662,27 +683,70 @@ void LoadPresets(void) {
   }
 }
 
-static void RestoreTftAfterSharedReset(const char* tag) {
-  Serial.printf("[%s] TFT full restore after shared reset begin\n", tag);
+static bool TftControllerRegistersAlive(const char* tag) {
+  // ILI9341 register reads are available because this PCB wires TFT MISO.
+  // RDMODE (0x0A) and RDPIXFMT (0x0C) should never both be 0x00/0xFF on a
+  // correctly initialised controller. Do not require exact clone-specific
+  // values; use the read only to detect an obviously missing controller.
+  const uint8_t mode = tft.readcommand8(0x0A);
+  const uint8_t pixelFormat = tft.readcommand8(0x0C);
+  const bool deadZero = mode == 0x00U && pixelFormat == 0x00U;
+  const bool deadHigh = mode == 0xFFU && pixelFormat == 0xFFU;
+  const bool alive = !deadZero && !deadHigh;
+  Serial.printf("[%s/TFT] RDMODE=0x%02X RDPIXFMT=0x%02X alive=%u\n",
+                tag ? tag : "TFT", mode, pixelFormat, alive ? 1U : 0U);
+  return alive;
+}
 
-  // GPIO17 is shared with the SI4684 RSTB pin. Earlier hardware testing showed
-  // that TFT_eSPI::init() itself does not reset the tuner, so it is safe to
-  // reinitialise the TFT immediately after releasing the shared reset.
+static void RestoreTftControllerNoReset(const char* tag, bool reinitDma) {
+  // Never expose a half-initialised/white panel. GPIO17 is shared with the
+  // SI4684, so this recovery deliberately does NOT pulse hardware RESET.
+  // TFT_RST=-1 makes tft.init() issue the complete controller init sequence
+  // without touching GPIO17 or disturbing the already-running radio.
+  analogWrite(CONTRASTPIN, 0);
   pinMode(17, OUTPUT);
   digitalWrite(17, HIGH);
+  digitalWrite(15, HIGH);  // keep SI4684 CS inactive during TFT traffic
+
+  Serial.printf("[%s/TFT] full controller init begin dma=%u\n",
+                tag ? tag : "TFT", reinitDma ? 1U : 0U);
 
   tft.init();
-  Serial.printf("[%s] TFT init OK\n", tag);
-  tft.initDMA();
-  Serial.printf("[%s] TFT DMA OK\n", tag);
-  doTheme();
-  tft.setSwapBytes(true);
+  delay(20);
   tft.setRotation(displayflip == 0 ? 3 : 1);
-  loadFonts(true);
-  tft.fillScreen(BackgroundColor);
+  tft.setSwapBytes(true);
+  if (reinitDma) tft.initDMA();
+  doTheme();
 
-  // The caller redraws the transition overlay before restoring brightness.
-  analogWrite(CONTRASTPIN, 0);
+  // A cold power-up or a marginal wake can very rarely leave the TFT white
+  // while the ESP32/radio continue running. When register reads show an
+  // obviously absent controller, retry the complete software init once. This
+  // still never toggles the shared GPIO17 reset line.
+  if (!TftControllerRegistersAlive(tag)) {
+    Serial.printf("[%s/TFT] controller check failed; retry after 120 ms\n",
+                  tag ? tag : "TFT");
+    delay(120);
+    digitalWrite(15, HIGH);
+    tft.init();
+    delay(20);
+    tft.setRotation(displayflip == 0 ? 3 : 1);
+    tft.setSwapBytes(true);
+    doTheme();
+    TftControllerRegistersAlive(tag);
+  }
+
+  tft.fillScreen(BackgroundColor);
+  Serial.printf("[%s/TFT] full controller init complete; backlight OFF\n",
+                tag ? tag : "TFT");
+}
+
+static void RestoreTftAfterSharedReset(const char* tag) {
+  Serial.printf("[%s] TFT full restore after shared reset begin\n", tag);
+  RestoreTftControllerNoReset(tag, true);
+  // Sprite smooth-font state lives in ESP32 RAM, but the mode-switch path has
+  // historically reloaded it after a shared hardware reset. Keep that proven
+  // behaviour here; light-sleep wake does not need to reload sprite fonts.
+  loadFonts(true);
   delay(20);
   Serial.printf("[%s] TFT full restore complete; backlight still OFF\n", tag);
 }
@@ -766,6 +830,7 @@ bool SwitchRadioMode(RadioMode newMode, bool force) {
   fmSeekStarted = false;
   tuning = false;
   trysetservice = false;
+  trysetserviceFreq = 0xFF;
   SlideShowView = false;
   if (radioMode == RADIO_MODE_FM) {
     fmfreq = normalizeFmFrequency(fmfreq, fmRegion);
@@ -779,7 +844,9 @@ bool SwitchRadioMode(RadioMode newMode, bool force) {
   } else {
     radio.setFreq(dabfreq);
     EEPROM.get(EE_UINT32_SERVICEID, _serviceID);
+    memset(_serviceName, 0, sizeof(_serviceName));
     trysetservice = _serviceID != 0;
+    trysetserviceFreq = trysetservice ? dabfreq : 0xFF;
   }
   BuildDisplay();
   Serial.printf("[RADIO/BOOT] total mode switch=%u ms mode=%s control=%s\n",
@@ -858,7 +925,13 @@ void ExitSettingsMenu(void) {
   settingsSnapshotValid = false;
 
   if (gpio12Changed) {
-    FlushEeprom();
+    if (!FlushEeprom()) {
+      Serial.println("[EEPROM] GPIO12 setting not committed; restart cancelled");
+      ShowStatusOverlay("EEPROM ERROR");
+      delay(1200);
+      BuildDisplay();
+      return;
+    }
     ShowStatusOverlay(restartingText[language]);
     delay(250);
     // Match the FM/DAB transition behaviour: hide the TFT reset/boot interval
@@ -919,6 +992,7 @@ void RemoteVolumeStep(int8_t delta) {
     MarkEepromDirty();
   }
   ShowVolume();
+  volumeOverlayRssiStamp = rssiTimer;
 }
 
 // IR TUNE +/- shares the normal application controls, with two deliberate
@@ -978,8 +1052,16 @@ static void RedrawVolumeOverlay(void) {
   uint8_t segments = map(volume, 0, 63, 0, 100);
   if (segments > 100) segments = 100;
 
+  // Restore the COMPLETE original 270x50 artwork first. OneBigLineSprite is
+  // intentionally only 270x30, so it must never be used as the sole backing
+  // store for this 50-pixel-high overlay: doing that left the lower 20 pixels
+  // as a flat rectangle and visibly cut through the loudspeaker artwork.
   tft.pushImage(25, 46, 270, 50, volumebackground);
-  OneBigLineSprite.pushImage(0, 0, 270, 50, volumebackground);
+
+  // Only the upper 30 pixels need a sprite because the moving volume bar lives
+  // there. Limit pushImage to the actual sprite height instead of relying on
+  // clipping a 270x50 source into a 270x30 sprite.
+  OneBigLineSprite.pushImage(0, 0, 270, 30, volumebackground);
   OneBigLineSprite.fillRect(60, 9, 2 * segments, 9, BarInsignificantColor);
   OneBigLineSprite.pushSprite(25, 46);
 
@@ -988,6 +1070,13 @@ static void RedrawVolumeOverlay(void) {
            static_cast<long>(map(volume, 0, 62, 0, 100)));
   tftPrintFixed(0, value, 190, 68,
                 ActiveColor, ActiveColorSmooth, 28);
+
+  // Match the slideshow-loading visual treatment: draw the crisp theme frame
+  // after every content redraw so no dynamic widget can weaken its edge.
+  tft.drawRoundRect(25, 46, 270, 50, 8, ActiveColor);
+
+  // Remember which 10 Hz signal-meter frame is covered by this composition.
+  volumeOverlayRssiStamp = rssiTimer;
 }
 
 
@@ -1051,17 +1140,26 @@ void setup(void) {
   // EEPROM check byte acts as a schema version. Known schemas are migrated
   // without changing the DAB layout; only unknown/corrupt values use defaults.
   Serial.println("[BOOT] EEPROM.begin");
-  EEPROM.begin(EE_TOTAL_CNT);
+  if (!EEPROM.begin(EE_TOTAL_CNT)) {
+    Serial.printf("[BOOT] FATAL: EEPROM.begin(%u) failed\n",
+                  static_cast<unsigned>(EE_TOTAL_CNT));
+    while (true) delay(1000);
+  }
   const uint8_t storedSchema = EEPROM.readByte(EE_BYTE_CHECKBYTE);
   Serial.printf("[BOOT] EEPROM OK schema=%u\n", storedSchema);
+  bool schemaCommitOk = true;
   if (storedSchema == EE_CHECKBYTE_DAB_ONLY) {
-    MigrateSchema2ToCurrent();
+    schemaCommitOk = MigrateSchema2ToCurrent();
   } else if (storedSchema == EE_CHECKBYTE_FM_INDEXED) {
-    MigrateSchema3ToCurrent();
+    schemaCommitOk = MigrateSchema3ToCurrent();
   } else if (storedSchema == EE_CHECKBYTE_FM_ABSOLUTE) {
-    MigrateSchema4ToCurrent();
+    schemaCommitOk = MigrateSchema4ToCurrent();
   } else if (storedSchema != EE_CHECKBYTE_VALUE) {
-    DefaultSettings();
+    schemaCommitOk = DefaultSettings();
+  }
+  if (!schemaCommitOk) {
+    Serial.println("[BOOT] FATAL: EEPROM schema/default commit failed");
+    while (true) delay(1000);
   }
   ContrastSet = EEPROM.readByte(EE_BYTE_CONTRASTSET);
   language = EEPROM.readByte(EE_BYTE_LANGUAGE);
@@ -1106,6 +1204,16 @@ void setup(void) {
   LoadPresets();
   Serial.printf("[BOOT] presets loaded; heap=%u\n", ESP.getFreeHeap());
   LogRamUsage("after settings/presets");
+
+  // Reserve the single shared PNG/JPEG decoder arena while the internal heap
+  // is still contiguous. In previous builds this was attempted only after the
+  // TFT sprites, fonts, SI4684 workspace and 50 kB MOT buffer; the measured
+  // largest block had then fallen below 64 kB even though total free RAM was
+  // sufficient. The arena is persistent and is shared by PNG, baseline JPEG
+  // and progressive JPEG for the whole uptime.
+  const bool slideshowWorkspaceReady = SlideshowPrepareWorkspace();
+  Serial.printf("[SLS/WS] early persistent reservation=%s\n",
+                slideshowWorkspaceReady ? "READY" : "FAILED");
 
   Serial.println("[BOOT] TPA6130A2 init");
   const byte headphoneInitResult = Headphones.Init();
@@ -1212,13 +1320,17 @@ void setup(void) {
   }
 
   if (digitalRead(ROTARY_BUTTON) == LOW && digitalRead(SLBUTTON) == LOW) {
-    DefaultSettings();
+    const bool defaultsSaved = DefaultSettings();
 
     analogWrite(CONTRASTPIN, ContrastSet * 2 + 27);
-    tftPrint(0, myLanguage[language][10], 155, 70, ActiveColor, ActiveColorSmooth, 28);
-    tftPrint(0, myLanguage[language][2], 155, 130, ActiveColor, ActiveColorSmooth, 28);
+    if (defaultsSaved) {
+      tftPrint(0, myLanguage[language][10], 155, 70, ActiveColor, ActiveColorSmooth, 28);
+      tftPrint(0, myLanguage[language][2], 155, 130, ActiveColor, ActiveColorSmooth, 28);
+    } else {
+      tftPrint(0, "EEPROM ERROR", 155, 100, TFT_RED, TFT_DARKGREY, 28);
+    }
     while (digitalRead(ROTARY_BUTTON) == LOW && digitalRead(SLBUTTON) == LOW);
-    ESP.restart();
+    if (defaultsSaved) ESP.restart();
   }
 
   // V16 shared-reset recovery (same proven sequence as V14.1).
@@ -1243,17 +1355,12 @@ void setup(void) {
   Serial.println("[V16] GPIO17 shared reset HIGH; wait 200 ms");
   delay(200);
 
-  // Recover ILI9341 after the shared hardware reset. TFT_RST=-1 prevents
-  // tft.init() from pulsing GPIO17 and resetting the SI4684 again.
+  // Recover ILI9341 after the shared hardware reset using the same robust
+  // controller path as runtime recovery. It validates readable controller
+  // registers and retries once without ever pulsing the shared GPIO17 again.
   digitalWrite(15, HIGH);
   Serial.println("[V16] TFT re-init after shared reset");
-  tft.init();
-  delay(20);
-  tft.setRotation(displayflip == 0 ? 3 : 1);
-  tft.setSwapBytes(true);
-  tft.initDMA();
-  doTheme();
-  tft.fillScreen(BackgroundColor);
+  RestoreTftControllerNoReset("BOOT", true);
 
   // Restore the normal boot logo after the real reset/re-init.
   Serial.println("[BOOT] drawing splash after TFT recovery");
@@ -1280,12 +1387,6 @@ void setup(void) {
              TFT_RED, TFT_DARKGREY, 16);
     for (;;) delay(1000);
   }
-
-  // Reserve the shared PNG/JPEG scratch arena only after the TFT sprites,
-  // fonts, SI4684 workspace and 50 kB MOT buffer are already established.
-  // A failure is non-fatal: slideshow keeps its legacy compatibility
-  // allocation fallbacks.
-  SlideshowPrepareWorkspace();
 
   // Firmware identity is detected from the chip; never hard-code it here.
   const String detectedRadioVersion =
@@ -1317,11 +1418,18 @@ void setup(void) {
     }
     radio.setFreq(dabfreq);
     EEPROM.get(EE_UINT32_SERVICEID, _serviceID);
-    for (int i = 0; i < 16; i++) {
-      _serviceName[i] = EEPROM.readByte(i + EE_CHAR17_SERVICENAME);
-    }
+    // The stored label is intentionally ignored. SID + the freshly received
+    // service list are authoritative; using an old EEPROM label caused the
+    // brief station-name flash before a restore was actually confirmed.
+    memset(_serviceName, 0, sizeof(_serviceName));
   }
-  if (radioMode == RADIO_MODE_DAB && _serviceID != 0) trysetservice = true;
+  if (radioMode == RADIO_MODE_DAB && _serviceID != 0) {
+    trysetservice = true;
+    trysetserviceFreq = dabfreq;
+  } else {
+    trysetservice = false;
+    trysetserviceFreq = 0xFF;
+  }
 
   // GPIO12 role is selected at boot. AUTO never initializes IR.
   if (gpio12Mode == GPIO12_IR) IrRemoteBegin();
@@ -1377,8 +1485,13 @@ void loop(void) {
     if (store) {
       detachInterrupt(digitalPinToInterrupt(ROTARY_PIN_A));
       detachInterrupt(digitalPinToInterrupt(ROTARY_PIN_B));
-      StoreFrequency();
-      store = false;
+      if (StoreFrequency()) {
+        store = false;
+      } else {
+        // START_DIGITAL_SERVICE may still be completing asynchronously. Keep
+        // the store request armed and retry after another debounce interval.
+        TuningTimer = millis();
+      }
       attachInterrupt(digitalPinToInterrupt(ROTARY_PIN_A), read_encoder, CHANGE);
       attachInterrupt(digitalPinToInterrupt(ROTARY_PIN_B), read_encoder, CHANGE);
     } else if (tuning) {
@@ -1390,7 +1503,10 @@ void loop(void) {
         radio.setFreq(dabfreq);
       }
       tuning = false;
-      if (tunemode == TUNE_MEM) trysetservice = true;
+      if (tunemode == TUNE_MEM) {
+        trysetservice = _serviceID != 0;
+        trysetserviceFreq = trysetservice ? dabfreq : 0xFF;
+      }
     }
   }
 
@@ -1455,18 +1571,51 @@ void ProcessDAB(void) {
   // not a reason to reset the tuner.  Re-enable recovery only after the display
   // and DAB runtime path are proven stable.
 
-  if (radioMode == RADIO_MODE_DAB && trysetservice && radio.signallock) {
-    for (byte x = 0; x < radio.numberofservices; x++) {
+  // A pending restore belongs to exactly one DAB frequency. Any user/serial
+  // retune that changes dabfreq cancels it immediately, even before the new
+  // multiplex has produced a service list. This prevents a stale boot SID from
+  // surviving an AUTO scan and matching again after the band wraps around.
+  if (radioMode == RADIO_MODE_DAB && trysetservice &&
+      dabfreq != trysetserviceFreq) {
+    Serial.printf("[DAB/RESTORE] cancelled by retune oldFreq=%u newFreq=%u\n",
+                  static_cast<unsigned>(trysetserviceFreq),
+                  static_cast<unsigned>(dabfreq));
+    trysetservice = false;
+    trysetserviceFreq = 0xFF;
+    memset(_serviceName, 0, sizeof(_serviceName));
+  }
+
+  if (radioMode == RADIO_MODE_DAB && trysetservice && radio.signallock &&
+      radio.isDabServiceListReady()) {
+    bool restored = false;
+
+    // The frequency-mismatch case was consumed above, so this list belongs to
+    // the exact tune request for which the restore was armed.
+    for (byte x = 0; x < radio.numberofservices; ++x) {
       if (_serviceID == radio.service[x].ServiceID) {
-        // Keep the requested service name visible while START_DIGITAL_SERVICE
-        // completes asynchronously; do not flash a generic placeholder.
+        // Use only the label from the current, validated service list.
         strncpy(_serviceName, radio.service[x].Label, sizeof(_serviceName));
         _serviceName[sizeof(_serviceName) - 1] = '\0';
         radio.setService(x);
-        trysetservice = false;
-        store = true;
+        // Startup/MEM restore is already represented by the stored SID/frequency.
+        // Do not schedule a redundant EEPROM write after a successful restore.
+        restored = true;
+        Serial.printf("[DAB/RESTORE] SID=%08X matched service=%u freq=%u\n",
+                      static_cast<unsigned>(_serviceID),
+                      static_cast<unsigned>(x),
+                      static_cast<unsigned>(dabfreq));
+        break;
       }
     }
+
+    if (!restored) {
+      memset(_serviceName, 0, sizeof(_serviceName));
+      Serial.printf("[DAB/RESTORE] SID=%08X not restored on freq=%u; request consumed\n",
+                    static_cast<unsigned>(_serviceID),
+                    static_cast<unsigned>(dabfreq));
+    }
+    trysetservice = false;
+    trysetserviceFreq = 0xFF;
   }
 
   // A manually armed waiting overlay is not a full-screen slideshow. Keep the
@@ -1482,8 +1631,19 @@ void ProcessDAB(void) {
   // The user can cancel the waiting view explicitly, or a complete image below
   // will replace the overlay.
 
+  bool volumeNeedsFinalComposite = false;
   if ((!SlideShowView || slsWaitingView) && !menu) {
-    if (!ChannelListView) ShowSignalLevel();
+    if (!ChannelListView) {
+      ShowSignalLevel();
+      // The Q/M bar overlaps the lower edge of the volume panel. Repaint the
+      // volume panel immediately after that 10 Hz bar update, matching the
+      // slideshow-loading timing instead of leaving the bar visible until the
+      // rest of the dynamic widgets have finished drawing.
+      if (setvolume && volumeOverlayRssiStamp != rssiTimer) {
+        volumeNeedsFinalComposite = true;
+        RedrawVolumeOverlay();
+      }
+    }
     ShowRT();
     if (!ShowServiceInformation && !ChannelListView) {
       if (radioMode == RADIO_MODE_DAB && autoslideshow && radio.SlideShowAvailable && radio.SlideShowUpdate) {
@@ -1559,20 +1719,15 @@ void ProcessDAB(void) {
     }
   }
 
-  // Volume is a compact modal overlay drawn over live radio widgets. Let all
-  // normal widgets update first, then composite the volume panel back on top
-  // at the same 10 Hz cadence as the signal UI. Do not call ShowVolume() here:
-  // it would reset the 3-second close timer on every repaint.
-  static uint32_t volumeOverlayRefreshMs = 0;
-  if (setvolume && !menu) {
-    const uint32_t now = millis();
-    if (static_cast<uint32_t>(now - volumeOverlayRefreshMs) >= 100UL) {
-      volumeOverlayRefreshMs = now;
-      RedrawVolumeOverlay();
-    }
-  } else {
-    volumeOverlayRefreshMs = 0;
-  }
+  // Final composition pass. When the signal/Q bar changed, the overlay was
+  // already restored immediately after ShowSignalLevel() above; draw it once
+  // more after all remaining dynamic widgets so fields such as protection
+  // level cannot cut into its lower edge. This is only 10 Hz and keeps the
+  // overlay visually as solid as the slideshow-loading panel.
+  // Do not call ShowVolume() here: it would restart the 3-second close timer.
+  if (setvolume && !menu &&
+      (volumeNeedsFinalComposite || volumeOverlayRssiStamp != rssiTimer))
+    RedrawVolumeOverlay();
 }
 
 // Leave the volume overlay and redraw whichever view was visible underneath.
@@ -1595,57 +1750,83 @@ void doRecovery(void) {
   SwitchRadioMode(radioMode, true);
 }
 
+// Activate the currently highlighted service-list row without changing the
+// cursor. This is also used after DABSelectService() moves the cursor, so
+// movement and OK-confirmation share exactly the same start/tune path.
+bool ActivateCurrentService(void) {
+  if (radio.numberofservices == 0 ||
+      radio.ServiceIndex >= radio.numberofservices) {
+    return false;
+  }
+
+  if (radioMode == RADIO_MODE_FM) {
+    fmfreq = static_cast<uint16_t>(radio.service[radio.ServiceIndex].CompID);
+    radio.setFmFrequency(fmfreq);
+
+    uint16_t storedFmFrequency = 0;
+    EEPROM.get(EE_UINT16_FM_FREQUENCY, storedFmFrequency);
+    if (storedFmFrequency != fmfreq) {
+      EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
+      MarkEepromDirty();
+    }
+    return true;
+  }
+
+  const uint8_t serviceType = radio.service[radio.ServiceIndex].ServiceType;
+  if (serviceType != 0x00 && serviceType != 0x04 && serviceType != 0x05)
+    return false;
+
+  // setService() intentionally clears ServiceStart until the asynchronous
+  // START_DIGITAL_SERVICE command finishes. Preserve the selected live label
+  // so the main UI can transition directly to the requested service.
+  strncpy(_serviceName, radio.service[radio.ServiceIndex].Label,
+          sizeof(_serviceName));
+  _serviceName[sizeof(_serviceName) - 1] = '\0';
+  radio.setService(radio.ServiceIndex);
+  store = true;
+  return true;
+}
+
 // Step through the ensemble's services, skipping anything that isn't a
 // regular audio service (type 0x00/0x04/0x05). Wraps at both ends.
 void DABSelectService(bool dir) {
+  if (radio.numberofservices == 0) return;
+
   if (radioMode == RADIO_MODE_FM) {
-    if (radio.numberofservices == 0) return;
-    radio.ServiceIndex = dir ? (radio.ServiceIndex + 1) % radio.numberofservices
-                             : (radio.ServiceIndex == 0 ? radio.numberofservices - 1 : radio.ServiceIndex - 1);
-    fmfreq = static_cast<uint16_t>(radio.service[radio.ServiceIndex].CompID);
-    radio.setFmFrequency(fmfreq);
-    EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
-    MarkEepromDirty();
+    radio.ServiceIndex =
+        dir ? (radio.ServiceIndex + 1) % radio.numberofservices
+            : (radio.ServiceIndex == 0
+                   ? radio.numberofservices - 1
+                   : radio.ServiceIndex - 1);
+    ActivateCurrentService();
     return;
   }
-  if (radio.numberofservices > 0) {
-    bool hasValidService = false;
-    for (int i = 0; i < radio.numberofservices; i++) {
-      if (radio.service[i].ServiceType == 0x00 ||
-          radio.service[i].ServiceType == 0x04 ||
-          radio.service[i].ServiceType == 0x05) {
-        hasValidService = true;
-        break;
-      }
+
+  bool hasValidService = false;
+  for (uint8_t i = 0; i < radio.numberofservices; ++i) {
+    const uint8_t type = radio.service[i].ServiceType;
+    if (type == 0x00 || type == 0x04 || type == 0x05) {
+      hasValidService = true;
+      break;
     }
-
-    if (!hasValidService) return;
-
-    if (dir) {
-      radio.ServiceIndex = (radio.ServiceIndex + 1) % radio.numberofservices;
-    } else {
-      radio.ServiceIndex = (radio.ServiceIndex == 0) ? (radio.numberofservices - 1) : (radio.ServiceIndex - 1);
-    }
-
-    while (radio.service[radio.ServiceIndex].ServiceType != 0x00 &&
-           radio.service[radio.ServiceIndex].ServiceType != 0x04 &&
-           radio.service[radio.ServiceIndex].ServiceType != 0x05) {
-      if (dir) {
-        radio.ServiceIndex = (radio.ServiceIndex + 1) % radio.numberofservices;
-      } else {
-        radio.ServiceIndex = (radio.ServiceIndex == 0) ? (radio.numberofservices - 1) : (radio.ServiceIndex - 1);
-      }
-    }
-
-    // setService() intentionally clears ServiceStart until the asynchronous
-    // START_DIGITAL_SERVICE command finishes. Preserve the target label so the
-    // UI can transition directly from the old service name to the new one.
-    strncpy(_serviceName, radio.service[radio.ServiceIndex].Label,
-            sizeof(_serviceName));
-    _serviceName[sizeof(_serviceName) - 1] = '\0';
-    radio.setService(radio.ServiceIndex);
-    store = true;
   }
+  if (!hasValidService) return;
+
+  do {
+    if (dir) {
+      radio.ServiceIndex =
+          (radio.ServiceIndex + 1) % radio.numberofservices;
+    } else {
+      radio.ServiceIndex =
+          (radio.ServiceIndex == 0)
+              ? radio.numberofservices - 1
+              : radio.ServiceIndex - 1;
+    }
+  } while (radio.service[radio.ServiceIndex].ServiceType != 0x00 &&
+           radio.service[radio.ServiceIndex].ServiceType != 0x04 &&
+           radio.service[radio.ServiceIndex].ServiceType != 0x05);
+
+  ActivateCurrentService();
 }
 
 // Persist the currently playing channel + service so the next boot can
@@ -1692,7 +1873,7 @@ void ShowTuneModeCurrent(void) {
   ModeSprite.pushSprite(6, 33);
 }
 
-void StoreFrequency(void) {
+bool StoreFrequency(void) {
   if (radioMode == RADIO_MODE_FM) {
     fmfreq = radio.fmFrequency10kHz;
     uint16_t storedFmFrequency = 0;
@@ -1701,10 +1882,29 @@ void StoreFrequency(void) {
       EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
       MarkEepromDirty();
     }
-    return;
+    return true;
+  }
+
+  // Never index service[] while the asynchronous selection is incomplete or
+  // while no valid service list exists. Keeping the previous valid restore
+  // pair is safer than persisting service[0] from an empty/stale table.
+  if (!radio.ServiceStart || !radio.isDabServiceListReady() ||
+      radio.numberofservices == 0 ||
+      radio.ServiceIndex >= radio.numberofservices) {
+    Serial.printf("[EEPROM] DAB store skipped: started=%u list=%u count=%u index=%u\n",
+                  radio.ServiceStart ? 1U : 0U,
+                  radio.isDabServiceListReady() ? 1U : 0U,
+                  static_cast<unsigned>(radio.numberofservices),
+                  static_cast<unsigned>(radio.ServiceIndex));
+    return false;
   }
 
   const uint32_t serviceId = radio.service[radio.ServiceIndex].ServiceID;
+  if (serviceId == 0U) {
+    Serial.println("[EEPROM] DAB store skipped: invalid service ID 0");
+    return false;
+  }
+
   bool changed = false;
   uint32_t storedServiceId = 0;
   EEPROM.get(EE_UINT32_SERVICEID, storedServiceId);
@@ -1716,15 +1916,13 @@ void StoreFrequency(void) {
     EEPROM.writeByte(EE_BYTE_DABFREQ, dabfreq);
     changed = true;
   }
-  for (int i = 0; i < 16; ++i) {
-    if (EEPROM.readByte(i + EE_CHAR17_SERVICENAME) !=
-        static_cast<uint8_t>(radio.PStext[i])) {
-      EEPROM.writeByte(i + EE_CHAR17_SERVICENAME, radio.PStext[i]);
-      changed = true;
-    }
-  }
+
+  // EE_CHAR17_SERVICENAME remains reserved for schema compatibility only.
+  // Restore is SID-based and obtains the current label from the live service
+  // list, so rewriting the label here would add flash wear without value.
   if (changed) MarkEepromDirty();
   _serviceID = serviceId;
+  return true;
 }
 
 // Rotary 1 click: stores/recalls a memory preset when in TUNE_MEM, toggles
@@ -1782,7 +1980,13 @@ void ButtonPress(void) {
         }
       }
     } else {
-      if (ChannelListView || SlideShowView || ShowServiceInformation) {
+      if (ChannelListView) {
+        // OK confirms the row that is already highlighted. Previously OK only
+        // closed the list, so the initial highlighted row was not started until
+        // the user moved away and back (movement calls DABSelectService()).
+        ActivateCurrentService();
+        BuildDisplay();
+      } else if (SlideShowView || ShowServiceInformation) {
         BuildDisplay();
       } else {
         ChannelListView = true;
@@ -1805,6 +2009,7 @@ void Button2Press(void) {
   } else {
     setvolume = true;
     ShowVolume();
+    volumeOverlayRssiStamp = rssiTimer;
   }
 }
 
@@ -1902,6 +2107,18 @@ void StandbyButtonPress(void) {
   static unsigned long pressStart = 0;
   static bool actionDone = false;
   bool pressed = (digitalRead(STANDBYBUTTON) == LOW);
+
+  // A LOW level on the standby button can be the light-sleep wake source. Do
+  // not reinterpret the same physical press as a fresh short/long press after
+  // wake. Rearm normal button handling only after a real release.
+  if (standbyWakeReleaseGuard) {
+    if (!pressed) {
+      standbyWakeReleaseGuard = false;
+      pressStart = 0;
+      actionDone = false;
+    }
+    return;
+  }
 
   if (!pressed) {
     if (pressStart != 0) {
@@ -2012,9 +2229,8 @@ void KeyUp(void) {
           if (radioMode == RADIO_MODE_DAB) {
             radio.clearData();
             // Do not let the previous service label survive a new AUTO scan.
-            // Keep trysetservice untouched: it is the independent startup/MEM
-            // restore mechanism and may act later only after real service data
-            // has been received for a matching ensemble.
+            // ProcessDAB also cancels any restore whose armed frequency no
+            // longer matches this newly selected channel.
             memset(_serviceName, 0, sizeof(_serviceName));
           }
           direction = true;
@@ -2116,8 +2332,8 @@ void KeyDown(void) {
           radio.ServiceStart = false;
           if (radioMode == RADIO_MODE_DAB) {
             radio.clearData();
-            // Mirror KeyUp(): clear only the stale visible label. The pending
-            // service-restore state itself is not an AUTO-tune policy flag.
+            // Mirror KeyUp(): clear the stale visible label; ProcessDAB cancels
+            // a restore as soon as the selected DAB frequency changes.
             memset(_serviceName, 0, sizeof(_serviceName));
           }
           direction = false;
@@ -2282,22 +2498,256 @@ bool IsStationEmpty(void) {
   return memory[memorypos].Channel == EE_PRESETS_FREQUENCY;
 }
 
-// Fade out the backlight, draw the standby splash, then go into ESP deep-sleep.
-// Wake source is configured in this function (button / power switch on the board).
-void doStandby(void) {
-  FlushEeprom();
-  tft.pushImage (0, 0, 320, 240, standbymode);
-  tftPrint(0, myLanguage[language][78], 155, 210, ActiveColor, ActiveColorSmooth, 28);
+// Wait until an active-low wake input has really returned to idle HIGH. This
+// matters for level-triggered light-sleep wake: entering sleep while the source
+// is already LOW would immediately return from esp_light_sleep_start().
+static bool WaitPinHighStable(uint8_t pin, uint32_t stableMs,
+                              uint32_t timeoutMs) {
+  const uint32_t started = millis();
+  uint32_t highSince = 0;
+  while (static_cast<uint32_t>(millis() - started) < timeoutMs) {
+    if (digitalRead(pin) == HIGH) {
+      if (highSince == 0) highSince = millis();
+      if (static_cast<uint32_t>(millis() - highSince) >= stableMs) return true;
+    } else {
+      highSince = 0;
+    }
+    delay(1);
+  }
+  return false;
+}
 
-  for (int x = ContrastSet; x > 0; x--) {
-    analogWrite(CONTRASTPIN, x * 2);
-    delay(25);
+// Experimental standby using ESP32 LIGHT SLEEP. CPU/RAM stop, but execution
+// resumes here without rebooting, so the SI4684 firmware, service state, 64 kB
+// decoder workspace and all UI/IR RAM remain resident. GPIO17 is the shared
+// active-low TFT/SI4684 reset and belongs to the WROOM VDD_SDIO domain, hence
+// that domain is explicitly kept powered during light sleep.
+//
+// Wake policy is deliberately conservative:
+//   - physical STANDBY button GPIO36 LOW is always enabled;
+//   - GPIO12 LOW is enabled ONLY for explicit GPIO12=IR with a learned profile;
+//   - GPIO12 is NEVER a wake source in AUTO or INTB, even if its live level is
+//     LOW (e.g. no INTB wire, a pending radio interrupt, or an undefined net).
+static void EnterLightSleep(bool showStandbyScreen) {
+  const bool explicitIrMode = sanitizeGpio12Mode(gpio12Mode) == GPIO12_IR;
+  const bool irWakeRequested = explicitIrMode && IrRemoteHasProfile();
+
+  if (irWakeRequested) {
+    // gpio_wakeup_enable() temporarily programs GPIO12 as a LOW-level wake
+    // source. Stop the project-local CHANGE ISR first and restore it after wake.
+    IrRemoteStop();
   }
 
-  tft.writecommand(0x10);
+  // The long-press that requested standby must be released before a LOW-level
+  // wake can be armed. GPIO34-39 have no internal pull resistors, so this uses
+  // the board's existing external bias exactly as normal button handling does.
+  if (!WaitPinHighStable(STANDBYBUTTON, 50UL, 3000UL)) {
+    Serial.printf("[SLEEP] cancelled: standby GPIO%u stayed LOW\n",
+                  static_cast<unsigned>(STANDBYBUTTON));
+    if (irWakeRequested) IrRemoteBegin();
+    return;
+  }
+
+  bool irWakeEnabled = false;
+  if (irWakeRequested) {
+    // 250 ms exceeds the decoder's held-frame association window and therefore
+    // avoids arming sleep in the quiet gap between repeated IR frames.
+    irWakeEnabled = WaitPinHighStable(SI4684_INTB_PIN, 250UL, 3000UL);
+    if (!irWakeEnabled) {
+      Serial.printf("[SLEEP] IR wake skipped this cycle: GPIO%u did not become idle HIGH\n",
+                    static_cast<unsigned>(SI4684_INTB_PIN));
+    }
+  }
+
+  if (showStandbyScreen) {
+    tft.pushImage(0, 0, 320, 240, standbymode);
+    tftPrint(0, myLanguage[language][78], 155, 210,
+             ActiveColor, ActiveColorSmooth, 28);
+    for (int x = ContrastSet; x > 0; --x) {
+      analogWrite(CONTRASTPIN, x * 2);
+      delay(25);
+    }
+    // The loop above ends at duty=2, not zero. Force the backlight fully OFF
+    // before TFT Sleep In so an IR pre-wake/qualification can never expose a
+    // dim black LCD for the duration of the qualification window.
+    analogWrite(CONTRASTPIN, 0);
+  } else {
+    analogWrite(CONTRASTPIN, 0);
+  }
+
+  tft.writecommand(0x10);  // ILI9341 Sleep In; GRAM contents are retained.
   Headphones.Shutdown();
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, LOW);
-  esp_deep_sleep_start();
+
+  // GPIO17 must remain HIGH so neither the TFT nor SI4684 is reset while the
+  // CPU sleeps. ESP-IDF specifically requires VDD_SDIO to stay on when WROOM
+  // pins in this domain (GPIO16/17) must keep their driven level in light sleep.
+  pinMode(17, OUTPUT);
+  digitalWrite(17, HIGH);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO, ESP_PD_OPTION_ON);
+
+  // The display/backlight/amplifier now stay asleep until a wake source has
+  // been QUALIFIED. A physical button wake is accepted immediately. GPIO12 is
+  // only a hardware pre-wake: the CPU resumes invisibly, the normal edge
+  // decoder is restored, and only the learned STANDBY command is allowed to
+  // continue to the visible wake path. Any other IR command returns straight
+  // to light sleep without waking the TFT or amplifier.
+  esp_err_t sleepResult = ESP_OK;
+  uint64_t totalSleepUs = 0U;
+  bool acceptedWake = false;
+  bool wakeButtonLow = false;
+  bool wakeIrLow = false;
+  bool acceptedByIr = false;
+  uint32_t sleepCycle = 0U;
+
+  while (!acceptedWake) {
+    ++sleepCycle;
+
+    gpio_wakeup_disable(static_cast<gpio_num_t>(STANDBYBUTTON));
+    // Always clear GPIO12 first. AUTO/INTB therefore cannot inherit a stale
+    // wake setting even if GPIO12 is physically LOW or not connected.
+    gpio_wakeup_disable(static_cast<gpio_num_t>(SI4684_INTB_PIN));
+    gpio_wakeup_enable(static_cast<gpio_num_t>(STANDBYBUTTON),
+                       GPIO_INTR_LOW_LEVEL);
+    if (irWakeEnabled) {
+      gpio_wakeup_enable(static_cast<gpio_num_t>(SI4684_INTB_PIN),
+                         GPIO_INTR_LOW_LEVEL);
+    }
+
+    const esp_err_t wakeEnableResult = esp_sleep_enable_gpio_wakeup();
+    Serial.printf("[SLEEP] LIGHT enter cycle=%u wakeButton=GPIO%u/LOW GPIO12=%s level=%c control=%s setup=%d\n",
+                  static_cast<unsigned>(sleepCycle),
+                  static_cast<unsigned>(STANDBYBUTTON),
+                  irWakeEnabled ? "IR/LOW+QUALIFY" : "DISABLED",
+                  digitalRead(SI4684_INTB_PIN) == HIGH ? 'H' : 'L',
+                  radio.controlModeName(), static_cast<int>(wakeEnableResult));
+    Serial.flush();
+
+    const int64_t sleepStartedUs = esp_timer_get_time();
+    sleepResult = wakeEnableResult == ESP_OK
+                      ? esp_light_sleep_start()
+                      : wakeEnableResult;
+    const uint64_t oneSleepUs = static_cast<uint64_t>(
+        esp_timer_get_time() - sleepStartedUs);
+    totalSleepUs += oneSleepUs;
+
+    const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+    wakeButtonLow = digitalRead(STANDBYBUTTON) == LOW;
+    wakeIrLow = irWakeEnabled && digitalRead(SI4684_INTB_PIN) == LOW;
+
+    gpio_wakeup_disable(static_cast<gpio_num_t>(STANDBYBUTTON));
+    if (irWakeEnabled)
+      gpio_wakeup_disable(static_cast<gpio_num_t>(SI4684_INTB_PIN));
+
+    if (sleepResult != ESP_OK) {
+      Serial.printf("[SLEEP] light sleep failed result=%d; restoring runtime\n",
+                    static_cast<int>(sleepResult));
+      if (irWakeRequested) IrRemoteBegin();
+      acceptedWake = true;
+      break;
+    }
+
+    // The physical button has priority if both inputs happen to be LOW.
+    if (wakeButtonLow) {
+      if (irWakeRequested) IrRemoteBegin();
+      acceptedWake = true;
+      acceptedByIr = false;
+      break;
+    }
+
+    // With GPIO wake enabled, a wake with the button HIGH can only be the
+    // explicit IR source (or a harmless transient on it). The pin can already
+    // be HIGH by the time the CPU resumes, so do not require wakeIrLow=true to
+    // enter qualification; wakeIrLow is used only to seed a still-active MARK.
+    const bool irWakeCandidate =
+        irWakeEnabled && wakeCause == ESP_SLEEP_WAKEUP_GPIO;
+    if (irWakeCandidate) {
+      IrRemoteResumeAfterLightSleep(wakeIrLow);
+
+      // Keep TFT in Sleep In, backlight fully off and TPA6130A2 in shutdown
+      // while the decoder checks the wake command. The wake-causing first IR
+      // frame can be incomplete because its leading edge woke the CPU. Give the
+      // user a generous 1.5 s window for the next COMPLETE press/frame instead
+      // of requiring an unnaturally fast double-click. Protocol repeat frames
+      // still cannot qualify by themselves unless the decoder has seen a real
+      // learned STANDBY frame in this qualification window.
+      if (IrRemoteQualifyStandbyWake(1500UL)) {
+        acceptedWake = true;
+        acceptedByIr = true;
+        break;
+      }
+
+      Serial.println("[SLEEP] IR wake rejected; display/audio stayed asleep");
+      radio.Update();
+      IrRemoteStop();
+
+      // Do not re-arm a LOW-level wake in the middle of a held/repeating key.
+      // If GPIO12 never returns to its IR idle HIGH state, disable IR wake for
+      // this sleep session and retain the physical standby button as wake.
+      if (!WaitPinHighStable(SI4684_INTB_PIN, 250UL, 3000UL)) {
+        irWakeEnabled = false;
+        Serial.printf("[SLEEP] GPIO%u stayed LOW after rejected IR; IR wake disabled until visible wake\n",
+                      static_cast<unsigned>(SI4684_INTB_PIN));
+      }
+      continue;
+    }
+
+    // Unexpected GPIO wake state: do not expose a half-restored UI. Return to
+    // sleep after servicing radio status, unless IR is not available at all.
+    Serial.printf("[SLEEP] unqualified wake cause=%d button=%c ir=%c; re-sleep\n",
+                  static_cast<int>(wakeCause),
+                  wakeButtonLow ? 'L' : 'H', wakeIrLow ? 'L' : 'H');
+    radio.Update();
+  }
+
+  // Ignore the wake button until it has physically returned HIGH; otherwise
+  // the same LOW level would immediately be interpreted as a new press.
+  standbyWakeReleaseGuard = wakeButtonLow;
+
+  // Reinitialise the ILI9341 completely while the backlight is still OFF.
+  // A simple Sleep-Out was usually sufficient, but a rare controller-state
+  // loss produced a white panel while the ESP32 and radio kept running. The
+  // full TFT_eSPI init is software-only because TFT_RST=-1; shared GPIO17 and
+  // therefore the Si4684 are never reset here. DMA/sprite/font RAM state is
+  // retained, so only controller registers are rebuilt.
+  RestoreTftControllerNoReset("WAKE", false);
+
+  // Service any status that accumulated while the CPU was asleep. In INTB
+  // mode a falling edge may have happened during sleep and therefore been
+  // missed by the CPU ISR; the driver's normal safety-poll path handles it.
+  radio.Update();
+
+  const byte headphoneWake = Headphones.Init();
+  Headphones.SetMute(true);
+  Headphones.SetHiZ(0);
+  Headphones.SetVolume(volume);
+
+  // Rebuild while the backlight is still off, then expose a complete UI at
+  // normal brightness. The radio itself was never rebooted or re-uploaded.
+  RestoreMainDisplayAfterSlideshow();
+  analogWrite(CONTRASTPIN, ContrastSet * 2 + 27);
+  Headphones.SetMute(false);
+
+  // Timer-based standby must start a fresh interval after wake instead of
+  // immediately sleeping again because millis()/esp_timer include sleep time.
+  tottimer = millis();
+
+  Serial.printf("[SLEEP] LIGHT wake result=%d slept=%llu ms source=%s button=%c ir=%c amp=%u heap=%u\n",
+                static_cast<int>(sleepResult),
+                static_cast<unsigned long long>(totalSleepUs / 1000ULL),
+                acceptedByIr ? "IR-STANDBY" : "BUTTON",
+                wakeButtonLow ? 'L' : 'H', wakeIrLow ? 'L' : 'H',
+                static_cast<unsigned>(headphoneWake), ESP.getFreeHeap());
+}
+
+// User standby: persist changes, then enter light sleep. Unlike the previous
+// deep-sleep implementation this returns after wake without reset/firmware load.
+void doStandby(void) {
+  if (!FlushEeprom()) {
+    Serial.println("[EEPROM] standby cancelled: commit failed");
+    ShowStatusOverlay("EEPROM ERROR");
+    return;
+  }
+  EnterLightSleep(true);
 }
 
 // Auto-seek scan. `mode` true = upwards, false = downwards. Steps one channel
@@ -2381,7 +2831,7 @@ void read_encoder2(void) {
 // Factory reset: write known-good defaults to every EEPROM slot, including
 // emptying all preset entries. Also called automatically on first boot or
 // when the schema version byte changes.
-void DefaultSettings(void) {
+bool DefaultSettings(void) {
   EEPROM.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
   EEPROM.writeByte(EE_BYTE_CONTRASTSET, 100);
   EEPROM.writeByte(EE_BYTE_LANGUAGE, 0);
@@ -2413,8 +2863,7 @@ void DefaultSettings(void) {
   }
   WriteEmptyFmPresetsV4();
   ClearIrProfileStorage();
-  EEPROM.commit();
-  eepromDirty = false;
+  return CommitEepromNow("factory defaults");
 }
 
 void tftReplace(int8_t offset, const String & textold, const String & text, int16_t x, int16_t y, int color, int smoothcolor, int backcolor, uint8_t fontsize) {
@@ -2555,12 +3004,17 @@ void tftPrint(int8_t offset, const String & text, int16_t x, int16_t y, int colo
   tft.drawString(modifiedText, x, y, 1);
 }
 
-// Final-stage shutdown: detach interrupts, mute amp, blank screen, and call
-// esp_deep_sleep_start(). Wakes only on a button-pin trigger.
+// Timeout standby uses the same light-sleep path as the manual command. Keep
+// the historical function name to avoid changing the TOT scheduler call site.
 void deepSleep(void) {
   StoreFrequency();
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, LOW);
-  esp_deep_sleep_start();
+  if (!FlushEeprom()) {
+    Serial.println("[EEPROM] timeout light-sleep cancelled: commit failed");
+    // Prevent a tight retry loop on every main-loop iteration.
+    tottimer = millis();
+    return;
+  }
+  EnterLightSleep(false);
 }
 
 void loadFonts(bool option) {

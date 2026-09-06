@@ -536,6 +536,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   ServiceStart = false;
   ServiceIndex = 0;
   numberofservices = 0;
+  dabServiceListReady = false;
   SlideShowAvailable = false;
   SlideShowUpdate = false;
   SlideShowUpdate2 = false;
@@ -618,7 +619,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   diagDabLastReportMs = 0;
   // GPIO12 is MTDI on classic ESP32. Hardware using it for INTB must have
   // VDD_SDIO fixed safely at 3.3 V; firmware never reads or writes eFuse.
-  // In IR mode leave the pin completely to Arduino-IRremote.
+  // In IR mode leave the pin completely to the standalone IR edge receiver.
   if (configuredGpio12Mode != GPIO12_IR) {
     pinMode(SI4684_INTB_PIN, INPUT_PULLUP);
     if (radioControlMode == RADIO_CTRL_DETECT)
@@ -1251,6 +1252,10 @@ void DAB::parseDabServiceListReply(uint16_t replyLength) {
     parsedServiceCharset[i] = serviceCharset;
   }
 
+  // Reaching this point means the complete list reply was structurally valid.
+  // A valid list may legitimately contain zero services; that still resolves
+  // a pending startup/MEM restore attempt deterministically.
+  dabServiceListReady = true;
   if (numberofservices == 0) return;
   qsort(service, numberofservices, sizeof(DABService), compareCompID);
   for (uint8_t sorted = 0; sorted < numberofservices; ++sorted) {
@@ -1703,6 +1708,7 @@ void DAB::ServiceInfo(void) {
 // Wipe every cached metadata field. Called when re-tuning so stale labels,
 // PTY etc. from the previous channel don't briefly show up on the display.
 void DAB::clearData(void) {
+  dabServiceListReady = false;
   for (byte x = 0; x < 32; x++) {
     service[x].ServiceID = 0;
     service[x].CompID = 0;
