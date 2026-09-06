@@ -1868,19 +1868,24 @@ void DAB::processFmRds(void) {
     finishCommandDiagnostics(clearResult);
     return;
   }
-  if (!group.sync) return;
-
-  // FM_RDS_STATUS can legitimately report sync with an empty FIFO. Its block
-  // fields do not contain a new group in that case, so publishing them would
-  // corrupt candidate state and could replace an already stable PS.
-  if (group.fifoUsed == 0U) return;
-
+  // PI and TP/PTY are current-channel status fields. They can already be
+  // valid when the RDS group FIFO is momentarily empty, especially just after
+  // tuning or with marginal reception. Capture them before any FIFO-dependent
+  // early return so the UI can publish PI/PTY at the first valid opportunity.
   if (group.piValid) fmPi = group.pi;
   if (group.tpPtyValid) {
     fmPty = group.pty;
     fmPtyValid = true;
     pty = fmPty;
   }
+
+  if (!group.sync) return;
+
+  // FM_RDS_STATUS can legitimately report sync with an empty FIFO. Its block
+  // fields do not contain a new group in that case, so publishing them would
+  // corrupt candidate state and could replace an already stable PS. PI/PTY
+  // above are status fields and therefore do not depend on fifoUsed.
+  if (group.fifoUsed == 0U) return;
   // BLE 0 and 1 are clean or corrected by at most two bits. Do not use BLE 2
   // for text: a 3-5 bit correction can otherwise become a visible character.
   if (group.ble[1] > 1U) return;
