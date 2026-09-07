@@ -716,7 +716,7 @@ bool IrDecodeFrame(const uint16_t* durationsUs,
       decodeSamsung(durationsUs, durationCount, initialGapUs, state, frame);
 
   if (!decoded) {
-    // Keep the old DECODE_HASH behaviour for arbitrary learned remotes.
+    // Preserve DECODE_HASH fallback support for arbitrary learned remotes.
     if (durationCount < 5U) return false;
     decodeHash(durationsUs, durationCount, frame);
     decoded = true;

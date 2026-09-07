@@ -1,4 +1,5 @@
 #include "JPEGdecoder.h"
+#include "constants.h"
 #include <cstdlib>
 #include <cstring>
 
@@ -24,21 +25,17 @@ class MemoryFile {
 // ============================================================================
 // JPEG decoder for ESP32 (no PSRAM)
 //
-// Uses multi-pass row-by-row decoding: for each MCU row, re-reads the file
-// from the start and decodes all scans, storing only the current row's DCT
-// coefficients in RAM (~15-20KB). This avoids needing the full 225KB+
-// coefficient buffer that traditional progressive decoders require.
+// DAB SlideShow Simple Profile decoder path. ETSI TS 101 499 requires
+// baseline JPEG support; progressive/multiscan support is optional. This
+// receiver intentionally accepts only single-scan SOF0 baseline images so
+// decoding is deterministic and uses only the early persistent workspace.
 //
-// A non-zero bitmap tracks which coefficient positions have been set by
-// AC-first scans, so that AC-refine scans read the correct number of bits
-// even when blocks are being discarded (not in the target row).
-//
-// Supports: SOF0 (baseline) and SOF2 (progressive DCT)
-// Subsampling: YCbCr 4:4:4 / 4:2:2 / 4:2:0 / grayscale / non-standard
-// Max image size: 320x240 pixels
+// Display envelope: up to 320 x 240, 8-bit samples, grayscale or three-
+// component YCbCr. Four-component JPEG is rejected explicitly rather than
+// rendered with an incorrect CMYK/YCCK transform.
 // ============================================================================
 
-#define PJ_MAX_COMPONENTS 3
+#define PJ_MAX_COMPONENTS 4
 #define PJ_MAX_HTABLES    4
 
 // JPEG markers
@@ -294,9 +291,9 @@ struct PJDecoder {
   int totalImageBlocks;
 };
 
-// Persistent decoder state. The old implementation calloc/free'd this ~8 kB
-// object for every image. The receiver is single-threaded, so one zeroed
-// instance can be safely reused for every slideshow decode.
+// Persistent decoder state. The receiver is single-threaded, so one zeroed
+// instance can be safely reused for every slideshow decode without runtime
+// allocation.
 static PJDecoder pjDecoderState;
 
 // --- Compute global block offsets after SOF parsing ---
@@ -376,32 +373,42 @@ static bool pjParseDHT(MemoryFile& f, PJDecoder* d) {
 // SOF (Start Of Frame) parser - extracts image dimensions and subsampling info.
 static bool pjParseSOF(MemoryFile& f, PJDecoder* d) {
   pjRead16(f); // length
-  if (pjRead8(f) != 8) return false; // precision must be 8
+  if (pjRead8(f) != 8) return false; // precision must be 8 bit
   d->height = pjRead16(f);
   d->width = pjRead16(f);
   d->nComp = pjRead8(f);
-  if (d->nComp > PJ_MAX_COMPONENTS) return false;
+  if (d->nComp == 0 || d->nComp > PJ_MAX_COMPONENTS) return false;
 
-  d->maxH = 0; d->maxV = 0;
+  d->maxH = 0;
+  d->maxV = 0;
+  uint16_t blocksPerMcu = 0;
   for (int i = 0; i < d->nComp; i++) {
     d->comp[i].id = pjRead8(f);
-    int samp = pjRead8(f);
+    const int samp = pjRead8(f);
     d->comp[i].hSamp = (samp >> 4) & 0x0F;
     d->comp[i].vSamp = samp & 0x0F;
     d->comp[i].qtSel = pjRead8(f);
+
+    // ISO/IEC 10918 bounds used by baseline interleaved JPEG: sampling
+    // factors 1..4 and at most 10 data units per MCU. Enforce them before
+    // any workspace-size arithmetic.
+    if (d->comp[i].hSamp < 1 || d->comp[i].hSamp > 4 ||
+        d->comp[i].vSamp < 1 || d->comp[i].vSamp > 4 ||
+        d->comp[i].qtSel > 3) return false;
+    blocksPerMcu += static_cast<uint16_t>(d->comp[i].hSamp) *
+                    static_cast<uint16_t>(d->comp[i].vSamp);
+    if (blocksPerMcu > 10U) return false;
+
     if (d->comp[i].hSamp > d->maxH) d->maxH = d->comp[i].hSamp;
     if (d->comp[i].vSamp > d->maxV) d->maxV = d->comp[i].vSamp;
   }
+  if (d->maxH == 0 || d->maxV == 0) return false;
 
   d->mcuW = d->maxH * 8;
   d->mcuH = d->maxV * 8;
   d->mcuCntX = (d->width + d->mcuW - 1) / d->mcuW;
   d->mcuCntY = (d->height + d->mcuH - 1) / d->mcuH;
-
-  d->blocksPerMCU = 0;
-  for (int i = 0; i < d->nComp; i++) {
-    d->blocksPerMCU += d->comp[i].hSamp * d->comp[i].vSamp;
-  }
+  d->blocksPerMCU = static_cast<uint8_t>(blocksPerMcu);
 
   pjComputeBlockOffsets(d);
   return true;
@@ -1001,9 +1008,18 @@ static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
         break;
       case M_SOS: {
         if (!pjParseSOS(f, d)) return false;
+        // Baseline multiscan is optional for SlideShow. This renderer handles
+        // one interleaved scan only; reject separate-component scans rather
+        // than displaying an incomplete image.
+        if (d->scanNComp != d->nComp) {
+          DIAG_PRINTF("[SLS/JPEG] multiscan baseline unsupported scanComp=%u frameComp=%u\n",
+                        static_cast<unsigned>(d->scanNComp),
+                        static_cast<unsigned>(d->nComp));
+          return false;
+        }
         d->br.init(&f);
-        // Baseline-only fix for the historical gray MCU at the end of a scan.
-        // Progressive decoding remains byte-for-byte on the original path.
+        // Prevent baseline bitstream read-ahead past the final MCU when no
+        // restart markers are present.
         d->br.safeTail = (d->restartInterval == 0);
 
         int blocksPerRow = d->mcuCntX * d->blocksPerMCU;
@@ -1011,18 +1027,15 @@ static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
         size_t pixelBufSize = blocksPerRow * 64;
         size_t totalSize = coefSize + pixelBufSize;
 
-        // Normal path: borrow the persistent slideshow workspace. Only fall
-        // back to the legacy temporary allocation if an unusual image needs
-        // more than the shared arena.
-        bool ownsBaseBuf = false;
-        uint8_t* baseBuf = nullptr;
-        if (workspace && workspaceSize >= totalSize) {
-          baseBuf = workspace;
-        } else {
-          baseBuf = (uint8_t*)malloc(totalSize);
-          ownsBaseBuf = true;
+        // Runtime heap allocation is forbidden: the slideshow arena must fit
+        // every baseline row workspace for a supported image.
+        if (!workspace || workspaceSize < totalSize) {
+          DIAG_PRINTF("[SLS/JPEG] baseline workspace too small need=%u have=%u\n",
+                        static_cast<unsigned>(totalSize),
+                        static_cast<unsigned>(workspaceSize));
+          return false;
         }
-        if (!baseBuf) return false;
+        uint8_t* baseBuf = workspace;
 
         int16_t* rowCoefs = (int16_t*)baseBuf;
         uint8_t* allBlocks = baseBuf + coefSize;
@@ -1064,7 +1077,6 @@ static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
           if (d->br.hitMarker) break;
         }
 
-        if (ownsBaseBuf) free(baseBuf);
         return true;
       }
       default:
@@ -1093,96 +1105,60 @@ bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
   PJDecoder* d = &pjDecoderState;
   memset(d, 0, sizeof(*d));
 
-  // Pre-scan to get dimensions and type
+  // Pre-scan only far enough to identify frame coding and dimensions.
   f.seek(0);
   bool foundSOF = false;
   bool isBaseline = false;
+  bool isProgressive = false;
   while (!foundSOF) {
-    int marker = pjSkipToMarker(f);
+    const int marker = pjSkipToMarker(f);
     if (marker < 0 || marker == M_EOI) break;
     if (marker == M_SOF0) {
-      pjParseSOF(f, d);
+      if (!pjParseSOF(f, d)) { f.close(); return false; }
       isBaseline = true;
       foundSOF = true;
     } else if (marker == M_SOF2) {
-      pjParseSOF(f, d);
+      if (!pjParseSOF(f, d)) { f.close(); return false; }
+      isProgressive = true;
       foundSOF = true;
     } else if (marker != M_SOI && !(marker >= M_RST0 && marker <= M_RST7)) {
-      int len = pjRead16(f);
+      const int len = pjRead16(f);
       if (len >= 2) pjSkip(f, len - 2);
     }
   }
 
   if (!foundSOF || d->width == 0 || d->height == 0) {
-    f.close(); return false;
+    f.close();
+    return false;
+  }
+  if (isProgressive || !isBaseline) {
+    DIAG_PRINTLN("[SLS/JPEG] progressive coding ignored (optional in DAB SlideShow Simple Profile)");
+    f.close();
+    return false;
+  }
+  if (d->width > static_cast<uint16_t>(displayWidth) ||
+      d->height > static_cast<uint16_t>(displayHeight)) {
+    DIAG_PRINTF("[SLS/JPEG] unsupported dimensions=%ux%u max=%dx%d\n",
+                  static_cast<unsigned>(d->width),
+                  static_cast<unsigned>(d->height),
+                  displayWidth, displayHeight);
+    f.close();
+    return false;
+  }
+  if (d->nComp != 1U && d->nComp != 3U) {
+    // ETSI permits up to four JPEG components, but this compact renderer does
+    // not implement CMYK/YCCK conversion. Reject it explicitly rather than
+    // producing wrong colours.
+    DIAG_PRINTF("[SLS/JPEG] unsupported component count=%u (renderer supports 1 or 3)\n",
+                  static_cast<unsigned>(d->nComp));
+    f.close();
+    return false;
   }
 
-  int offsetX = (displayWidth - d->width) / 2;
-  int offsetY = (displayHeight - d->height) / 2;
-
-  bool result;
-  if (isBaseline) {
-    result = pjDecodeBaselinePass(f, d, tft, offsetX, offsetY,
-                                  workspace, workspaceSize);
-  } else {
-    // Progressive: multi-pass row-by-row decode
-    // Single allocation to reduce heap fragmentation on ESP32
-    int blocksPerRow = d->mcuCntX * d->blocksPerMCU;
-    size_t coefSize = blocksPerRow * 64 * sizeof(int16_t);
-    size_t pixelBufSize = blocksPerRow * 64;
-    size_t bitmapSize = d->totalImageBlocks * 8;
-    size_t totalSize = coefSize + pixelBufSize + bitmapSize;
-
-    uint8_t* progBuf = nullptr;
-    uint8_t* nzBitmap = nullptr;
-    bool ownsProgBuf = false;
-
-    if (workspace && workspaceSize >= totalSize) {
-      progBuf = workspace;
-      memset(progBuf, 0, totalSize);
-      nzBitmap = progBuf + coefSize + pixelBufSize;
-    } else {
-      // Compatibility fallback for an image larger than the shared arena:
-      // preserve the original full-bitmap allocation attempt first.
-      progBuf = (uint8_t*)calloc(1, totalSize);
-      ownsProgBuf = (progBuf != nullptr);
-      if (progBuf) {
-        nzBitmap = progBuf + coefSize + pixelBufSize;
-      } else {
-        // Original low-memory fallback: decode without nzBitmap. If the
-        // persistent arena is large enough for this reduced requirement, use
-        // it before attempting another temporary heap allocation.
-        bitmapSize = 0;
-        totalSize = coefSize + pixelBufSize;
-        if (workspace && workspaceSize >= totalSize) {
-          progBuf = workspace;
-          memset(progBuf, 0, totalSize);
-        } else {
-          progBuf = (uint8_t*)calloc(1, totalSize);
-          ownsProgBuf = (progBuf != nullptr);
-        }
-        if (!progBuf) {
-          f.close();
-          return false;
-        }
-        nzBitmap = nullptr;
-      }
-    }
-
-    int16_t* rowCoefs = (int16_t*)progBuf;
-    uint8_t* allBlocks = progBuf + coefSize;
-
-    for (int row = 0; row < d->mcuCntY; row++) {
-      memset(rowCoefs, 0, coefSize);
-      if (nzBitmap) memset(nzBitmap, 0, bitmapSize);
-      pjProcessFileForRow(f, d, rowCoefs, row, nzBitmap);
-      pjOutputMCURow(d, rowCoefs, row, tft, offsetX, offsetY, allBlocks);
-    }
-
-    if (ownsProgBuf) free(progBuf);
-    result = true;
-  }
-
+  const int offsetX = (displayWidth - d->width) / 2;
+  const int offsetY = (displayHeight - d->height) / 2;
+  const bool result = pjDecodeBaselinePass(f, d, tft, offsetX, offsetY,
+                                           workspace, workspaceSize);
   f.close();
   return result;
 }

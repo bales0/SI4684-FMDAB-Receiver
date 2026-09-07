@@ -2,8 +2,8 @@
 //
 // Implementation notes:
 //   - The supplied Si468x library owns the common CTS/error state machine.
-//     Legacy DAB parsers below still use SPIbuffer, but all their commands are
-//     routed through that one common transport.
+//     DAB parsers that still use SPIbuffer route all commands through that one
+//     common transport.
 //   - Commands and reply layouts mirror the Si468x programming guide (AN649).
 //   - Slideshow segments and the assembled current image stay in RAM.
 
@@ -61,6 +61,19 @@ uint8_t DabDynamicLabelLengthValue(void) {
 
 uint8_t slaveSelectPin;
 
+// The TFT stays on TFT_eSPI's VSPI/SPI3 host. The radio owns HSPI/SPI2 for the
+// whole ESP32 uptime. Calling global SPI.begin() with the radio pins would still
+// select VSPI and collide with the TFT host/APB callback registration.
+static constexpr int RADIO_SPI_SCK = 14;
+static constexpr int RADIO_SPI_MISO = 16;
+static constexpr int RADIO_SPI_MOSI = 13;
+static constexpr int RADIO_SPI_CS = 15;
+static constexpr uint32_t RADIO_SPI_HZ = 10000000UL;
+static SPIClass RadioSPI(HSPI);
+static bool radioSpiInitialized = false;
+static bool radioMemoryPrepareAttempted = false;
+static bool radioMemoryPrepared = false;
+
 static si468x::Si468x chip;
 // One 4 KiB workspace reduces the approximately 0.5 MB firmware image to
 // 4092-byte HOST_LOAD payloads (4096 bytes including the three command args).
@@ -110,8 +123,8 @@ static constexpr uint16_t RADIO_PIN_CONFIG_AUDIO =
 // Keep INTB as the fast path for real events and retain short, bounded safety
 // polls so a disconnected or faulty application IRQ cannot stall the UI.
 static constexpr uint32_t RADIO_INTB_CTS_SAFETY_US = 2000UL;
-static constexpr uint32_t RADIO_FM_DIAG_INTERVAL_MS = 5000UL;
-static constexpr uint32_t RADIO_DAB_DIAG_INTERVAL_MS = 5000UL;
+static constexpr uint32_t RADIO_FM_DIAG_INTERVAL_MS = 30000UL;
+static constexpr uint32_t RADIO_DAB_DIAG_INTERVAL_MS = 30000UL;
 static constexpr uint32_t RADIO_DAB_TUNE_TIMEOUT_MS = 5000UL;
 static constexpr uint8_t RADIO_DAB_MAX_DSRV_BURST = 4U;
 static constexpr uint16_t RADIO_DAB_EVENT_SERVICE_LIST = 0x0001U;
@@ -134,8 +147,11 @@ static uint32_t diagDabCommandErrorCount = 0;
 static uint32_t diagDabBusySkipCount = 0;
 static uint32_t diagDabLastReportMs = 0;
 
-// Boot diagnostics. HOST_LOAD is intentionally not logged chunk-by-chunk;
-// progress is reported roughly every 64 KiB to keep the UART readable.
+// Raw SPI/bootstrap tracing is compiled in but silent by default. The bare
+// serial command DEBUG enables it at runtime together with FM/DAB/RDS/SLS logs.
+
+// Boot diagnostics counters are retained even when verbose transport logging
+// is disabled because the compact boot summary reports total uploaded bytes.
 static uint8_t diagLoadPhase = 0;
 static uint32_t diagPhaseBytes[3] = {0, 0, 0};
 static uint32_t diagNextLoadReport = 65536UL;
@@ -222,7 +238,7 @@ static void promoteDetectedIntb(const char* stage) {
   chip.setCtsPollIntervalUs(RADIO_INTB_CTS_SAFETY_US);
   chip.setIdleStatusPollIntervalUs(50000UL);
 
-  Serial.printf(
+  DIAG_PRINTF(
       "[RADIO/IRQ] first INTB transition detected during %s cmd=0x%02X phase=%u; IRQ mode ACTIVE\n",
       stage ? stage : "command",
       static_cast<unsigned>(diagLastCommand),
@@ -235,7 +251,7 @@ static void usePollingFallback(const char* reason) {
   radioControlMode = RADIO_CTRL_POLL;
   chip.setCtsPollIntervalUs(1000);
   chip.setIdleStatusPollIntervalUs(20000);
-  Serial.printf("[RADIO/IRQ] %s; polling fallback\n", reason ? reason : "INTB disabled");
+  DIAG_PRINTF("[RADIO/IRQ] %s; polling fallback\n", reason ? reason : "INTB disabled");
 }
 
 // Runtime fallback also disables the physical INTB output. This helper is used
@@ -244,7 +260,7 @@ static void useRuntimePollingFallback(const char* reason) {
   usePollingFallback(reason);
   const si468x::Result pinConfigResult = chip.setProperty(
       si468x::Property::PIN_CONFIG_ENABLE, RADIO_PIN_CONFIG_AUDIO);
-  Serial.printf("[RADIO/IRQ] runtime PIN_CONFIG=0x%04X fallback result=%d\n",
+  DIAG_PRINTF("[RADIO/IRQ] runtime PIN_CONFIG=0x%04X fallback result=%d\n",
                 static_cast<unsigned>(RADIO_PIN_CONFIG_AUDIO),
                 static_cast<int>(pinConfigResult));
 }
@@ -255,63 +271,68 @@ static bool hostWriteCommand(void*, uint8_t command, const uint8_t* args, uint16
   commandStatusReadTriggeredByIrq = false;
   commandStartedUs = micros();
   if (command == 0x01) {
-    Serial.printf("[RADIO/SPI] POWER_UP args=%u data=", length);
-    for (uint16_t i = 0; i < length; ++i) Serial.printf("%02X%s", args[i], (i + 1U < length) ? " " : "");
-    Serial.println();
+    if (diagnosticDebug) {
+      DIAG_PRINTF("[RADIO/SPI] POWER_UP args=%u data=", length);
+      for (uint16_t i = 0; i < length; ++i)
+        DIAG_PRINTF("%02X%s", args[i], (i + 1U < length) ? " " : "");
+      DIAG_PRINTLN();
+    }
   } else if (command == 0x06) {
     if (diagLoadPhase < 2) ++diagLoadPhase;
     diagPhaseBytes[diagLoadPhase] = 0;
     diagNextLoadReport = 65536UL;
-    Serial.printf("[RADIO/SPI] LOAD_INIT phase=%u (%s)\n",
-                  diagLoadPhase, diagLoadPhase == 1 ? "PATCH" : "FIRMWARE");
+    if (diagnosticDebug)
+      DIAG_PRINTF("[RADIO/SPI] LOAD_INIT phase=%u (%s)\n",
+                    diagLoadPhase, diagLoadPhase == 1 ? "PATCH" : "FIRMWARE");
   } else if (command == 0x04) {
     if (diagLoadPhase <= 2) {
       const uint16_t payloadLength = length >= 3U ? length - 3U : 0U;
       diagPhaseBytes[diagLoadPhase] += payloadLength;
-      if (diagPhaseBytes[diagLoadPhase] == static_cast<uint32_t>(payloadLength) ||
-          diagPhaseBytes[diagLoadPhase] >= diagNextLoadReport) {
-        Serial.printf("[RADIO/SPI] HOST_LOAD phase=%u bytes=%u\n",
-                      diagLoadPhase, diagPhaseBytes[diagLoadPhase]);
+      if (diagPhaseBytes[diagLoadPhase] >= diagNextLoadReport) {
+        if (diagnosticDebug)
+          DIAG_PRINTF("[RADIO/SPI] HOST_LOAD phase=%u bytes=%u\n",
+                        diagLoadPhase, diagPhaseBytes[diagLoadPhase]);
         while (diagNextLoadReport <= diagPhaseBytes[diagLoadPhase])
           diagNextLoadReport += 65536UL;
       }
     }
-  } else if (command == 0x07) {
-    Serial.printf("[RADIO/SPI] BOOT patchBytes=%u fwBytes=%u\n",
+  } else if (command == 0x07 && diagnosticDebug) {
+    DIAG_PRINTF("[RADIO/SPI] BOOT patchBytes=%u fwBytes=%u\n",
                   diagPhaseBytes[1], diagPhaseBytes[2]);
   }
 
-  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  RadioSPI.beginTransaction(SPISettings(RADIO_SPI_HZ, MSBFIRST, SPI_MODE0));
   digitalWrite(slaveSelectPin, LOW);
-  SPI.transfer(command);
-  for (uint16_t i = 0; i < length; ++i) SPI.transfer(args[i]);
+  RadioSPI.transfer(command);
+  for (uint16_t i = 0; i < length; ++i) RadioSPI.transfer(args[i]);
   digitalWrite(slaveSelectPin, HIGH);
-  SPI.endTransaction();
+  RadioSPI.endTransaction();
   return true;
 }
 
 static bool hostReadReply(void*, uint8_t* destination, uint16_t length) {
   if (!destination || !length) return false;
-  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
+  RadioSPI.beginTransaction(SPISettings(RADIO_SPI_HZ, MSBFIRST, SPI_MODE0));
   digitalWrite(slaveSelectPin, LOW);
-  SPI.transfer(0);  // SPI framing byte; hidden from the common driver
-  for (uint16_t i = 0; i < length; ++i) destination[i] = SPI.transfer(0);
+  RadioSPI.transfer(0);  // SPI framing byte; hidden from the common driver
+  for (uint16_t i = 0; i < length; ++i) destination[i] = RadioSPI.transfer(0);
   digitalWrite(slaveSelectPin, HIGH);
-  SPI.endTransaction();
+  RadioSPI.endTransaction();
 
-  // Print raw replies for the two boot-state commands and for every command error.
-  // This exposes RESP4 (the AN649 command-error reason) without depending on
-  // any higher-level library diagnostic API.
-  if (diagLastCommand == 0x01 || diagLastCommand == 0x09 || (destination[0] & 0x40U)) {
+  // Raw SPI replies are useful only for transport debugging. Normal builds
+  // report command failures in the higher-level DAB/FM diagnostics instead.
+  if (diagnosticDebug &&
+      (diagLastCommand == 0x01 || diagLastCommand == 0x09 ||
+       (destination[0] & 0x40U))) {
     const uint16_t shown = length < 12 ? length : 12;
-    Serial.printf("[RADIO/SPI] REPLY cmd=0x%02X len=%u data=",
+    DIAG_PRINTF("[RADIO/SPI] REPLY cmd=0x%02X len=%u data=",
                   static_cast<unsigned>(diagLastCommand), static_cast<unsigned>(length));
     for (uint16_t i = 0; i < shown; ++i)
-      Serial.printf("%02X%s", destination[i], (i + 1U < shown) ? " " : "");
-    if (length > shown) Serial.print(" ...");
-    Serial.println();
+      DIAG_PRINTF("%02X%s", destination[i], (i + 1U < shown) ? " " : "");
+    if (length > shown) DIAG_PRINT(" ...");
+    DIAG_PRINTLN();
     if ((destination[0] & 0x40U) && length >= 5)
-      Serial.printf("[RADIO/SPI] ERR_CMD reason RESP4=0x%02X\n", destination[4]);
+      DIAG_PRINTF("[RADIO/SPI] ERR_CMD reason RESP4=0x%02X\n", destination[4]);
   }
   return true;
 }
@@ -378,7 +399,7 @@ static void statusChanged(void*, const si468x::Status& status) {
     // Keep a diagnostic for a genuinely long wait, but do not flood the UART
     // for the normal 2 ms hybrid safety poll.
     if (static_cast<uint32_t>(micros() - commandStartedUs) >= 200000UL)
-      Serial.println("[RADIO/IRQ] long CTS wait resolved by status poll");
+      DIAG_PRINTLN("[RADIO/IRQ] long CTS wait resolved by status poll");
   }
   commandAwaitingCts = false;
 }
@@ -399,8 +420,6 @@ static size_t progmemImageReader(void* context, uint32_t offset, uint8_t* destin
 }
 
 static void Set_Property(uint16_t property, uint16_t value);
-static String convertToUTF8(const wchar_t* input);
-static String extractUTF8Substring(const String& utf8String, size_t start, size_t length);
 static void charConverter(const char* input, wchar_t* output, size_t size);
 static int compareCompID(const void* a, const void* b);
 
@@ -451,7 +470,7 @@ static void Set_Property(uint16_t property, uint16_t value) {
   const si468x::Result result = chip.setProperty(property, value);
   finishCommandDiagnostics(result);
   if (result != si468x::Result::Ok)
-    Serial.printf("[RADIO/PROP] set 0x%04X=0x%04X failed result=%d\n",
+    DIAG_PRINTF("[RADIO/PROP] set 0x%04X=0x%04X failed result=%d\n",
                   static_cast<unsigned>(property),
                   static_cast<unsigned>(value), static_cast<int>(result));
 }
@@ -477,7 +496,7 @@ void DAB::applyFmRegionProperties(void) {
   Set_Property(0x3101, profile.maxFrequency10kHz);
   Set_Property(0x3102, profile.seekSpacing10kHz);
   Set_Property(0x3900, profile.deEmphasis);
-  Serial.printf("[FM/REGION] %s band=%u-%u spacing=%u de-emphasis=%u us data=%s\n",
+  DIAG_PRINTF("[FM/REGION] %s band=%u-%u spacing=%u de-emphasis=%u us data=%s\n",
                 profile.menuName, profile.minFrequency10kHz,
                 profile.maxFrequency10kHz, profile.seekSpacing10kHz,
                 profile.deEmphasis == 0 ? 75U : 50U,
@@ -489,40 +508,88 @@ void DAB::setFmRegion(uint8_t region, bool applyNow) {
   if (applyNow && isFm()) applyFmRegionProperties();
 }
 
+bool DAB::prepareRuntimeMemory(void) {
+  // Never retry later in begin(): a failed early reservation is a startup
+  // failure, not permission to fragment the heap and try again.
+  if (radioMemoryPrepareAttempted) return radioMemoryPrepared;
+  radioMemoryPrepareAttempted = true;
+
+  if (!slideshowSegBuf) {
+    slideshowSegBuf = static_cast<uint8_t*>(heap_caps_malloc(
+        SLS_BUFFER_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+  if (!slideshowSegBuf) {
+    DIAG_PRINTF("[RAM/SLS] ERROR: early MOT allocation failed bytes=%u free=%u largest=%u\n",
+                  static_cast<unsigned>(SLS_BUFFER_BYTES), ESP.getFreeHeap(),
+                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    return false;
+  }
+  DIAG_PRINTF("[RAM/SLS] early MOT buffer=%u address=%p free=%u largest=%u\n",
+                static_cast<unsigned>(SLS_BUFFER_BYTES), slideshowSegBuf,
+                ESP.getFreeHeap(),
+                heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+  if (!chipWorkspace) {
+    chipWorkspace = static_cast<uint8_t*>(heap_caps_malloc(
+        CHIP_WORKSPACE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+  if (!chipWorkspace) {
+    DIAG_PRINTF("[RAM/RADIO] ERROR: early HOST_LOAD workspace allocation failed bytes=%u free=%u largest=%u\n",
+                  static_cast<unsigned>(CHIP_WORKSPACE_BYTES), ESP.getFreeHeap(),
+                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    return false;
+  }
+  DIAG_PRINTF("[RAM/RADIO] early HOST_LOAD workspace=%u address=%p free=%u largest=%u\n",
+                static_cast<unsigned>(CHIP_WORKSPACE_BYTES), chipWorkspace,
+                ESP.getFreeHeap(),
+                heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+  radioMemoryPrepared = true;
+  return true;
+}
+
+bool DAB::prepareSpiBus(void) {
+  if (radioSpiInitialized) {
+    if (diagnosticDebug)
+      DIAG_PRINTLN("[RADIO/SPI] HSPI/SPI2 already initialised; begin skipped");
+    return true;
+  }
+
+  pinMode(RADIO_SPI_CS, OUTPUT);
+  digitalWrite(RADIO_SPI_CS, HIGH);
+  RadioSPI.begin(RADIO_SPI_SCK, RADIO_SPI_MISO, RADIO_SPI_MOSI, RADIO_SPI_CS);
+  radioSpiInitialized = true;
+  DIAG_PRINTF("[RADIO/SPI] HSPI/SPI2 initialised once SCK=%d MISO=%d MOSI=%d CS=%d\n",
+                RADIO_SPI_SCK, RADIO_SPI_MISO, RADIO_SPI_MOSI, RADIO_SPI_CS);
+  return true;
+}
+
 // Cold-start sequence per AN649:
 //   1. POWER_UP - configure clock + crystal
 //   2. LOAD_INIT + HOST_LOAD - upload the patch + firmware blobs from flash
 //   3. BOOT - jump to firmware
 //   4. Configure DAB-specific properties (sample rate, audio output, FIC etc.)
-// Returns true once the chip reports the DAB image is running.
+// Returns true once the chip reports the requested application image is running.
 bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   const uint32_t radioBeginMs = millis();
-  if (!chipWorkspace) {
-    chipWorkspace = static_cast<uint8_t*>(heap_caps_malloc(
-        CHIP_WORKSPACE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (!chipWorkspace) {
-      Serial.println("[RADIO/BOOT] ERROR: cannot allocate 4096-byte workspace");
-      return false;
-    }
+  if (!radioMemoryPrepared || !slideshowSegBuf || !chipWorkspace) {
+    DIAG_PRINTLN("[RADIO/BOOT] ERROR: persistent radio RAM was not prepared during setup");
+    return false;
   }
-  if (!slideshowSegBuf) {
-    slideshowSegBuf = static_cast<uint8_t*>(heap_caps_malloc(
-        SLS_BUFFER_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (!slideshowSegBuf) {
-      Serial.println("[RADIO/BOOT] ERROR: cannot allocate 51200-byte MOT buffer");
-      return false;
-    }
+  if (!radioSpiInitialized) {
+    DIAG_PRINTLN("[RADIO/BOOT] ERROR: HSPI/SPI2 was not prepared during setup");
+    return false;
   }
-  Serial.printf("[RAM/SLS] single MOT buffer=%u address=%p free=%u largest=%u\n",
-                (unsigned)SLS_BUFFER_BYTES, slideshowSegBuf,
+  DIAG_PRINTF("[RAM/SLS] persistent MOT buffer=%u address=%p free=%u largest=%u\n",
+                static_cast<unsigned>(SLS_BUFFER_BYTES), slideshowSegBuf,
                 ESP.getFreeHeap(),
                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
-  Serial.println();
-  Serial.println("[RADIO] ================================================");
-  Serial.printf("[RADIO] begin SS=%u requestedMode=%s\n",
+  DIAG_PRINTLN();
+  DIAG_PRINTLN("[RADIO] ================================================");
+  DIAG_PRINTF("[RADIO] begin SS=%u requestedMode=%s\n",
                 SSpin, requestedMode == RADIO_MODE_FM ? "FM" : "DAB");
-  Serial.printf("[RADIO] heap before begin=%u min=%u\n",
+  DIAG_PRINTF("[RADIO] heap before begin=%u min=%u\n",
                 ESP.getFreeHeap(), ESP.getMinFreeHeap());
 
   diagLoadPhase = 0;
@@ -628,26 +695,24 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
       setRadioIntbInterrupt(true, FALLING);
   }
   if (configuredGpio12Mode == GPIO12_INTB)
-    Serial.println("[RADIO/IRQ] GPIO12 setting INTB; FALLING IRQ active before radio commands");
+    DIAG_PRINTLN("[RADIO/IRQ] GPIO12 setting INTB; FALLING IRQ active before radio commands");
   else if (configuredGpio12Mode == GPIO12_IR)
-    Serial.println("[RADIO/IRQ] GPIO12 setting IR; radio forced to polling");
+    DIAG_PRINTLN("[RADIO/IRQ] GPIO12 setting IR; radio forced to polling");
   else if (radioControlMode == RADIO_CTRL_DETECT)
-    Serial.println("[RADIO/IRQ] GPIO12 setting AUTO; detecting INTB");
+    DIAG_PRINTLN("[RADIO/IRQ] GPIO12 setting AUTO; detecting INTB");
   else
-    Serial.printf("[RADIO/IRQ] AUTO reusing startup HW capability=%s\n",
+    DIAG_PRINTF("[RADIO/IRQ] AUTO reusing startup HW capability=%s\n",
                   radioIntbCapability == RadioIntbCapability::Present ? "INTB" : "POLL");
 
   pinMode(slaveSelectPin, OUTPUT);
-  digitalWrite(slaveSelectPin, HIGH);
-  // The Arduino SPI object is initialised once in setup(). Do not call
-  // SPI.begin() again here; all radio traffic uses transactions.
-  Serial.println("[RADIO] shared SPI already initialised; SPI.begin skipped");
   digitalWrite(slaveSelectPin, HIGH);
 #ifdef TFT_CS
   pinMode(TFT_CS, OUTPUT);
   digitalWrite(TFT_CS, HIGH);
 #endif
-  Serial.println("[RADIO] SPI ready");
+  // HSPI was started exactly once during setup(). External SI4684/TFT resets
+  // do not reset the ESP32 SPI hosts, so begin() only reuses the live bus.
+  DIAG_PRINTLN("[RADIO] dedicated HSPI/SPI2 ready; no SPI reinitialisation");
 
   si468x::HostInterface host;
   host.writeCommand = hostWriteCommand;
@@ -663,7 +728,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   chip.setIdleStatusPollIntervalUs(radioControlMode == RADIO_CTRL_INTB
                                        ? 50000UL
                                        : 20000UL);
-  Serial.printf("[RADIO/BOOT] workspace=%u chunk=%u CTS bootstrap=%s\n",
+  DIAG_PRINTF("[RADIO/BOOT] workspace=%u chunk=%u CTS bootstrap=%s\n",
                 static_cast<unsigned>(CHIP_WORKSPACE_BYTES),
                 static_cast<unsigned>(CHIP_HOST_LOAD_PAYLOAD),
                 controlModeName());
@@ -674,9 +739,9 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   // already running DAB/FM application image.
   delay(5);
   si468x::SystemState preState;
-  Serial.println("[RADIO] PRECHECK GET_SYS_STATE before POWER_UP");
+  DIAG_PRINTLN("[RADIO] PRECHECK GET_SYS_STATE before POWER_UP");
   si468x::Result preResult = chip.getSystemState(preState, 100000UL);
-  Serial.printf("[RADIO] PRECHECK result=%d image=%u status0=0x%02X status3=0x%02X\n",
+  DIAG_PRINTF("[RADIO] PRECHECK result=%d image=%u status0=0x%02X status3=0x%02X\n",
                 static_cast<int>(preResult),
                 preResult == si468x::Result::Ok ? static_cast<unsigned>(preState.image) : 255U,
                 preResult == si468x::Result::Ok ? static_cast<unsigned>(preState.status.status0) : static_cast<unsigned>(lastStatus0),
@@ -686,27 +751,25 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   const bool reuseRunningImage =
       preResult == si468x::Result::Ok && preState.image == expected;
 
-  // Do not touch the shared GPIO17 reset when the requested application is
-  // already running.  This preserves the TFT controller state.  A fresh/cold
-  // Si4684 STARTUP state (for example the diagnostic image value seen as 9) is
-  // still allowed to continue through POWER_UP + HOST_LOAD + BOOT.  If a real
-  // opposite application image is active, refuse here; mode switching is kept
-  // separate from this startup test because GPIO17 also resets the TFT.
+  // Do not touch shared GPIO17 when the requested application is already
+  // running; this preserves the TFT controller state. A Si4684 STARTUP image
+  // may continue through POWER_UP + HOST_LOAD + BOOT. If the opposite runtime
+  // application is active, refuse here because mode switching also resets TFT.
   if (reuseRunningImage) {
     if (configuredGpio12Mode == GPIO12_AUTO &&
         radioIntbCapability == RadioIntbCapability::Unknown) {
-      Serial.println("[RADIO/IRQ] running image without startup POWER_UP; INTB detection inconclusive");
+      DIAG_PRINTLN("[RADIO/IRQ] running image without startup POWER_UP; INTB detection inconclusive");
       return false;
     }
-    Serial.printf("[RADIO] active image already matches requested=%u - REUSE, no POWER_UP/upload\n",
+    DIAG_PRINTF("[RADIO] active image already matches requested=%u - REUSE, no POWER_UP/upload\n",
                   static_cast<unsigned>(expected));
   } else if (preResult == si468x::Result::Ok &&
              (preState.image == si468x::Image::DAB || preState.image == si468x::Image::FMHD)) {
-    Serial.printf("[RADIO] opposite active application image=%u requested=%u - refusing shared reset\n",
+    DIAG_PRINTF("[RADIO] opposite active application image=%u requested=%u - refusing shared reset\n",
                   static_cast<unsigned>(preState.image), static_cast<unsigned>(expected));
     return false;
   } else {
-    Serial.printf("[RADIO] startup/bootloader state image=%u - boot sequence required\n",
+    DIAG_PRINTF("[RADIO] startup/bootloader state image=%u - boot sequence required\n",
                   preResult == si468x::Result::Ok ? static_cast<unsigned>(preState.image) : 255U);
   }
 
@@ -732,7 +795,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   uint32_t patchUploadMs = 0;
   uint32_t firmwareUploadMs = 0;
   if (!reuseRunningImage) {
-    Serial.printf("[RADIO] bootHostImage start: patch=%u B image=%s %u B\n",
+    DIAG_PRINTF("[RADIO] bootHostImage start: patch=%u B image=%s %u B\n",
                   static_cast<unsigned>(sizeof(rom_patch_016)),
                   requestedMode == RADIO_MODE_FM ? "FMHD 5.3.3" : "DAB 6.0.9",
                   static_cast<unsigned>(imageSize));
@@ -755,7 +818,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
       powerUpStartChanges = 0;
       powerUpStartFall = 0;
       powerUpStartRise = 0;
-      Serial.printf("[RADIO/IRQTEST] before POWER_UP INTB=%d changes=0 fall=0 rise=0\n",
+      DIAG_PRINTF("[RADIO/IRQTEST] before POWER_UP INTB=%d changes=0 fall=0 rise=0\n",
                     intbBeforePowerUp);
     }
     result = chip.powerUp(power, 1000000UL);
@@ -765,7 +828,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
       const uint32_t powerUpChanges = radioIntbEdges() - powerUpStartChanges;
       const uint32_t powerUpFall = radioIntbFallingEdges() - powerUpStartFall;
       const uint32_t powerUpRise = radioIntbRisingEdges() - powerUpStartRise;
-      Serial.printf("[RADIO/IRQTEST] after POWER_UP result=%d status0=0x%02X INTB=%d changes=%u fall=%u rise=%u viaIrq=%u\n",
+      DIAG_PRINTF("[RADIO/IRQTEST] after POWER_UP result=%d status0=0x%02X INTB=%d changes=%u fall=%u rise=%u viaIrq=%u\n",
                     static_cast<int>(result), static_cast<unsigned>(lastStatus0),
                     intbAfterPowerUp, static_cast<unsigned>(powerUpChanges),
                     static_cast<unsigned>(powerUpFall),
@@ -773,27 +836,27 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
                     radioPowerUpCtsViaIrq ? 1U : 0U);
 
       if (result != si468x::Result::Ok) {
-        Serial.println("[RADIO/IRQ] POWER_UP failed; INTB detection inconclusive");
+        DIAG_PRINTLN("[RADIO/IRQ] POWER_UP failed; INTB detection inconclusive");
       } else if (powerUpChanges > 0U) {
         radioIntbCapability = RadioIntbCapability::Present;
         radioControlMode = RADIO_CTRL_INTB;
         chip.setCtsPollIntervalUs(RADIO_INTB_CTS_SAFETY_US);
         chip.setIdleStatusPollIntervalUs(50000UL);
-        Serial.printf("[RADIO/IRQTEST] POWER_UP transition observed before=%d after=%d changes=%u fall=%u rise=%u\n",
+        DIAG_PRINTF("[RADIO/IRQTEST] POWER_UP transition observed before=%d after=%d changes=%u fall=%u rise=%u\n",
                       intbBeforePowerUp, intbAfterPowerUp,
                       static_cast<unsigned>(powerUpChanges),
                       static_cast<unsigned>(powerUpFall),
                       static_cast<unsigned>(powerUpRise));
-        Serial.printf("[RADIO/IRQ] POWER_UP CTS via %s\n",
+        DIAG_PRINTF("[RADIO/IRQ] POWER_UP CTS via %s\n",
                       radioPowerUpCtsViaIrq ? "INTB" : "safety poll");
-        Serial.println("[RADIO/IRQ] INTB connected; IRQ mode");
+        DIAG_PRINTLN("[RADIO/IRQ] INTB connected; IRQ mode");
       } else {
         // Do NOT classify Absent here. Keep DETECT active into LOAD_INIT /
         // HOST_LOAD / BOOT. The first later transition promotes immediately to
         // INTB mode inside hostIdle(); only if the whole boot produces no
         // transition do we need the explicit application probe after BOOT.
-        Serial.println("[RADIO/IRQTEST] POWER_UP produced no GPIO12 transition");
-        Serial.println("[RADIO/IRQTEST] continuing DETECT into LOAD_INIT/HOST_LOAD/BOOT; first toggle will activate IRQ immediately");
+        DIAG_PRINTLN("[RADIO/IRQTEST] POWER_UP produced no GPIO12 transition");
+        DIAG_PRINTLN("[RADIO/IRQTEST] continuing DETECT into LOAD_INIT/HOST_LOAD/BOOT; first toggle will activate IRQ immediately");
       }
     }
 
@@ -815,19 +878,19 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     firmwareUploadMs = millis() - firmwareStartMs;
     if (result == si468x::Result::Ok) result = chip.boot(1000000UL);
 
-    Serial.printf("[RADIO] bootHostImage result=%d elapsed=%u ms status0=0x%02X patchBytes=%u fwBytes=%u\n",
+    DIAG_PRINTF("[RADIO] bootHostImage result=%d elapsed=%u ms status0=0x%02X patchBytes=%u fwBytes=%u\n",
                   static_cast<int>(result),
                   static_cast<unsigned>(millis() - bootStartMs),
                   static_cast<unsigned>(lastStatus0),
                   static_cast<unsigned>(diagPhaseBytes[1]),
                   static_cast<unsigned>(diagPhaseBytes[2]));
     if (result != si468x::Result::Ok) {
-      Serial.println("[RADIO] ERROR: bootHostImage failed");
+      DIAG_PRINTLN("[RADIO] ERROR: bootHostImage failed");
       return false;
     }
 
   } else {
-    Serial.println("[RADIO] bootHostImage skipped; preserving running image and TFT state");
+    DIAG_PRINTLN("[RADIO] bootHostImage skipped; preserving running image and TFT state");
   }
 
   // If POWER_UP itself was silent, DETECT stayed armed through the complete
@@ -836,7 +899,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   // HOST_LOAD or BOOT generated a usable INTB event. Only a completely silent
   // boot reaches the deterministic application-firmware fallback probe below.
   radioBootIrqEdgeCount = radioIntbEdges();
-  Serial.printf("[RADIO/IRQ] boot INTB edges=%u\n",
+  DIAG_PRINTF("[RADIO/IRQ] boot INTB edges=%u\n",
                 static_cast<unsigned>(radioBootIrqEdgeCount));
 
   const bool applicationProbeNeeded =
@@ -872,7 +935,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     appStartFall = radioIntbFallingEdges();
     appStartRise = radioIntbRisingEdges();
     appIntbBefore = digitalRead(SI4684_INTB_PIN);
-    Serial.printf("[RADIO/IRQTEST] before APP bootstrap INTB=%d changes=%u fall=%u rise=%u\n",
+    DIAG_PRINTF("[RADIO/IRQTEST] before APP bootstrap INTB=%d changes=%u fall=%u rise=%u\n",
                   appIntbBefore,
                   static_cast<unsigned>(appStartChanges),
                   static_cast<unsigned>(appStartFall),
@@ -889,7 +952,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
 
   si468x::Result pinConfigResult = chip.setProperty(
       si468x::Property::PIN_CONFIG_ENABLE, pinConfig);
-  Serial.printf("[RADIO/IRQ] runtime PIN_CONFIG=0x%04X result=%d\n",
+  DIAG_PRINTF("[RADIO/IRQ] runtime PIN_CONFIG=0x%04X result=%d\n",
                 static_cast<unsigned>(pinConfig),
                 static_cast<int>(pinConfigResult));
 
@@ -899,20 +962,20 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   if ((runtimeIntbRequested || irPollingBootstrap) &&
       pinConfigResult == si468x::Result::Ok) {
     runtimeCtsResult = chip.setInterruptEnable(si468x::INTERRUPT_CTS);
-    Serial.printf("[RADIO/IRQ] runtime sources=0x%04X stage=%s result=%d\n",
+    DIAG_PRINTF("[RADIO/IRQ] runtime sources=0x%04X stage=%s result=%d\n",
                   static_cast<unsigned>(si468x::INTERRUPT_CTS),
                   irPollingBootstrap ? "IR-poll-bootstrap" : "bootstrap",
                   static_cast<int>(runtimeCtsResult));
     if (runtimeCtsResult == si468x::Result::Ok) {
       pendingStatusResult = chip.readStatus(pendingStatus);
-      Serial.printf("[RADIO/IRQ] runtime pending status=0x%02X readResult=%d\n",
+      DIAG_PRINTF("[RADIO/IRQ] runtime pending status=0x%02X readResult=%d\n",
                     static_cast<unsigned>(pendingStatus.status0),
                     static_cast<int>(pendingStatusResult));
     }
   }
 
   if (pinConfigResult != si468x::Result::Ok) {
-    Serial.println("[RADIO] ERROR: PIN_CONFIG_ENABLE failed");
+    DIAG_PRINTLN("[RADIO] ERROR: PIN_CONFIG_ENABLE failed");
     return false;
   }
 
@@ -923,7 +986,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   if (applicationProbeNeeded) {
     if (runtimeCtsResult != si468x::Result::Ok ||
         pendingStatusResult != si468x::Result::Ok) {
-      Serial.println("[RADIO/IRQTEST] application INTB bootstrap failed; detection inconclusive");
+      DIAG_PRINTLN("[RADIO/IRQTEST] application INTB bootstrap failed; detection inconclusive");
       return false;
     }
 
@@ -934,7 +997,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     takeRadioIntb();
     radioAppTestCtsViaIrq = false;
     const int appBeforeGetPart = digitalRead(SI4684_INTB_PIN);
-    Serial.printf("[RADIO/IRQTEST] before APP GET_PART_INFO INTB=%d appChanges=%u fall=%u rise=%u\n",
+    DIAG_PRINTF("[RADIO/IRQTEST] before APP GET_PART_INFO INTB=%d appChanges=%u fall=%u rise=%u\n",
                   appBeforeGetPart,
                   static_cast<unsigned>(radioIntbEdges() - appStartChanges),
                   static_cast<unsigned>(radioIntbFallingEdges() - appStartFall),
@@ -947,7 +1010,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     const uint32_t appFall = radioIntbFallingEdges() - appStartFall;
     const uint32_t appRise = radioIntbRisingEdges() - appStartRise;
 
-    Serial.printf("[RADIO/IRQTEST] after APP GET_PART_INFO result=%d status0=0x%02X INTB=%d changes=%u fall=%u rise=%u viaIrq=%u part=%u\n",
+    DIAG_PRINTF("[RADIO/IRQTEST] after APP GET_PART_INFO result=%d status0=0x%02X INTB=%d changes=%u fall=%u rise=%u viaIrq=%u part=%u\n",
                   static_cast<int>(appProbeResult),
                   static_cast<unsigned>(lastStatus0), appIntbAfter,
                   static_cast<unsigned>(appChanges),
@@ -957,7 +1020,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
                   partInfoAlreadyRead ? static_cast<unsigned>(part.partNumber) : 0U);
 
     if (appProbeResult != si468x::Result::Ok) {
-      Serial.println("[RADIO/IRQTEST] application probe command failed; INTB detection inconclusive");
+      DIAG_PRINTLN("[RADIO/IRQTEST] application probe command failed; INTB detection inconclusive");
       return false;
     }
 
@@ -966,22 +1029,22 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
       radioControlMode = RADIO_CTRL_INTB;
       chip.setCtsPollIntervalUs(RADIO_INTB_CTS_SAFETY_US);
       chip.setIdleStatusPollIntervalUs(50000UL);
-      Serial.printf("[RADIO/IRQTEST] application INTB transition observed before=%d after=%d changes=%u fall=%u rise=%u\n",
+      DIAG_PRINTF("[RADIO/IRQTEST] application INTB transition observed before=%d after=%d changes=%u fall=%u rise=%u\n",
                     appIntbBefore, appIntbAfter,
                     static_cast<unsigned>(appChanges),
                     static_cast<unsigned>(appFall),
                     static_cast<unsigned>(appRise));
-      Serial.printf("[RADIO/IRQTEST] APP GET_PART_INFO CTS serviced via %s\n",
+      DIAG_PRINTF("[RADIO/IRQTEST] APP GET_PART_INFO CTS serviced via %s\n",
                     radioAppTestCtsViaIrq ? "INTB" : "safety polling");
-      Serial.println("[RADIO/IRQ] INTB connected; IRQ mode confirmed by application firmware");
+      DIAG_PRINTLN("[RADIO/IRQ] INTB connected; IRQ mode confirmed by application firmware");
     } else {
       radioIntbCapability = RadioIntbCapability::Absent;
-      Serial.printf("[RADIO/IRQTEST] application firmware produced no GPIO12 transition INTB=%d->%d\n",
+      DIAG_PRINTF("[RADIO/IRQTEST] application firmware produced no GPIO12 transition INTB=%d->%d\n",
                     appIntbBefore, appIntbAfter);
       usePollingFallback("no application INTB transition");
       pinConfigResult = chip.setProperty(
           si468x::Property::PIN_CONFIG_ENABLE, RADIO_PIN_CONFIG_AUDIO);
-      Serial.printf("[RADIO/IRQ] runtime PIN_CONFIG=0x%04X after failed probe result=%d\n",
+      DIAG_PRINTF("[RADIO/IRQ] runtime PIN_CONFIG=0x%04X after failed probe result=%d\n",
                     static_cast<unsigned>(RADIO_PIN_CONFIG_AUDIO),
                     static_cast<int>(pinConfigResult));
       if (pinConfigResult != si468x::Result::Ok) return false;
@@ -993,14 +1056,14 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
       takeRadioIntb();
       chip.setCtsPollIntervalUs(RADIO_INTB_CTS_SAFETY_US);
       chip.setIdleStatusPollIntervalUs(50000UL);
-      Serial.println("[RADIO/IRQ] runtime INTB armed");
+      DIAG_PRINTLN("[RADIO/IRQ] runtime INTB armed");
     } else {
       useRuntimePollingFallback("runtime INTB bootstrap failed");
     }
   } else if (irPollingBootstrap) {
     if (runtimeCtsResult != si468x::Result::Ok ||
         pendingStatusResult != si468x::Result::Ok) {
-      Serial.println("[RADIO/IRQ] ERROR: IR polling bootstrap failed");
+      DIAG_PRINTLN("[RADIO/IRQ] ERROR: IR polling bootstrap failed");
       return false;
     }
     // Keep the same bounded polling values used by AUTO after INTB absence.
@@ -1008,7 +1071,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     radioIntbCapability = RadioIntbCapability::Absent;
     chip.setCtsPollIntervalUs(1000UL);
     chip.setIdleStatusPollIntervalUs(20000UL);
-    Serial.println("[RADIO/IRQ] IR polling bootstrap complete; AUTO fallback state matched");
+    DIAG_PRINTLN("[RADIO/IRQ] IR polling bootstrap complete; AUTO fallback state matched");
   }
 
   // Start runtime edge telemetry after the one-shot application probe so its
@@ -1018,65 +1081,65 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   radioBootIrqEdgeCount = radioIntbEdges();
 
   if (!partInfoAlreadyRead) {
-    Serial.println("[RADIO] GET_PART_INFO");
+    DIAG_PRINTLN("[RADIO] GET_PART_INFO");
     result = chip.getPartInfo(part);
-    Serial.printf("[RADIO] GET_PART_INFO result=%d part=%u status0=0x%02X\n",
+    DIAG_PRINTF("[RADIO] GET_PART_INFO result=%d part=%u status0=0x%02X\n",
                   static_cast<int>(result),
                   result == si468x::Result::Ok ? static_cast<unsigned>(part.partNumber) : 0U,
                   static_cast<unsigned>(lastStatus0));
   } else {
     result = si468x::Result::Ok;
-    Serial.printf("[RADIO] GET_PART_INFO reused application probe part=%u status0=0x%02X\n",
+    DIAG_PRINTF("[RADIO] GET_PART_INFO reused application probe part=%u status0=0x%02X\n",
                   static_cast<unsigned>(part.partNumber),
                   static_cast<unsigned>(lastStatus0));
   }
   if (result != si468x::Result::Ok || part.partNumber != 4684) {
-    Serial.println("[RADIO] ERROR: GET_PART_INFO failed or part != 4684");
+    DIAG_PRINTLN("[RADIO] ERROR: GET_PART_INFO failed or part != 4684");
     return false;
   }
   snprintf(ChipType, sizeof(ChipType), "SI%u", part.partNumber);
 
-  Serial.println("[RADIO] GET_SYS_STATE");
+  DIAG_PRINTLN("[RADIO] GET_SYS_STATE");
   result = chip.getSystemState(state);
-  Serial.printf("[RADIO] GET_SYS_STATE result=%d image=%u status0=0x%02X\n",
+  DIAG_PRINTF("[RADIO] GET_SYS_STATE result=%d image=%u status0=0x%02X\n",
                 static_cast<int>(result),
                 result == si468x::Result::Ok ? static_cast<unsigned>(state.image) : 0xFFU,
                 static_cast<unsigned>(lastStatus0));
   if (result != si468x::Result::Ok) {
-    Serial.println("[RADIO] ERROR: GET_SYS_STATE failed");
+    DIAG_PRINTLN("[RADIO] ERROR: GET_SYS_STATE failed");
     return false;
   }
   if (state.image != expected) {
-    Serial.printf("[RADIO] ERROR: wrong active image expected=%u actual=%u\n",
+    DIAG_PRINTF("[RADIO] ERROR: wrong active image expected=%u actual=%u\n",
                   static_cast<unsigned>(expected), static_cast<unsigned>(state.image));
     return false;
   }
   activeMode = requestedMode;
 
   si468x::FunctionInfo functionInfo;
-  Serial.println("[RADIO] GET_FUNC_INFO");
+  DIAG_PRINTLN("[RADIO] GET_FUNC_INFO");
   result = chip.getFunctionInfo(functionInfo);
-  Serial.printf("[RADIO] GET_FUNC_INFO result=%d status0=0x%02X\n",
+  DIAG_PRINTF("[RADIO] GET_FUNC_INFO result=%d status0=0x%02X\n",
                 static_cast<int>(result), static_cast<unsigned>(lastStatus0));
   if (result != si468x::Result::Ok) {
-    Serial.println("[RADIO] ERROR: GET_FUNC_INFO failed");
+    DIAG_PRINTLN("[RADIO] ERROR: GET_FUNC_INFO failed");
     return false;
   }
   snprintf(FirmwVersion, sizeof(FirmwVersion), "%u.%u.%u",
            functionInfo.major, functionInfo.minor, functionInfo.build);
-  Serial.printf("[RADIO] Si%u image=%s firmware=%s\n", part.partNumber,
+  DIAG_PRINTF("[RADIO] Si%u image=%s firmware=%s\n", part.partNumber,
                 requestedMode == RADIO_MODE_FM ? "FMHD" : "DAB", FirmwVersion);
 
-  Serial.println("[RADIO] shared properties begin");
+  DIAG_PRINTLN("[RADIO] shared properties begin");
   // Shared audio/front-end setup retained from the proven DAB configuration.
   Set_Property(0x0200, 0x8000);
   Set_Property(0x0202, 0x1600);
   Set_Property(0x1710, 0xFC4A);
   Set_Property(0x1711, 0x00F8);
-  Serial.println("[RADIO] shared properties done");
+  DIAG_PRINTLN("[RADIO] shared properties done");
 
   if (requestedMode == RADIO_MODE_DAB) {
-    Serial.println("[RADIO] DAB frequency list + generic properties");
+    DIAG_PRINTLN("[RADIO] DAB frequency list + generic properties");
     uint32_t frequencies[38];
     for (uint8_t i = 0; i < 38; ++i)
       frequencies[i] = DABfrequencyTable_DAB[i].frequency;
@@ -1112,7 +1175,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
             ? chip.readStatus(irqStatus)
             : irqResult;
     takeRadioIntb();
-    Serial.printf("[RADIO/IRQ] DAB freq=%d sources=0x%04X repeat=0x%04X dsrv=0x%04X event=0x%04X irq=%d read=%d\n",
+    DIAG_PRINTF("[RADIO/IRQ] DAB freq=%d sources=0x%04X repeat=0x%04X dsrv=0x%04X event=0x%04X irq=%d read=%d\n",
                   static_cast<int>(frequencyListResult),
                   static_cast<unsigned>(interruptSources),
                   static_cast<unsigned>(si468x::INTERRUPT_DSRV),
@@ -1130,7 +1193,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
         irqStatusResult != si468x::Result::Ok)
       useRuntimePollingFallback("DAB interrupt-source configuration failed");
   } else {
-    Serial.println("[RADIO] FM band/RDS properties");
+    DIAG_PRINTLN("[RADIO] FM band/RDS properties");
     applyFmRegionProperties();
     Set_Property(0x3200, 20);    // max tune error
     Set_Property(0x3202, 18);    // seek RSSI threshold (dBuV)
@@ -1149,7 +1212,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
             ? chip.readStatus(irqStatus)
             : irqResult;
     takeRadioIntb();
-    Serial.printf("[RADIO/IRQ] runtime sources=0x%04X mode=FM result=%d read=%d\n",
+    DIAG_PRINTF("[RADIO/IRQ] runtime sources=0x%04X mode=FM result=%d read=%d\n",
                   static_cast<unsigned>(interruptSources),
                   static_cast<int>(irqResult),
                   static_cast<int>(irqStatusResult));
@@ -1167,14 +1230,14 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   diagFmLastReportMs = millis();
   diagDabLastReportMs = millis();
   radioDabRuntimeActive = requestedMode == RADIO_MODE_DAB;
-  Serial.printf("[RADIO/BOOT] patch=%u ms firmware=%u ms total=%u ms mode=%s irqEdges=%u workspace=%u chunk=%u\n",
+  DIAG_PRINTF("[RADIO/BOOT] patch=%u ms firmware=%u ms total=%u ms mode=%s irqEdges=%u workspace=%u chunk=%u\n",
                 static_cast<unsigned>(patchUploadMs),
                 static_cast<unsigned>(firmwareUploadMs),
                 static_cast<unsigned>(millis() - radioBeginMs),
                 controlModeName(), static_cast<unsigned>(radioIntbEdges()),
                 static_cast<unsigned>(CHIP_WORKSPACE_BYTES),
                 static_cast<unsigned>(CHIP_HOST_LOAD_PAYLOAD));
-  Serial.printf("[RADIO] begin SUCCESS mode=%s firmware=%s heap=%u min=%u\n",
+  DIAG_PRINTF("[RADIO] begin SUCCESS mode=%s firmware=%s heap=%u min=%u\n",
                 requestedMode == RADIO_MODE_FM ? "FM" : "DAB",
                 FirmwVersion, ESP.getFreeHeap(), ESP.getMinFreeHeap());
   return true;
@@ -1293,12 +1356,10 @@ void DAB::getServiceData(void) {
       if (readResult == si468x::Result::Ok) {
         byte_count = SPIbuffer[19] + (SPIbuffer[20] << 8);
 
-        // Read DAB Dynamic Label (DLS). Si468x exposes the two DLS
-        // prefix bytes at PAYLOAD[0..1] and the complete character field from
-        // PAYLOAD+2. BYTE_COUNT covers the complete DSRV payload, hence only
-        // BYTE_COUNT-2 bytes belong to the displayed text. This follows the
-        // Si468x DLS handling used by independent working drivers and avoids
-        // the previous regression that tried to reassemble X-PAD segments here.
+        // Read DAB Dynamic Label (DLS). Si468x exposes the two DLS prefix bytes
+        // at PAYLOAD[0..1] and the character field from PAYLOAD+2. BYTE_COUNT
+        // covers the complete DSRV payload, so only BYTE_COUNT-2 bytes belong to
+        // the displayed text; X-PAD reassembly is not performed on this payload.
         if (((SPIbuffer[8] >> 6) & 0x03) == 0x02 && byte_count >= 2U) {
           const uint8_t dlsPrefix0 = SPIbuffer[25];
 
@@ -1314,10 +1375,9 @@ void DAB::getServiceData(void) {
             if (copyLength > sizeof(ServiceData)) copyLength = sizeof(ServiceData);
             memcpy(ServiceData, SPIbuffer + 27, copyLength);
 
-            // Keep an explicit byte length for UCS-2/UTF-16BE but discard only
-            // trailing NUL padding. The old working parser copied BYTE_COUNT
-            // bytes starting at PAYLOAD+2, i.e. two bytes past the payload;
-            // those foreign bytes could appear as random residual glyphs.
+            // Keep an explicit byte length for UCS-2/UTF-16BE and discard only
+            // trailing NUL padding. Copy exactly BYTE_COUNT-2 bytes so data beyond
+            // the DLS payload cannot appear as residual glyphs.
             while (copyLength > 0U && ServiceData[copyLength - 1U] == '\0')
               --copyLength;
             dabDynamicLabelLength = static_cast<uint8_t>(copyLength);
@@ -1344,24 +1404,24 @@ void DAB::getServiceData(void) {
 
           if (newLength == 0U || newLength > SLS_BUFFER_BYTES) {
             if (SlideShowDebug)
-              Serial.printf("[SLS] Reject header TID=%u length=%u\n",
+              DIAG_PRINTF("[SLS] Reject header TID=%u length=%u\n",
                             transportID, newLength);
           } else if (lastCompletedTransportIdValid &&
                      transportID == lastCompletedTransportId) {
             if (SlideShowDebug)
-              Serial.printf("[SLS] Ignore repeated completed header TID=%u\n",
+              DIAG_PRINTF("[SLS] Ignore repeated completed header TID=%u\n",
                             transportID);
           } else if (slideshowPublishedPending || SlideShowUpdate) {
             // The only image-sized buffer is still owned by the UI. DSRV is
             // deliberately drained, but no new object may claim the buffer.
             if (SlideShowDebug)
-              Serial.printf("[SLS] Hold published image; ignore header TID=%u\n",
+              DIAG_PRINTF("[SLS] Hold published image; ignore header TID=%u\n",
                             transportID);
           } else {
             if (SlideShowTransportIDValid &&
                 transportID != SlideShowTransportID) {
               if (SlideShowDebug)
-                Serial.printf("[SLS] Partial TID=%u abandoned; new header TID=%u\n",
+                DIAG_PRINTF("[SLS] Partial TID=%u abandoned; new header TID=%u\n",
                               SlideShowTransportID, transportID);
               lockSlideshowTransport(transportID);
             } else if (!SlideShowTransportIDValid) {
@@ -1373,7 +1433,7 @@ void DAB::getServiceData(void) {
               // Conflicting metadata for the same TID is corruption. Start the
               // same TID afresh using the newest complete header.
               if (SlideShowDebug)
-                Serial.printf("[SLS] TID=%u BodySize changed %u -> %u; reset\n",
+                DIAG_PRINTF("[SLS] TID=%u BodySize changed %u -> %u; reset\n",
                               transportID, SlideShowLength, newLength);
               lockSlideshowTransport(transportID);
               metadataChanged = true;
@@ -1384,7 +1444,7 @@ void DAB::getServiceData(void) {
             if (metadataChanged || SlideShowLastActivity == 0U)
               SlideShowLastActivity = millis();
             if (SlideShowDebug)
-              Serial.printf("[SLS] Header TID=%u length=%u bytes=%u\n",
+              DIAG_PRINTF("[SLS] Header TID=%u length=%u bytes=%u\n",
                             transportID, SlideShowLength,
                             SlideShowByteCounter);
 
@@ -1396,7 +1456,7 @@ void DAB::getServiceData(void) {
               assembleSlideshow();
             } else if (SlideShowByteCounter > SlideShowLength) {
               if (SlideShowDebug)
-                Serial.println("[SLS] Buffered bytes exceed BodySize; reset");
+                DIAG_PRINTLN("[SLS] Buffered bytes exceed BodySize; reset");
               resetSlideshowCollector();
             }
           }
@@ -1416,29 +1476,29 @@ void DAB::getServiceData(void) {
           if (lastCompletedTransportIdValid &&
               transportID == lastCompletedTransportId) {
             if (SlideShowDebug && segmentNumber == 0U)
-              Serial.printf("[SLS] Ignore repeated completed TID=%u\n",
+              DIAG_PRINTF("[SLS] Ignore repeated completed TID=%u\n",
                             transportID);
           } else if (slideshowPublishedPending || SlideShowUpdate) {
             // Preserve the complete image until acknowledgeSlideshow().
             if (SlideShowDebug && segmentNumber == 0U)
-              Serial.printf("[SLS] Hold published image; ignore seg=0 TID=%u\n",
+              DIAG_PRINTF("[SLS] Hold published image; ignore seg=0 TID=%u\n",
                             transportID);
           } else {
             if (SlideShowTransportIDValid &&
                 transportID != SlideShowTransportID && segmentNumber == 0U) {
               if (SlideShowDebug)
-                Serial.printf("[SLS] Partial TID=%u abandoned; new seg=0 TID=%u\n",
+                DIAG_PRINTF("[SLS] Partial TID=%u abandoned; new seg=0 TID=%u\n",
                               SlideShowTransportID, transportID);
               lockSlideshowTransport(transportID);
             } else if (!SlideShowTransportIDValid) {
               lockSlideshowTransport(transportID);
               if (SlideShowDebug)
-                Serial.printf("[SLS] Collector locked to TID=%u\n", transportID);
+                DIAG_PRINTF("[SLS] Collector locked to TID=%u\n", transportID);
             }
 
             if (transportID != SlideShowTransportID) {
               if (SlideShowDebug)
-                Serial.printf("[SLS] Ignore seg=%u TID=%u (collecting TID=%u)\n",
+                DIAG_PRINTF("[SLS] Ignore seg=%u TID=%u (collecting TID=%u)\n",
                               segmentNumber, transportID,
                               SlideShowTransportID);
             } else {
@@ -1461,7 +1521,7 @@ void DAB::getServiceData(void) {
                     dataLen > SLS_MAX_SEG_SIZE ||
                     SlideShowByteCounter > SLS_BUFFER_BYTES - dataLen) {
                   if (SlideShowDebug)
-                    Serial.printf("[SLS] Invalid seg=%u len=%u last=%u; reset TID=%u\n",
+                    DIAG_PRINTF("[SLS] Invalid seg=%u len=%u last=%u; reset TID=%u\n",
                                   segmentNumber, dataLen,
                                   lastSegment ? 1U : 0U, transportID);
                   resetSlideshowCollector();
@@ -1477,7 +1537,7 @@ void DAB::getServiceData(void) {
                   if (!storeSlideshowSegment(segmentNumber,
                                               SPIbuffer + 34, dataLen)) {
                     if (SlideShowDebug)
-                      Serial.printf("[SLS] Seg=%u len=%u does not fit packed buffer\n",
+                      DIAG_PRINTF("[SLS] Seg=%u len=%u does not fit packed buffer\n",
                                     segmentNumber, dataLen);
                     resetSlideshowCollector();
                   } else {
@@ -1496,7 +1556,7 @@ void DAB::getServiceData(void) {
                     SlideShowInit = true;
                     SlideShowLastActivity = millis();
                     if (SlideShowDebug)
-                      Serial.printf("[SLS] Saved TID=%u seg=%u len=%u bytes=%u/%u%s\n",
+                      DIAG_PRINTF("[SLS] Saved TID=%u seg=%u len=%u bytes=%u/%u%s\n",
                                     transportID, segmentNumber, dataLen,
                                     SlideShowByteCounter, SlideShowLength,
                                     lastSegment ? " LAST" : "");
@@ -1504,7 +1564,7 @@ void DAB::getServiceData(void) {
                     if (SlideShowLength != 0U &&
                         SlideShowByteCounter > SlideShowLength) {
                       if (SlideShowDebug)
-                        Serial.println("[SLS] Segment data exceed BodySize; reset");
+                        DIAG_PRINTLN("[SLS] Segment data exceed BodySize; reset");
                       resetSlideshowCollector();
                     } else if (allSegmentsReceived() &&
                                ((SlideShowLength != 0U &&
@@ -1618,7 +1678,7 @@ bool DAB::allSegmentsReceived(void) {
 // Validate the already packed segments and publish the contiguous RAM buffer.
 void DAB::assembleSlideshow(void) {
   if (SlideShowDebug) {
-    Serial.printf("[SLS] Assembling: %u segments, %u bytes received, %u bytes expected\n",
+    DIAG_PRINTF("[SLS] Assembling: %u segments, %u bytes received, %u bytes expected\n",
                   SlideShowTotalSegments, SlideShowByteCounter, SlideShowLength);
   }
 
@@ -1628,7 +1688,7 @@ void DAB::assembleSlideshow(void) {
     if (slideshowSegLen[i] > 0) {
       actualSize += slideshowSegLen[i];
     } else if (SlideShowDebug) {
-      Serial.printf("[SLS] WARNING: segment %u missing!\n", i);
+      DIAG_PRINTF("[SLS] WARNING: segment %u missing!\n", i);
     }
   }
 
@@ -1659,7 +1719,7 @@ void DAB::assembleSlideshow(void) {
 
   if (!validJPEG && !validPNG) {
     if (SlideShowDebug) {
-      Serial.printf("[SLS] REJECTED new image: size=%u expected=%u hdr=%02X %02X %02X %02X\n",
+      DIAG_PRINTF("[SLS] REJECTED new image: size=%u expected=%u hdr=%02X %02X %02X %02X\n",
                     actualSize, SlideShowLength,
                     actualSize > 0 ? slideshowSegBuf[0] : 0,
                     actualSize > 1 ? slideshowSegBuf[1] : 0,
@@ -1676,13 +1736,13 @@ void DAB::assembleSlideshow(void) {
     lastCompletedTransportIdValid = SlideShowTransportIDValid;
 
     if (SlideShowDebug) {
-      Serial.printf("[SLS] RAM image ready: %s, %u bytes\n",
+      DIAG_PRINTF("[SLS] RAM image ready: %s, %u bytes\n",
                     validJPEG ? "JPEG" : "PNG", actualSize);
     }
-    Serial.printf("[SLS/UI] READY: icon/button enabled, %u bytes\n", actualSize);
+    DIAG_PRINTF("[SLS/UI] READY: icon/button enabled, %u bytes\n", actualSize);
     SlideshowReceptionState(false);
-    Serial.printf("[SLS/TIME] first-segment-to-ready=%u ms\n", slideshowFirstSegmentMs ? (millis() - slideshowFirstSegmentMs) : 0U);
-    Serial.printf("[RAM/SLS] single MOT buffer=%u image=%u\n",
+    DIAG_PRINTF("[SLS/TIME] first-segment-to-ready=%u ms\n", slideshowFirstSegmentMs ? (millis() - slideshowFirstSegmentMs) : 0U);
+    DIAG_PRINTF("[RAM/SLS] single MOT buffer=%u image=%u\n",
                   (unsigned)SLS_BUFFER_BYTES, actualSize);
   }
 
@@ -1771,8 +1831,9 @@ void DAB::setFreq(uint8_t freq) {
   dabDataServicePending = false;
   tunePending = true;
   DataUpdate = millis() - 500U;
-  Serial.printf("[DAB/ASYNC] queued tune index=%u request=%u\n",
-                freq, static_cast<unsigned>(dabTuneRequestId));
+  if (diagnosticDebug)
+    DIAG_PRINTF("[DAB/ASYNC] queued tune index=%u request=%u\n",
+                  freq, static_cast<unsigned>(dabTuneRequestId));
 }
 
 void DAB::clearFmData(void) {
@@ -1786,7 +1847,8 @@ void DAB::clearFmData(void) {
   fmPi = 0;
   fmPty = 0;
   fmPtyValid = false;
-  fmPsMask = 0;
+  fmPsSeenMask = 0;
+  fmPsConfirmedMask = 0;
   fmRtMask = 0;
   fmRtSeenMask = 0;
   fmRtAb = false;
@@ -1795,7 +1857,6 @@ void DAB::clearFmData(void) {
   memset(fmPs, 0, sizeof(fmPs));
   memset(fmRadioText, 0, sizeof(fmRadioText));
   memset(fmPsWork, ' ', 8); fmPsWork[8] = '\0';
-  memset(fmPsCandidate, 0, sizeof(fmPsCandidate));
   memset(fmRtWork, ' ', 64); fmRtWork[64] = '\0';
   memset(PStext, 0, sizeof(PStext));
   memset(ServiceData, 0, sizeof(ServiceData));
@@ -1841,88 +1902,78 @@ bool DAB::startFmSeek(bool up) {
 }
 
 void DAB::processFmRds(void) {
-  si468x::FmRdsGroup group;
-  ++diagFmRdsStatusCount;
-  const si468x::Result statusResult =
-      chip.fmRdsStatus(group, false, false, true, 100000UL);
-  finishCommandDiagnostics(statusResult);
-  if (statusResult != si468x::Result::Ok) return;
-  // Loss of instantaneous RDS sync must not erase a text that was already
-  // assembled correctly. A FIFO overrun invalidates only the in-progress
-  // assembly; the last published PS/RT remains on screen until replaced.
-  if (group.fifoLost) {
-    fmPsMask = 0;
-    fmRtMask = 0;
-    fmRtSeenMask = 0;
-    fmRtVersionKnown = false;
-    memset(fmPsCandidate, 0, sizeof(fmPsCandidate));
-    memset(fmPsWork, ' ', 8); fmPsWork[8] = '\0';
-    memset(fmRtWork, ' ', 64); fmRtWork[64] = '\0';
-    ++diagFmRdsStatusCount;
-    const si468x::Result clearResult =
-        chip.fmRdsStatus(group, true, true, true, 100000UL);
-    finishCommandDiagnostics(clearResult);
-    return;
-  }
-  // PI and TP/PTY are current-channel status fields, not FIFO payload. Use
-  // them as soon as the Si4684 marks them valid, even when no complete RDS
-  // group is waiting in the FIFO yet. This improves acquisition after retune
-  // on marginal signals without increasing the RDS polling rate.
-  if (group.piValid) fmPi = group.pi;
-  if (group.tpPtyValid) {
-    fmPty = group.pty;
-    fmPtyValid = true;
-    pty = fmPty;
-  }
+  // Drain only a bounded number of groups per scheduler pass. AN649 defines
+  // RDSFIFOUSED as including the group returned in the current reply; when it
+  // is >1 another oldest group can be fetched immediately without waiting for
+  // the next 80 ms poll. Limiting the drain keeps GUI/radio scheduling fair.
+  static constexpr uint8_t kMaxRdsGroupsPerPass = 3;
 
-  if (!group.sync) return;
+  auto processGroup = [this](const si468x::FmRdsGroup& group) {
+    // BLE 0 and 1 are clean or corrected by at most two bits. Do not use BLE 2
+    // for text: a 3-5 bit correction can otherwise become a visible character.
+    if (group.ble[1] > 1U) return;
 
-  // Block A/B/C/D below are meaningful only when a complete FIFO group exists.
-  if (group.fifoUsed == 0U) return;
-  // BLE 0 and 1 are clean or corrected by at most two bits. Do not use BLE 2
-  // for text: a 3-5 bit correction can otherwise become a visible character.
-  if (group.ble[1] > 1U) return;
+    const uint16_t blockB = group.block[1];
+    const uint8_t groupType = static_cast<uint8_t>((blockB >> 12) & 0x0F);
+    const bool versionB = (blockB & 0x0800U) != 0;
 
-  const uint16_t blockB = group.block[1];
-  const uint8_t groupType = static_cast<uint8_t>((blockB >> 12) & 0x0F);
-  const bool versionB = (blockB & 0x0800U) != 0;
+    if (groupType == 0 && group.ble[3] <= 1U) {
+      const uint8_t segment = blockB & 0x03U;
+      const uint8_t segmentBit = static_cast<uint8_t>(1U << segment);
+      const uint8_t pos = static_cast<uint8_t>(segment * 2U);
+      const char incoming[2] = {
+          static_cast<char>(group.block[3] >> 8),
+          static_cast<char>(group.block[3] & 0xFF)};
 
-  if (groupType == 0 && group.ble[3] <= 1U) {
-    const uint8_t segment = blockB & 0x03U;
-    fmPsWork[segment * 2] = static_cast<char>(group.block[3] >> 8);
-    fmPsWork[segment * 2 + 1] = static_cast<char>(group.block[3] & 0xFF);
-    fmPsMask |= static_cast<uint8_t>(1U << segment);
-    if (fmPsMask == 0x0F) {
-      bool validPs = false;
-      for (uint8_t i = 0; i < 8; ++i) {
-        const uint8_t c = static_cast<uint8_t>(fmPsWork[i]);
-        // Current EBU/RDS charset 0000 assigns printable letters to several
-        // byte values below 0x20 (for example 0x1B = U+011A / E-caron).
-        // Only the explicitly non-displayable control codes are invalid here.
-        if (c == 0x00U || c == 0x0AU || c == 0x0BU || c == 0x0DU) {
-          validPs = false;
-          break;
-        }
-        if (c != ' ') validPs = true;
-      }
-      if (!validPs) {
-        fmPsMask = 0;
-        memset(fmPsCandidate, 0, sizeof(fmPsCandidate));
-        return;
-      }
-      if (memcmp(fmPsCandidate, fmPsWork, 8) == 0) {
-        memcpy(fmPs, fmPsWork, 8); fmPs[8] = '\0';
-        memset(PStext, 0, sizeof(PStext));
-        memcpy(PStext, fmPs, 8);
-        Serial.printf("[FM/RDS] PS confirmed='%s'\n", fmPs);
+      if ((fmPsSeenMask & segmentBit) == 0U) {
+        memcpy(fmPsWork + pos, incoming, 2);
+        fmPsSeenMask |= segmentBit;
+        fmPsConfirmedMask &= static_cast<uint8_t>(~segmentBit);
+      } else if (memcmp(fmPsWork + pos, incoming, 2) == 0) {
+        fmPsConfirmedMask |= segmentBit;
       } else {
-        memcpy(fmPsCandidate, fmPsWork, 8);
-        fmPsCandidate[8] = '\0';
-        Serial.printf("[FM/RDS] PS candidate='%s'\n", fmPsCandidate);
+        // Keep confirmation local to the changed 2-character segment. Other
+        // already-confirmed segments remain valid, so one missing/repeated
+        // group can no longer prevent PS acquisition indefinitely.
+        memcpy(fmPsWork + pos, incoming, 2);
+        fmPsConfirmedMask &= static_cast<uint8_t>(~segmentBit);
       }
-      fmPsMask = 0;
+      fmPsWork[8] = '\0';
+
+      if (fmPsSeenMask == 0x0F) {
+        bool validPs = false;
+        for (uint8_t i = 0; i < 8; ++i) {
+          const uint8_t c = static_cast<uint8_t>(fmPsWork[i]);
+          if (c == 0x00U || c == 0x0AU || c == 0x0BU || c == 0x0DU) {
+            validPs = false;
+            break;
+          }
+          if (c != ' ') validPs = true;
+        }
+        if (!validPs) {
+          fmPsSeenMask = 0;
+          fmPsConfirmedMask = 0;
+          memset(fmPsWork, ' ', 8); fmPsWork[8] = '\0';
+          return;
+        }
+
+        const bool firstAcquisition = fmPs[0] == '\0';
+        const bool stableReplacement = fmPsConfirmedMask == 0x0F;
+        if ((firstAcquisition || stableReplacement) &&
+            memcmp(fmPs, fmPsWork, 8) != 0) {
+          memcpy(fmPs, fmPsWork, 8); fmPs[8] = '\0';
+          memset(PStext, 0, sizeof(PStext));
+          memcpy(PStext, fmPs, 8);
+          DIAG_PRINTF("[FM/RDS] PS %s='%s' confirmedMask=0x%02X\n",
+                        firstAcquisition ? "acquired" : "updated",
+                        fmPs, fmPsConfirmedMask);
+        }
+      }
+      return;
     }
-  } else if (groupType == 2) {
+
+    if (groupType != 2) return;
+
     const bool ab = (blockB & 0x0010U) != 0;
     if (!fmRtVersionKnown || versionB != fmRtVersionB || ab != fmRtAb) {
       fmRtAb = ab;
@@ -1950,9 +2001,6 @@ void DAB::processFmRds(void) {
       return;
     }
 
-    // RDS RadioText uses 0x0D as its end marker and accepts 0x0A as a
-    // line-break control. Other low byte values can be real EBU letters, so
-    // reject only NUL and the explicitly non-displayable 0x0B control here.
     for (uint8_t i = 0; i < charsPerSegment; ++i) {
       const uint8_t c = static_cast<uint8_t>(segmentData[i]);
       if (c == 0x00U || c == 0x0BU) return;
@@ -1964,55 +2012,75 @@ void DAB::processFmRds(void) {
       fmRtSeenMask |= segmentBit;
       fmRtMask &= static_cast<uint16_t>(~segmentBit);
     } else if (memcmp(fmRtWork + pos, segmentData, charsPerSegment) == 0) {
-      // A segment becomes publishable only after an identical repeat.
       fmRtMask |= segmentBit;
     } else {
-      // A changed segment without an A/B toggle can be a marginal reception
-      // or a non-conforming dynamic update. Reacquire the whole message so old
-      // and new segments cannot be combined on screen.
       memset(fmRtWork, ' ', 64); fmRtWork[64] = '\0';
       memcpy(fmRtWork + pos, segmentData, charsPerSegment);
       fmRtSeenMask = segmentBit;
       fmRtMask = 0;
     }
 
-    // Publish only after every required segment has been seen identically at
-    // least twice. If no end marker is present, all 16 segments are required.
     const uint8_t maxChars = versionB ? 32U : 64U;
     int16_t endPos = -1;
     for (uint8_t i = 0; i < maxChars; ++i) {
       const uint8_t c = static_cast<uint8_t>(fmRtWork[i]);
-      if (c == 0x0D || c == '\n') {
-        endPos = i;
-        break;
-      }
+      if (c == 0x0D || c == '\n') { endPos = i; break; }
     }
 
     uint8_t requiredLastSegment = 15U;
-    if (endPos >= 0) {
-      requiredLastSegment = static_cast<uint8_t>(endPos / charsPerSegment);
-    }
-    const uint16_t requiredMask =
-        requiredLastSegment == 15U
-            ? 0xFFFFU
-            : static_cast<uint16_t>((1UL << (requiredLastSegment + 1U)) - 1UL);
+    if (endPos >= 0) requiredLastSegment = static_cast<uint8_t>(endPos / charsPerSegment);
+    const uint16_t requiredMask = requiredLastSegment == 15U
+        ? 0xFFFFU
+        : static_cast<uint16_t>((1UL << (requiredLastSegment + 1U)) - 1UL);
 
     if ((fmRtMask & requiredMask) == requiredMask) {
       memcpy(fmRadioText, fmRtWork, maxChars);
       fmRadioText[maxChars] = '\0';
-
       if (endPos >= 0 && endPos < maxChars) fmRadioText[endPos] = '\0';
-
       for (int16_t i = static_cast<int16_t>(maxChars) - 1;
-           i >= 0 && fmRadioText[i] == ' '; --i) {
-        fmRadioText[i] = '\0';
-      }
-
+           i >= 0 && fmRadioText[i] == ' '; --i) fmRadioText[i] = '\0';
       memset(ServiceData, 0, sizeof(ServiceData));
       strncpy(ServiceData, fmRadioText, sizeof(ServiceData) - 1);
-      Serial.printf("[FM/RDS] RT complete mask=0x%04X text='%s'\n",
-                    fmRtMask, fmRadioText);
     }
+  };
+
+  for (uint8_t drained = 0; drained < kMaxRdsGroupsPerPass; ++drained) {
+    si468x::FmRdsGroup group;
+    ++diagFmRdsStatusCount;
+    const si468x::Result statusResult =
+        chip.fmRdsStatus(group, false, false, drained == 0U, 100000UL);
+    finishCommandDiagnostics(statusResult);
+    if (statusResult != si468x::Result::Ok) return;
+
+    if (group.fifoLost) {
+      fmPsSeenMask = 0;
+      fmPsConfirmedMask = 0;
+      fmRtMask = 0;
+      fmRtSeenMask = 0;
+      fmRtVersionKnown = false;
+      memset(fmPsWork, ' ', 8); fmPsWork[8] = '\0';
+      memset(fmRtWork, ' ', 64); fmRtWork[64] = '\0';
+      ++diagFmRdsStatusCount;
+      const si468x::Result clearResult =
+          chip.fmRdsStatus(group, true, true, true, 100000UL);
+      finishCommandDiagnostics(clearResult);
+      return;
+    }
+
+    // PI and TP/PTY are status fields and are useful even with an empty FIFO.
+    if (group.piValid) fmPi = group.pi;
+    if (group.tpPtyValid) {
+      fmPty = group.pty;
+      fmPtyValid = true;
+      pty = fmPty;
+    }
+
+    if (!group.sync || group.fifoUsed == 0U) return;
+    processGroup(group);
+
+    // fifoUsed includes the group just returned. 1 therefore means that this
+    // was the last available group; >1 means another group is already queued.
+    if (group.fifoUsed <= 1U) return;
   }
 }
 
@@ -2024,7 +2092,7 @@ void DAB::updateFm(void) {
     ++diagFmBusySkipCount;
     if (reportDiagnostics) {
       diagFmLastReportMs = now;
-      Serial.printf("[FM/IRQ] edges=%u busySkip=%u rsq=%u rds=%u ctsIrq=%u ctsPoll=%u\n",
+      DIAG_PRINTF("[FM/IRQ] edges=%u busySkip=%u rsq=%u rds=%u ctsIrq=%u ctsPoll=%u\n",
                     static_cast<unsigned>(radioRuntimeIntbEdges()),
                     static_cast<unsigned>(diagFmBusySkipCount),
                     static_cast<unsigned>(diagFmRsqStatusCount),
@@ -2098,7 +2166,7 @@ void DAB::updateFm(void) {
 
   if (reportDiagnostics) {
     diagFmLastReportMs = now;
-    Serial.printf("[FM/IRQ] edges=%u busySkip=%u rsq=%u rds=%u ctsIrq=%u ctsPoll=%u\n",
+    DIAG_PRINTF("[FM/IRQ] edges=%u busySkip=%u rsq=%u rds=%u ctsIrq=%u ctsPoll=%u\n",
                   static_cast<unsigned>(radioRuntimeIntbEdges()),
                   static_cast<unsigned>(diagFmBusySkipCount),
                   static_cast<unsigned>(diagFmRsqStatusCount),
@@ -2158,9 +2226,10 @@ void DAB::setService(uint8_t _index) {
   dabRequestedComponentId = service[ServiceIndex].CompID;
   dabServiceRequestPending = true;
   dabDataServicePending = false;
-  Serial.printf("[DAB/ASYNC] queued service SID=%08X CID=%08X\n",
-                static_cast<unsigned>(dabRequestedServiceId),
-                static_cast<unsigned>(dabRequestedComponentId));
+  if (diagnosticDebug)
+    DIAG_PRINTF("[DAB/ASYNC] queued service SID=%08X CID=%08X\n",
+                  static_cast<unsigned>(dabRequestedServiceId),
+                  static_cast<unsigned>(dabRequestedComponentId));
 }
 
 bool DAB::startDabCommand(DabCommand operation, uint8_t command,
@@ -2181,7 +2250,7 @@ bool DAB::startDabCommand(DabCommand operation, uint8_t command,
   }
   finishCommandDiagnostics(result);
   ++diagDabCommandErrorCount;
-  Serial.printf("[DAB/ASYNC] command 0x%02X start failed result=%d\n",
+  DIAG_PRINTF("[DAB/ASYNC] command 0x%02X start failed result=%d\n",
                 command, static_cast<int>(result));
   return false;
 }
@@ -2194,9 +2263,19 @@ void DAB::finishDabCommand(void) {
 
   if (result != si468x::Result::Ok) {
     ++diagDabCommandErrorCount;
-    Serial.printf("[DAB/ASYNC] command failed op=%u result=%d reason=0x%02X\n",
-                  static_cast<unsigned>(completed), static_cast<int>(result),
-                  static_cast<unsigned>(chip.lastDeviceError()));
+    const uint8_t deviceReason = chip.lastDeviceError();
+    // AN649 reason 0x03 (NOT_AVAILABLE) is common for metadata queried before
+    // the newly started service has published it. Keep it observable without
+    // flooding UART; all other command failures are reported immediately.
+    static uint32_t lastNotAvailableLogMs = 0;
+    const uint32_t errorNow = millis();
+    if (deviceReason != 0x03U || lastNotAvailableLogMs == 0U ||
+        static_cast<uint32_t>(errorNow - lastNotAvailableLogMs) >= 30000UL) {
+      DIAG_PRINTF("[DAB/ASYNC] command failed op=%u result=%d reason=0x%02X\n",
+                    static_cast<unsigned>(completed), static_cast<int>(result),
+                    static_cast<unsigned>(deviceReason));
+      if (deviceReason == 0x03U) lastNotAvailableLogMs = errorNow;
+    }
     if ((completed == DabCommand::Tune || completed == DabCommand::TuneStatus) &&
         dabCommandRequestId == dabTuneRequestId) {
       dabTuneRequestPending = false;
@@ -2221,8 +2300,9 @@ void DAB::finishDabCommand(void) {
         dabWaitingTuneRequestId = dabCommandRequestId;
         dabWaitingForStc = true;
         dabTuneDeadlineMs = millis() + RADIO_DAB_TUNE_TIMEOUT_MS;
-        Serial.printf("[DAB/ASYNC] tune command accepted request=%u\n",
-                      static_cast<unsigned>(dabCommandRequestId));
+        if (diagnosticDebug)
+          DIAG_PRINTF("[DAB/ASYNC] tune command accepted request=%u\n",
+                        static_cast<unsigned>(dabCommandRequestId));
       }
       break;
 
@@ -2250,7 +2330,7 @@ void DAB::finishDabCommand(void) {
           dabEnsembleRefreshPending = true;
           dabTimeRefreshPending = true;
         }
-        Serial.printf("[DAB/ASYNC] tune complete request=%u lock=%u index=%u\n",
+        DIAG_PRINTF("[DAB/ASYNC] tune complete request=%u lock=%u index=%u\n",
                       static_cast<unsigned>(dabCommandRequestId), signallock,
                       status.tuneIndex);
       } else if (completed == DabCommand::SignalStatus && signallock) {
@@ -2298,7 +2378,7 @@ void DAB::finishDabCommand(void) {
       const uint32_t fullLength = static_cast<uint32_t>(listSize) + 6U;
       if (fullLength < 9U || fullLength > sizeof(SPIbuffer) - 1U) {
         ++diagDabCommandErrorCount;
-        Serial.printf("[DAB/ASYNC] invalid service-list length=%u\n",
+        DIAG_PRINTF("[DAB/ASYNC] invalid service-list length=%u\n",
                       static_cast<unsigned>(fullLength));
         break;
       }
@@ -2510,7 +2590,7 @@ void DAB::scheduleNextDabCommand(void) {
       ++diagDabCommandErrorCount;
       tunePending = false;
       dabTuneRequestPending = false;
-      Serial.printf("[DAB/ASYNC] tune start failed result=%d\n",
+      DIAG_PRINTF("[DAB/ASYNC] tune start failed result=%d\n",
                     static_cast<int>(result));
     }
     return;
@@ -2518,7 +2598,7 @@ void DAB::scheduleNextDabCommand(void) {
 
   if (dabWaitingForStc &&
       (dabStcPending || static_cast<int32_t>(millis() - dabTuneDeadlineMs) >= 0)) {
-    if (!dabStcPending) Serial.println("[DAB/ASYNC] STC timeout; reading final status");
+    if (!dabStcPending) DIAG_PRINTLN("[DAB/ASYNC] STC timeout; reading final status");
     const uint8_t args[1] = {0x01};
     dabStcPending = false;
     dabCommandRequestId = dabWaitingTuneRequestId;
@@ -2679,10 +2759,11 @@ void DAB::Update(void) {
     return;
   }
 
-  // Current project keeps slideshow data in RAM; do not pull old LittleFS code back in.
+  // Slideshow collection and rendering use RAM only; no filesystem path is
+  // involved in the runtime collector.
   const uint32_t now = millis();
   if (SlideShowInit && SlideShowLastActivity > 0 && now - SlideShowLastActivity > 30000) {
-    if (SlideShowDebug) Serial.println("[SLS] Collection timeout, resetting");
+    if (SlideShowDebug) DIAG_PRINTLN("[SLS] Collection timeout, resetting");
     // The buffer contains an incomplete object and therefore remains
     // unavailable. A picture already decoded to TFT GRAM is not erased here.
     resetSlideshowCollector();
@@ -2709,7 +2790,7 @@ void DAB::Update(void) {
 
   if (now - diagDabLastReportMs >= RADIO_DAB_DIAG_INTERVAL_MS) {
     diagDabLastReportMs = now;
-    Serial.printf("[DAB/IRQ] hw=%s mode=%s edges=%u ctsIrq=%u ctsPoll=%u STC=%u DSRV=%u overflow=%u DEVNT=%u busy=%u errors=%u pending=%02X\n",
+    DIAG_PRINTF("[DAB/IRQ] hw=%s mode=%s edges=%u ctsIrq=%u ctsPoll=%u STC=%u DSRV=%u overflow=%u DEVNT=%u busy=%u errors=%u pending=%02X\n",
                   intbHardwareName(), controlModeName(),
                   static_cast<unsigned>(radioRuntimeIntbEdges()),
                   static_cast<unsigned>(diagCtsIrqCompletionCount),
@@ -2803,35 +2884,6 @@ void DAB::ASCIIToBuffer(const char* input, uint8_t charset, char* output, size_t
   convertToUTF8Buffer(temp, output, outputSize);
 }
 
-// Convert a label/text from the DAB-side character set to UTF-8 for the TFT.
-String DAB::ASCII(const char* input, uint8_t charset) {
-  if (!input) return String();
-
-  // DAB registered charsets used by labels and Dynamic Label are EBU Latin
-  // (0000), UTF-16BE (0110) and UTF-8 (1111). Fixed DAB labels are 16 bytes,
-  // so UTF-16BE must be decoded by length rather than as a C string.
-  if (charset == 0x0F) return String(input);
-  if (charset == 0x06) {
-    wchar_t temp[9];
-    size_t out = 0;
-    for (size_t i = 0; i + 1 < 16 && out < 8; i += 2) {
-      const uint16_t code =
-          (static_cast<uint16_t>(static_cast<uint8_t>(input[i])) << 8) |
-          static_cast<uint8_t>(input[i + 1]);
-      if (code == 0) break;
-      temp[out++] = static_cast<wchar_t>(code);
-    }
-    temp[out] = L'\0';
-    return convertToUTF8(temp);
-  }
-  if (charset != 0x00) return String(input);
-
-  wchar_t temp[128];
-  charConverter(input, temp, sizeof(temp) / sizeof(wchar_t));
-  return convertToUTF8(temp);
-}
-
-
 // qsort() comparator: order services by component ID low byte ascending.
 static int compareCompID(const void* a, const void* b) {
   uint32_t compID_a = (*((DABService*)a)).CompID & 0xFF;
@@ -2883,71 +2935,10 @@ static void charConverter(const char* input, wchar_t* output, size_t outSize) {
   output[outIndex] = L'\0';
 }
 
-// Substring helper that operates on code-points (not bytes) so cutting a
-// UTF-8 string at index N doesn't slice a multi-byte sequence in half.
-static String extractUTF8Substring(const String& utf8String, size_t start, size_t length) {
-  String substring;
-  size_t utf8Length = utf8String.length();
-  size_t utf8Index = 0;
-  size_t charIndex = 0;
-
-  while (utf8Index < utf8Length && charIndex < start + length) {
-    uint8_t currentByte = utf8String.charAt(utf8Index);
-    uint8_t numBytes = 0;
-
-    if (currentByte < 0x80) {
-      numBytes = 1;
-    } else if ((currentByte >> 5) == 0x6) {
-      numBytes = 2;
-    } else if ((currentByte >> 4) == 0xE) {
-      numBytes = 3;
-    } else if ((currentByte >> 3) == 0x1E) {
-      numBytes = 4;
-    }
-
-    if (charIndex >= start) {
-      substring += utf8String.substring(utf8Index, utf8Index + numBytes);
-    }
-
-    utf8Index += numBytes;
-    charIndex++;
-  }
-
-  return substring;
-}
-
-// Encode the wchar_t code points produced by charConverter() into a UTF-8
-// String suitable for the TFT and the serial protocol.
-static String convertToUTF8(const wchar_t* input) {
-  String output;
-  while (*input) {
-    uint32_t unicode = *input;
-    if (unicode < 0x80) {
-      output += (char)unicode;
-    } else if (unicode < 0x800) {
-      output += (char)(0xC0 | (unicode >> 6));
-      output += (char)(0x80 | (unicode & 0x3F));
-    } else if (unicode < 0x10000) {
-      output += (char)(0xE0 | (unicode >> 12));
-      output += (char)(0x80 | ((unicode >> 6) & 0x3F));
-      output += (char)(0x80 | (unicode & 0x3F));
-    } else {
-      output += (char)(0xF0 | (unicode >> 18));
-      output += (char)(0x80 | ((unicode >> 12) & 0x3F));
-      output += (char)(0x80 | ((unicode >> 6) & 0x3F));
-      output += (char)(0x80 | (unicode & 0x3F));
-    }
-    input++;
-  }
-  return output;
-
-}
-
 // Decode the currently assembled DAB Dynamic Label directly into caller-owned
 // UTF-8 storage. The explicit source length is essential for UTF-16BE because
 // ordinary ASCII-range UTF-16 characters contain zero bytes. This is the
-// fixed-allocation counterpart of the former String-returning helper used by
-// ShowRT().
+// caller-owned fixed storage used directly by ShowRT().
 void DabDynamicLabelTextToBuffer(const char* input, char* output, size_t outputSize) {
   if (!output || outputSize == 0) return;
   output[0] = '\0';

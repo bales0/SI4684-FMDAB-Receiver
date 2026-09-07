@@ -173,10 +173,9 @@ void doTheme(void) {  // Use this to put your own colors in: http://www.barth-de
   }
 }
 
-// Full-screen technical diagnostics. The legacy function name is kept to
-// minimise cross-module churn, but the user-facing page is now "System info".
-// GPIO12 runtime state and its boot-time MTDI strap are deliberately shown as
-// separate facts: the pin is reused as INTB or IR after the reset sample.
+// Full-screen technical diagnostics. GPIO12 runtime state and its boot-time
+// MTDI strap are shown separately because the pin is reused as INTB or IR after
+// the reset sample.
 static uint32_t systemInfoRefreshTimer = 0;
 static constexpr uint32_t SYSTEM_INFO_REFRESH_MS = 1000UL;
 static constexpr int16_t SYSTEM_INFO_VALUE_X = 166;
@@ -372,15 +371,16 @@ void ShowServiceInfo(void) {
 
   RestoreSystemInfoValueRow(8);
   {
-    const size_t freeHeap =
-        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const size_t largestBlock =
-        heap_caps_get_largest_free_block(
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    // Use the exact same heap domain as the monitor's MEMCHK line.
+    // Mixing MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT here with ESP.getFreeHeap()
+    // above made the displayed largest block/fragmentation incomparable.
+    const size_t freeHeap = ESP.getFreeHeap();
+    const size_t largestBlock = ESP.getMaxAllocHeap();
     uint32_t fragmentation = 0;
     if (freeHeap != 0U && largestBlock <= freeHeap) {
       fragmentation = 100U -
-          static_cast<uint32_t>((largestBlock * 100U) / freeHeap);
+          static_cast<uint32_t>(
+              (static_cast<uint64_t>(largestBlock) * 100U) / freeHeap);
     }
     snprintf(value, sizeof(value), "%lu kB / %lu%%",
              static_cast<unsigned long>(largestBlock / 1024U),
@@ -614,7 +614,7 @@ static void RedrawMenuSelection(byte oldItem) {
 
 // Full redraw of the settings menu (entered by long-pressing MODE).
 void BuildMenu(void) {
-  // Settings has 11 logical entries while the original layout has nine rows.
+  // Settings has 11 logical entries while the display layout has nine rows.
   // Scroll the existing 9-row window instead of shrinking the proven UI.
   menuopen = false;
   IrRemoteUiAbort();
@@ -660,7 +660,12 @@ void BuildDisplay(void) {
   tftPrint(1, "MHz", 310, 55, ActiveColor, ActiveColorSmooth, 16);
   tftPrint(-1, "SIG:", 123, 109, ActiveColor, ActiveColorSmooth, 16);
   tftPrint(-1, unitString[unit], 183, 109, ActiveColor, ActiveColorSmooth, 16);
-  tftPrint(-1, radio.isFm() ? String(fmSnrText[language]) + ":" : "MER:", 237, 109, ActiveColor, ActiveColorSmooth, 16);
+  char snrLabel[24];
+  if (radio.isFm())
+    snprintf(snrLabel, sizeof(snrLabel), "%s:", fmSnrText[language]);
+  else
+    snprintf(snrLabel, sizeof(snrLabel), "MER:");
+  tftPrintFixed(-1, snrLabel, 237, 109, ActiveColor, ActiveColorSmooth, 16);
   tftPrint(1, "dB", 309, 109, ActiveColor, ActiveColorSmooth, 16);
   // The compact meter uses a single-letter M. A two-letter "MP" reaches the
   // bar border and its clipped P looks like a stray white pixel.
@@ -1070,30 +1075,20 @@ void DoMenu(void) {
 // Render a centered text line in the small "info" box at the top of the
 // screen (used for transient messages like "Saved" / "No signal").
 void Infoboxprint(const char* input) {
-  int length = strlen(input);
-  int newlineIndex = -1;
-
-  for (int i = 0; i < length; i++) {
-    if (input[i] == '\n') {
-      newlineIndex = i;
-      break;
-    }
-  }
-
-  if (newlineIndex != -1) {
-    char* line1 = (char*)malloc((newlineIndex + 1) * sizeof(char));
-    strncpy(line1, input, newlineIndex);
-    line1[newlineIndex] = '\0';
-
-    char* line2 = (char*)malloc((length - newlineIndex) * sizeof(char));
-    strcpy(line2, input + newlineIndex + 1);
-
-    tftPrint(0, line1, 155, 48, ActiveColor, ActiveColorSmooth, 28);
-    tftPrint(0, line2, 155, 78, ActiveColor, ActiveColorSmooth, 28);
-    free(line1);
-    free(line2);
+  if (!input) return;
+  // Use a fixed stack copy so two-line messages need no heap allocation.
+  char text[256];
+  snprintf(text, sizeof(text), "%s", input);
+  char* newline = strchr(text, '\n');
+  if (newline) {
+    *newline = '\0';
+    tftPrintFixed(0, text, 155, 48,
+                  ActiveColor, ActiveColorSmooth, 28);
+    tftPrintFixed(0, newline + 1, 155, 78,
+                  ActiveColor, ActiveColorSmooth, 28);
   } else {
-    tftPrint(0, input, 155, 78, ActiveColor, ActiveColorSmooth, 28);
+    tftPrintFixed(0, text, 155, 78,
+                  ActiveColor, ActiveColorSmooth, 28);
   }
 }
 
@@ -1129,7 +1124,7 @@ void ShowFreq(void) {
 
   const uint32_t frequency = radio.getFreq(dabfreq);
   const uint32_t fraction = frequency % 1000U;
-  // Preserve the original display formatting exactly: it added one leading
+  // Preserve the established display formatting: add one leading
   // zero only when the kHz remainder was below 100.
   if (fraction < 100U) {
     snprintf(value, sizeof(value), "%lu.0%lu",
@@ -1443,7 +1438,7 @@ void ShowEN(void) {
                   SecondaryColor, SecondaryColorSmooth, 16);
     snprintf(EnsembleNameOld, sizeof(EnsembleNameOld), "%s", value);
   }
-  // Preserve the original state semantics: tuning/no-lock never leaves a
+  // Preserve the display state semantics: tuning/no-lock never leaves a
   // placeholder string in the actual ensemble-label receive buffer.
   if (!radio.signallock || tuning) radio.EnsembleLabel[0] = '\0';
 }
@@ -1501,7 +1496,7 @@ void ShowAudioMode(void) {
 }
 
 static void ClearDabFlagArea(void) {
-  // An empty flag slot is intentionally quieter than the old '???' bitmap.
+  // Leave the flag slot empty when no valid country flag is available.
   tft.fillRect(80, 110, 36, 23, BackgroundColor3);
 }
 
@@ -1783,9 +1778,8 @@ void ShowSignalLevel(void) {
       if (segments < 0) segments = 0;
       if (segments > 85) segments = 85;
 
-      // Always clear the complete bar first and draw only positive widths.
-      // The old unsigned-byte subtraction produced a negative fillRect width
-      // below segment 56, which appeared as a full-scale flash/artifact.
+      // Always clear the complete bar first and draw only positive widths so
+      // values below segment 56 cannot produce an invalid fillRect width.
       tft.fillRect(134, 129, 170, 6, GreyoutColor);
       const int insignificantSegments = segments < 56 ? segments : 56;
       const int significantSegments = segments > 56 ? segments - 56 : 0;
@@ -1806,8 +1800,8 @@ void ShowSignalLevel(void) {
       snprintf(cnrText, sizeof(cnrText), "%d", static_cast<int>(CNR));
 
       if (radio.signallock) {
-        // If the previous state was unlocked, first erase the "--" placeholder,
-        // then replace the previous numeric CNR exactly as the original path did.
+        // If the previous state was unlocked, erase the "--" placeholder before
+        // replacing the previous numeric CNR.
         tftPrintFixed(1, "--", 289, 109,
                       BackgroundColor, BackgroundColor3, 16);
         tftReplaceFixed(1, cnrOldText, cnrText, 289, 109,

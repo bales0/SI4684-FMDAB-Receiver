@@ -248,7 +248,7 @@ static bool takeDecodedFrame(IrFrame& data) {
 bool IrRemotePrepare(void) {
   if (!prepareLogged) {
     prepareLogged = true;
-    Serial.printf("[IR] static code tables ready: 2 x %u bytes\n",
+    DIAG_PRINTF("[IR] static code tables ready: 2 x %u bytes\n",
                   static_cast<unsigned>(IR_CODE_TABLE_BYTES));
   }
   return true;
@@ -321,7 +321,7 @@ static void loadProfile(void) {
   if (!IrRemotePrepare()) return;
   profileLoaded = true;
   if (!storedProfileValid()) {
-    Serial.println("[IR] EEPROM profile empty or invalid");
+    DIAG_PRINTLN("[IR] EEPROM profile empty or invalid");
     return;
   }
 
@@ -335,13 +335,13 @@ static void loadProfile(void) {
     learned[i].raw = read64(p); p += 8;
   }
   profileValid = true;
-  Serial.println("[IR] learned profile loaded");
+  DIAG_PRINTLN("[IR] learned profile loaded");
 }
 
 static void saveProfile(const LearnedCode* codes) {
   if (!IrRemotePrepare()) return;
   if (profileValid && profilesEqual(codes, learned)) {
-    Serial.println("[IR] learned profile unchanged; EEPROM not written");
+    DIAG_PRINTLN("[IR] learned profile unchanged; EEPROM not written");
     return;
   }
 
@@ -372,14 +372,14 @@ static void saveProfile(const LearnedCode* codes) {
   profileValid = true;
   MarkEepromDirty();
   if (FlushEeprom())
-    Serial.println("[IR] learned profile saved");
+    DIAG_PRINTLN("[IR] learned profile saved");
   else
-    Serial.println("[IR] ERROR: learned profile commit failed");
+    DIAG_PRINTLN("[IR] ERROR: learned profile commit failed");
 }
 
 static void clearProfile(void) {
   if (!profileValid) {
-    Serial.println("[IR] clear requested but profile already empty");
+    DIAG_PRINTLN("[IR] clear requested but profile already empty");
     return;
   }
   for (int i = 0; i < EE_IR_CONFIG_SIZE; ++i)
@@ -391,9 +391,9 @@ static void clearProfile(void) {
   runtimePressStartMs = 0;
   MarkEepromDirty();
   if (FlushEeprom())
-    Serial.println("[IR] learned profile cleared");
+    DIAG_PRINTLN("[IR] learned profile cleared");
   else
-    Serial.println("[IR] ERROR: learned profile clear commit failed");
+    DIAG_PRINTLN("[IR] ERROR: learned profile clear commit failed");
 }
 
 static LearnedCode fromFrame(const IrFrame& data) {
@@ -447,7 +447,7 @@ static void servicePendingModePress(uint32_t now) {
       static_cast<uint32_t>(now - modePressStartMs) >= IR_MODE_LONG_PRESS_MS &&
       sinceLastFrame < IR_HELD_FRAME_GAP_MS) {
     modeLongFired = true;
-    Serial.printf("[IR/MODE] long press %lu ms -> DAB/FM switch\n",
+    DIAG_PRINTF("[IR/MODE] long press %lu ms -> DAB/FM switch\n",
                   static_cast<unsigned long>(now - modePressStartMs));
     RemoteModeLongAction();
     return;
@@ -468,7 +468,7 @@ static void servicePendingModePress(uint32_t now) {
   // Silence longer than the held-frame gap is the release event. If the long
   // action has not fired, this is the one and only place the short action runs.
   if (!modeLongFired) {
-    Serial.printf("[IR/MODE] short press released after %lu ms\n",
+    DIAG_PRINTF("[IR/MODE] short press released after %lu ms\n",
                   static_cast<unsigned long>(modeLastFrameMs - modePressStartMs));
     RemoteModeAction();
   }
@@ -502,7 +502,7 @@ static void dispatch(IrAction action, bool repeat) {
           // An IR frame that woke the CPU must not immediately put the radio
           // back to sleep. Non-repeat STANDBY is ignored only during this short
           // post-wake window; normal runtime operation is unchanged afterwards.
-          Serial.println("[IR/SLEEP] wake STANDBY frame suppressed");
+          DIAG_PRINTLN("[IR/SLEEP] wake STANDBY frame suppressed");
         } else {
           doStandby();
         }
@@ -541,10 +541,11 @@ static void drawMenuRow(uint8_t index, bool restoreBackground) {
   if (index >= 4U) return;
   if (restoreBackground) restoreUiBand(48 + index * 32, 32);
   const bool selected = index == uiSelection;
-  tftPrint(-1, String(selected ? "> " : "  ") + menuItemText(index),
-           70, 55 + index * 32,
-           selected ? ActiveColor : PrimaryColor,
-           selected ? ActiveColorSmooth : PrimaryColorSmooth, 28);
+  char text[96];
+  snprintf(text, sizeof(text), "%s%s", selected ? "> " : "  ", menuItemText(index));
+  tftPrintFixed(-1, text, 70, 55 + index * 32,
+                selected ? ActiveColor : PrimaryColor,
+                selected ? ActiveColorSmooth : PrimaryColorSmooth, 28);
 }
 
 static void drawMenu(void) {
@@ -572,8 +573,11 @@ static void drawLearn(void) {
            SecondaryColor, SecondaryColorSmooth, 16);
   tftPrint(0, kActionName[learnIndex], 155, 101,
            ActiveColor, ActiveColorSmooth, 28);
-  tftPrint(0, String(learnIndex + 1) + "/" + String(EE_IR_KEY_COUNT),
-           155, 145, PrimaryColor, PrimaryColorSmooth, 16);
+  char progress[16];
+  snprintf(progress, sizeof(progress), "%u/%u",
+           static_cast<unsigned>(learnIndex + 1U),
+           static_cast<unsigned>(EE_IR_KEY_COUNT));
+  tftPrintFixed(0, progress, 155, 145, PrimaryColor, PrimaryColorSmooth, 16);
   tftPrint(0, irPhysicalOkCancelsText[language], 155, 199,
            SecondaryColor, SecondaryColorSmooth, 16);
 }
@@ -582,22 +586,26 @@ static void drawLearnRelease(void) {
   drawUiBase(irLearningText[language]);
   tftPrint(0, irReleaseKeyText[language], 155, 96,
            ActiveColor, ActiveColorSmooth, 28);
-  tftPrint(0, String(learnIndex) + "/" + String(EE_IR_KEY_COUNT),
-           155, 145, PrimaryColor, PrimaryColorSmooth, 16);
+  char progress[16];
+  snprintf(progress, sizeof(progress), "%u/%u",
+           static_cast<unsigned>(learnIndex),
+           static_cast<unsigned>(EE_IR_KEY_COUNT));
+  tftPrintFixed(0, progress, 155, 145, PrimaryColor, PrimaryColorSmooth, 16);
   tftPrint(0, irPhysicalOkCancelsText[language], 155, 199,
            SecondaryColor, SecondaryColorSmooth, 16);
 }
 
 static void drawClearChoices(bool restoreBackground) {
   if (restoreBackground) restoreUiBand(122, 44);
-  String choices;
+  char choices[128];
   if (clearYes)
-    choices = String(irNoText[language]) + "     > " + irYesText[language];
+    snprintf(choices, sizeof(choices), "%s     > %s",
+             irNoText[language], irYesText[language]);
   else
-    choices = String("> ") + irNoText[language] + "     " + irYesText[language];
-
-  tftPrint(0, choices, 155, 132,
-           PrimaryColor, PrimaryColorSmooth, 28);
+    snprintf(choices, sizeof(choices), "> %s     %s",
+             irNoText[language], irYesText[language]);
+  tftPrintFixed(0, choices, 155, 132,
+                PrimaryColor, PrimaryColorSmooth, 28);
 }
 
 static void drawClear(void) {
@@ -607,52 +615,45 @@ static void drawClear(void) {
   drawClearChoices(false);
 }
 
-static String hex16(uint16_t value) {
-  String s(value, HEX);
-  s.toUpperCase();
-  while (s.length() < 4) s = "0" + s;
-  return s;
-}
+
 
 static void drawTestData(const IrFrame* data, bool restoreBackground) {
   if (!data) return;
   if (restoreBackground) restoreUiBand(45, 136);
 
   const IrAction action = findAction(*data);
-  tftPrint(-1,
-           String(irProtocolText[language]) + ": " +
-               IrProtocolName(data->protocol),
-           28, 55, PrimaryColor, PrimaryColorSmooth, 16);
-  tftPrint(-1,
-           String(irAddressText[language]) + ":  0x" +
-               hex16(data->address),
-           28, 80, PrimaryColor, PrimaryColorSmooth, 16);
-  tftPrint(-1,
-           String(irCommandText[language]) + ":  0x" +
-               hex16(data->command),
-           28, 105, PrimaryColor, PrimaryColorSmooth, 16);
-  tftPrint(-1,
-           String(irActionText[language]) + ":   " +
-               (action == IR_ACTION_NONE
-                    ? String(irNotAssignedText[language])
-                    : String(kActionName[action])),
-           28, 130, ActiveColor, ActiveColorSmooth, 16);
-  tftPrint(-1,
-           String(irRepeatText[language]) + ":   " +
-               ((data->flags &
-                 (IR_FLAG_REPEAT | IR_FLAG_AUTO_REPEAT))
-                    ? String(irYesText[language])
-                    : String(irNoText[language])),
-           28, 155, SecondaryColor, SecondaryColorSmooth, 16);
+  char text[160];
+
+  snprintf(text, sizeof(text), "%s: %s",
+           irProtocolText[language], IrProtocolName(data->protocol));
+  tftPrintFixed(-1, text, 28, 55, PrimaryColor, PrimaryColorSmooth, 16);
+
+  snprintf(text, sizeof(text), "%s:  0x%04X",
+           irAddressText[language], static_cast<unsigned>(data->address));
+  tftPrintFixed(-1, text, 28, 80, PrimaryColor, PrimaryColorSmooth, 16);
+
+  snprintf(text, sizeof(text), "%s:  0x%04X",
+           irCommandText[language], static_cast<unsigned>(data->command));
+  tftPrintFixed(-1, text, 28, 105, PrimaryColor, PrimaryColorSmooth, 16);
+
+  snprintf(text, sizeof(text), "%s:   %s",
+           irActionText[language],
+           action == IR_ACTION_NONE ? irNotAssignedText[language] : kActionName[action]);
+  tftPrintFixed(-1, text, 28, 130, ActiveColor, ActiveColorSmooth, 16);
+
+  snprintf(text, sizeof(text), "%s:   %s",
+           irRepeatText[language],
+           (data->flags & (IR_FLAG_REPEAT | IR_FLAG_AUTO_REPEAT))
+               ? irYesText[language] : irNoText[language]);
+  tftPrintFixed(-1, text, 28, 155, SecondaryColor, SecondaryColorSmooth, 16);
 }
 
 static void drawTestRepeatRow(bool repeat, bool restoreBackground) {
   if (restoreBackground) restoreUiBand(147, 28);
-  tftPrint(-1,
-           String(irRepeatText[language]) + ":   " +
-               (repeat ? String(irYesText[language])
-                       : String(irNoText[language])),
-           28, 155, SecondaryColor, SecondaryColorSmooth, 16);
+  char text[128];
+  snprintf(text, sizeof(text), "%s:   %s",
+           irRepeatText[language], repeat ? irYesText[language] : irNoText[language]);
+  tftPrintFixed(-1, text, 28, 155, SecondaryColor, SecondaryColorSmooth, 16);
 }
 
 static void drawTest(const IrFrame* data = nullptr) {
@@ -670,7 +671,7 @@ static void drawTest(const IrFrame* data = nullptr) {
 void IrRemoteBegin(void) {
   if (receiverStarted) return;
   if (!IrRemotePrepare()) {
-    Serial.println("[IR] receiver not started: persistent buffers unavailable");
+    DIAG_PRINTLN("[IR] receiver not started: persistent buffers unavailable");
     return;
   }
   if (!profileLoaded) loadProfile();
@@ -707,7 +708,7 @@ void IrRemoteBegin(void) {
   edgeDecodedCount = 0U;
   edgeDiagTimerMs = millis();
   edgeDiagLastTransitions = 0U;
-  Serial.printf("[IR] standalone edge receiver started GPIO%u profile=%s gap=%u us\n",
+  DIAG_PRINTF("[IR] standalone edge receiver started GPIO%u profile=%s gap=%u us\n",
                 SI4684_INTB_PIN, profileValid ? "learned" : "empty",
                 static_cast<unsigned>(IR_FRAME_GAP_US));
 }
@@ -730,7 +731,7 @@ void IrRemoteStop(void) {
   lastTestDataValid = false;
   lastTestRepeatShown = false;
   lastTestFrameMs = 0;
-  Serial.println("[IR] edge receiver stopped");
+  DIAG_PRINTLN("[IR] edge receiver stopped");
 }
 
 void IrRemoteResumeAfterLightSleep(bool seedActiveLowPulse) {
@@ -741,7 +742,7 @@ void IrRemoteResumeAfterLightSleep(bool seedActiveLowPulse) {
 
   if (!receiverStarted || !seedActiveLowPulse ||
       digitalRead(SI4684_INTB_PIN) != LOW) {
-    Serial.printf("[IR/SLEEP] edge receiver resumed seed=%u level=%c\n",
+    DIAG_PRINTF("[IR/SLEEP] edge receiver resumed seed=%u level=%c\n",
                   seedActiveLowPulse ? 1U : 0U,
                   digitalRead(SI4684_INTB_PIN) == HIGH ? 'H' : 'L');
     return;
@@ -764,7 +765,7 @@ void IrRemoteResumeAfterLightSleep(bool seedActiveLowPulse) {
   edgeWakeFirstMarkUs = 0U;
   interrupts();
 
-  Serial.println("[IR/SLEEP] wake LOW seeded as partial first MARK");
+  DIAG_PRINTLN("[IR/SLEEP] wake LOW seeded as partial first MARK");
 }
 
 bool IrRemoteQualifyStandbyWake(uint32_t timeoutMs) {
@@ -781,7 +782,7 @@ bool IrRemoteQualifyStandbyWake(uint32_t timeoutMs) {
     const bool repeat =
         (data.flags & (IR_FLAG_REPEAT | IR_FLAG_AUTO_REPEAT)) != 0U;
     const IrAction action = findAction(data);
-    Serial.printf("[IR/SLEEP] qualify protocol=%s action=%s repeat=%u elapsed=%lu ms\n",
+    DIAG_PRINTF("[IR/SLEEP] qualify protocol=%s action=%s repeat=%u elapsed=%lu ms\n",
                   IrProtocolName(data.protocol),
                   action == IR_ACTION_NONE ? "NONE" : kActionName[action],
                   repeat ? 1U : 0U,
@@ -796,7 +797,7 @@ bool IrRemoteQualifyStandbyWake(uint32_t timeoutMs) {
       lastRuntimeFrameMs = millis();
       runtimePressStartMs = 0U;
       standbySuppressUntilMs = millis() + 1000UL;
-      Serial.println("[IR/SLEEP] learned STANDBY wake accepted");
+      DIAG_PRINTLN("[IR/SLEEP] learned STANDBY wake accepted");
       return true;
     }
   }
@@ -806,7 +807,7 @@ bool IrRemoteQualifyStandbyWake(uint32_t timeoutMs) {
   lastRuntimeAction = IR_ACTION_NONE;
   lastRuntimeFrameMs = millis();
   runtimePressStartMs = 0U;
-  Serial.println("[IR/SLEEP] wake rejected: learned STANDBY not confirmed");
+  DIAG_PRINTLN("[IR/SLEEP] wake rejected: learned STANDBY not confirmed");
   return false;
 }
 
@@ -931,7 +932,7 @@ void IrRemoteProcess(void) {
   if (__atomic_exchange_n(&edgeWakeFirstMarkReady, false, __ATOMIC_ACQ_REL)) {
     const uint16_t firstMark =
         __atomic_load_n(&edgeWakeFirstMarkUs, __ATOMIC_ACQUIRE);
-    Serial.printf("[IR/SLEEP] residual first MARK=%u us (wake+resume time was already elapsed)\n",
+    DIAG_PRINTF("[IR/SLEEP] residual first MARK=%u us (wake+resume time was already elapsed)\n",
                   static_cast<unsigned>(firstMark));
   }
 
@@ -948,7 +949,7 @@ void IrRemoteProcess(void) {
           __atomic_load_n(&edgeGlitchCount, __ATOMIC_ACQUIRE);
       const uint32_t overflows =
           __atomic_load_n(&edgeOverflowCount, __ATOMIC_ACQUIRE);
-      Serial.printf("[IR/EDGE] edges=%u frames=%u decoded=%u glitches=%u overflow=%u\n",
+      DIAG_PRINTF("[IR/EDGE] edges=%u frames=%u decoded=%u glitches=%u overflow=%u\n",
                     static_cast<unsigned>(transitions),
                     static_cast<unsigned>(edgeFrameCount),
                     static_cast<unsigned>(edgeDecodedCount),
@@ -985,7 +986,7 @@ void IrRemoteProcess(void) {
 
     const int8_t duplicate = findLearningDuplicate(data);
     if (duplicate >= 0) {
-      Serial.printf("[IR/LEARN] duplicate of %s ignored while waiting for %s\n",
+      DIAG_PRINTF("[IR/LEARN] duplicate of %s ignored while waiting for %s\n",
                     kActionName[duplicate], kActionName[learnIndex]);
       learnWaitingRelease = true;
       drawLearnRelease();
@@ -993,7 +994,7 @@ void IrRemoteProcess(void) {
     }
 
     learnWork[learnIndex] = fromFrame(data);
-    Serial.printf("[IR/LEARN] %s protocol=%s address=0x%04X command=0x%04X bits=%u\n",
+    DIAG_PRINTF("[IR/LEARN] %s protocol=%s address=0x%04X command=0x%04X bits=%u\n",
                   kActionName[learnIndex], IrProtocolName(data.protocol),
                   data.address, data.command, data.bits);
     ++learnIndex;
@@ -1096,7 +1097,7 @@ void IrRemoteProcess(void) {
       lastRuntimeAction = IR_ACTION_MODE;
       lastRuntimeFrameMs = now;
       runtimePressStartMs = now;
-      Serial.println("[IR/MODE] press pending; long threshold=1000 ms");
+      DIAG_PRINTLN("[IR/MODE] press pending; long threshold=1000 ms");
       return;
     }
 

@@ -147,11 +147,8 @@ void ShowTuneMode(void);
 void ShowRSSI(void);
 void ShowOneLine(byte position, byte item, bool selected);
 
-extern void tftPrint(int8_t offset, const String & text, int16_t x, int16_t y,
+extern void tftPrint(int8_t offset, const char *text, int16_t x, int16_t y,
                      int color, int smoothcolor, uint8_t fontsize);
-extern void tftReplace(int8_t offset, const String & textold, const String & text,
-                       int16_t x, int16_t y, int color, int smoothcolor,
-                       int backcolor, uint8_t fontsize);
 extern void tftReplaceFixed(int8_t offset, const char *textold, const char *text,
                             int16_t x, int16_t y, int color, int smoothcolor,
                             int backcolor, uint8_t fontsize);

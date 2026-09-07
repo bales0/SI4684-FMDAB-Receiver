@@ -3,7 +3,7 @@
 
 #include "FmRegion.h"
 
-#define VERSION "v2.0b"
+#define VERSION "v2.0"
 
 // [number of languages][number of texts]
 // *** means the text is the same as in English
@@ -703,7 +703,7 @@ static const char* const systemResetReasonText[8][9] PROGMEM = {
   {"Pornire", "Extern", "Software", "Panic", "WDT", "Somn profund", "Brownout", "SDIO", "Necunoscut"}
 };
 
-// FM-only labels that have no DAB counterpart in the legacy 82-string table.
+// FM-only labels that have no DAB counterpart in the base 82-string table.
 static const char* const fmMultipathText[8] PROGMEM = {
   "Multipath", "Multipad", "Πολλαπλή διαδρομή", "Mehrweg", "Trajets multiples",
   "Multitrayecto", "Wielodrogowość", "Propagare multiplă"
@@ -748,8 +748,8 @@ static const char* const fmStereoText[8] PROGMEM = {
   "Stereo", "Stereo", "Στερεοφωνικό", "Stereo", "Stéréo", "Estéreo", "Stereo", "Stereo"
 };
 
-// Slideshow waiting screen. Kept separate from the legacy 82-string table so
-// the indexes used by the existing menu and status screens remain unchanged.
+// Slideshow waiting text is kept outside the base 82-string table so existing
+// menu and status indexes remain unchanged.
 static const char* const slideshowLoadingText[8] PROGMEM = {
   "Loading slideshow...",
   "Slideshow laden...",

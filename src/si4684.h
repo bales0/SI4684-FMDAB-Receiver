@@ -1,7 +1,8 @@
 // Driver for the Skyworks (formerly Silicon Labs) SI4684 DAB+ receiver chip.
 //
-// Communicates over SPI (pins set up in begin()). Boots the chip by uploading
-// the rom-patch + firmware blob, then exposes high-level operations:
+// Communicates over a dedicated ESP32 HSPI/SPI2 bus prepared once at startup.
+// begin() starts/reuses the requested Si4684 image, uploading the ROM patch and
+// firmware blob when needed, then exposes high-level operations:
 //   - tune to a DAB Band III channel
 //   - enumerate the services in the current ensemble
 //   - select a service and start audio
@@ -101,6 +102,12 @@ enum RadioControlMode : uint8_t {
 
 class DAB {
   public:
+    // Reserve persistent radio RAM while the internal heap is still contiguous.
+    // Call once immediately after the shared PNG/JPEG decoder workspace.
+    bool prepareRuntimeMemory(void);
+    // Start the dedicated HSPI/SPI2 host exactly once. External peripheral
+    // resets do not require (and must not trigger) another SPI.begin().
+    bool prepareSpiBus(void);
     bool begin(uint8_t SSpin, RadioMode requestedMode = RADIO_MODE_DAB);
     bool panic(void);
     bool ServiceStart;
@@ -118,7 +125,6 @@ class DAB {
     char* getFirmwareVersion(void);
     const char* getChannel(uint8_t freq);
     DABService service[32];
-    String ASCII(const char* input, uint8_t charset);
     void ASCIIToBuffer(const char* input, uint8_t charset, char* output, size_t outputSize);
     uint16_t bitrate;
     uint16_t ecc;
@@ -222,14 +228,14 @@ class DAB {
     uint32_t fmRdsTimer;
     uint32_t dabSignalTimer;
     int16_t dabRssi10;
-    uint8_t fmPsMask;
+    uint8_t fmPsSeenMask;
+    uint8_t fmPsConfirmedMask;
     uint16_t fmRtMask;
     uint16_t fmRtSeenMask;
     bool fmRtAb;
     bool fmRtVersionB;
     bool fmRtVersionKnown;
     char fmPsWork[9];
-    char fmPsCandidate[9];
     char fmRtWork[65];
     char ChipType[7];
     char FirmwVersion[6];
@@ -295,8 +301,9 @@ class DAB {
     static const uint16_t SLS_MAX_SEGMENTS   = 256;
     static const uint16_t SLS_MAX_SEG_SIZE   = 2048;
     static const size_t   SLS_BUFFER_BYTES   = 50U * 1024U;
-    // Allocated once from internal 8-bit heap in begin(). A static 50 KiB
-    // member overflows the classic ESP32 dram0 linker segment in this build.
+    // Allocated once from internal 8-bit heap by prepareRuntimeMemory(), before
+    // TFT sprites/fonts. A static 50 KiB member overflows the classic ESP32
+    // dram0 linker segment in this build.
     uint8_t* slideshowSegBuf = nullptr;
     uint16_t slideshowSegLen[SLS_MAX_SEGMENTS];
     void beginSlideshowReception(void);

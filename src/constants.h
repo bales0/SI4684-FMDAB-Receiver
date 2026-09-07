@@ -4,6 +4,14 @@
 #ifndef CONSTANTS_H
 #define CONSTANTS_H
 
+// Global UART diagnostics gate. Normal operation keeps application diagnostics
+// silent; the bare serial command DEBUG toggles this flag at runtime. The
+// control protocol in comms.cpp deliberately bypasses these macros.
+extern bool diagnosticDebug;
+#define DIAG_PRINT(...)   do { if (diagnosticDebug) Serial.print(__VA_ARGS__); } while (0)
+#define DIAG_PRINTLN(...) do { if (diagnosticDebug) Serial.println(__VA_ARGS__); } while (0)
+#define DIAG_PRINTF(...)  do { if (diagnosticDebug) Serial.printf(__VA_ARGS__); } while (0)
+
 // ---------- Hardware pin assignments ----------
 #define ROTARY_PIN_A    27
 #define ROTARY_PIN_B    34
@@ -82,8 +90,8 @@ static const char* const Gpio12ModeText[] = {"AUTO", "INTB", "IR"};
 #define EE_FM_PRESET_EMPTY_FREQUENCY 0xFFFFU
 #define EE_FM_PRESETS_END           3901
 
-// Learned IR profile occupies 160 bytes from the formerly reserved tail.
-// Format is explicitly serialized; no compiler struct padding is stored.
+// Learned IR profile occupies 160 bytes in the EEPROM tail. The format is
+// explicitly serialized; no compiler struct padding is stored.
 #define EE_IR_CONFIG_START          EE_FM_PRESETS_END
 #define EE_IR_KEY_COUNT             8
 #define EE_IR_KEY_RECORD_SIZE       17   // protocol + address + command + extra + bits + raw
