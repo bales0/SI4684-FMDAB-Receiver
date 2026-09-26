@@ -127,6 +127,8 @@ static constexpr uint32_t RADIO_FM_DIAG_INTERVAL_MS = 30000UL;
 static constexpr uint32_t RADIO_DAB_DIAG_INTERVAL_MS = 30000UL;
 static constexpr uint32_t RADIO_DAB_TUNE_TIMEOUT_MS = 5000UL;
 static constexpr uint8_t RADIO_DAB_MAX_DSRV_BURST = 4U;
+static constexpr uint32_t RADIO_DAB_SERVICE_SETTLE_MS = 200UL;
+static constexpr uint8_t RADIO_DAB_STALL_TIMEOUT_COUNT = 16U;
 static constexpr uint16_t RADIO_DAB_EVENT_SERVICE_LIST = 0x0001U;
 static constexpr uint16_t RADIO_DAB_EVENT_RECONFIGURATION = 0x0080U;
 
@@ -628,6 +630,8 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   dabCommandComponentId = 0;
   dabServiceRequestPending = false;
   dabActiveServiceValid = false;
+  dabServiceSettlePending = false;
+  dabServiceStartNotBeforeMs = 0;
   dabSignalRefreshPending = false;
   dabServiceListRefreshPending = false;
   dabEnsembleRefreshPending = false;
@@ -637,7 +641,14 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   dabCurrentServiceRefreshPending = false;
   dabServiceTypeScanIndex = 0;
   dabDataServicePending = false;
+  dabDataServiceId = 0;
+  dabDataComponentId = 0;
+  dabActiveDataServiceId = 0;
+  dabActiveDataComponentId = 0;
+  dabActiveDataServiceValid = false;
   dabDsrvBurstCount = 0;
+  dabConsecutiveCtsTimeouts = 0;
+  dabTransportStalled = false;
   lastStatus0 = 0;
   radioDabRuntimeActive = false;
   dabStcPending = false;
@@ -1825,10 +1836,10 @@ void DAB::setFreq(uint8_t freq) {
   dabWaitingForStc = false;
   dabStcPending = false;
   dabServiceRequestPending = false;
-  dabActiveServiceValid = false;
   dabServiceListRefreshPending = false;
   dabServiceTypeScanIndex = 0;
   dabDataServicePending = false;
+  if (!dabActiveDataServiceValid) dataServiceCheck = 0;
   tunePending = true;
   DataUpdate = millis() - 500U;
   if (diagnosticDebug)
@@ -2261,6 +2272,21 @@ void DAB::finishDabCommand(void) {
   dabCommand = DabCommand::None;
   finishCommandDiagnostics(result);
 
+  // A non-timeout response proves that the command transport is alive, even
+  // when the device rejected the command. Only consecutive failures to assert
+  // CTS contribute to stall recovery; loss of ensemble lock never does.
+  if (result == si468x::Result::Timeout) {
+    if (dabConsecutiveCtsTimeouts < 0xFFU) ++dabConsecutiveCtsTimeouts;
+    if (dabConsecutiveCtsTimeouts >= RADIO_DAB_STALL_TIMEOUT_COUNT &&
+        !dabTransportStalled) {
+      dabTransportStalled = true;
+      DIAG_PRINTF("[DAB/STALL] %u consecutive CTS timeouts; recovery requested\n",
+                    static_cast<unsigned>(dabConsecutiveCtsTimeouts));
+    }
+  } else {
+    dabConsecutiveCtsTimeouts = 0;
+  }
+
   if (result != si468x::Result::Ok) {
     ++diagDabCommandErrorCount;
     const uint8_t deviceReason = chip.lastDeviceError();
@@ -2276,17 +2302,33 @@ void DAB::finishDabCommand(void) {
                     static_cast<unsigned>(deviceReason));
       if (deviceReason == 0x03U) lastNotAvailableLogMs = errorNow;
     }
+    if (completed == DabCommand::StopDataService) {
+      dabActiveDataServiceValid = false;
+      dataServiceCheck = 0;
+      dabServiceSettlePending = true;
+      dabServiceStartNotBeforeMs = millis() + RADIO_DAB_SERVICE_SETTLE_MS;
+    }
+    if (completed == DabCommand::StopService) {
+      dabActiveServiceValid = false;
+      ServiceStart = false;
+      dabServiceSettlePending = true;
+      dabServiceStartNotBeforeMs = millis() + RADIO_DAB_SERVICE_SETTLE_MS;
+    }
     if ((completed == DabCommand::Tune || completed == DabCommand::TuneStatus) &&
         dabCommandRequestId == dabTuneRequestId) {
-      dabTuneRequestPending = false;
+      // Retry an unanswered tune so a wedged transport reaches the bounded
+      // stall threshold. A CTS device error is terminal for this request.
+      dabTuneRequestPending = result == si468x::Result::Timeout;
       dabWaitingForStc = false;
-      tunePending = false;
+      tunePending = dabTuneRequestPending;
     }
-    if (completed == DabCommand::StopService || completed == DabCommand::StartService) {
-      dabServiceRequestPending = false;
-      if (completed == DabCommand::StartService) ServiceStart = false;
+    if (completed == DabCommand::StartService) {
+      ServiceStart = false;
+      dabServiceRequestPending = result == si468x::Result::Timeout;
     }
-    if (completed == DabCommand::StartDataService) dabDataServicePending = false;
+    if (completed == DabCommand::StartDataService) {
+      dabDataServicePending = result == si468x::Result::Timeout;
+    }
     return;
   }
 
@@ -2513,12 +2555,25 @@ void DAB::finishDabCommand(void) {
       break;
     }
 
+    case DabCommand::StopDataService:
+      if (dabActiveDataServiceValid &&
+          dabCommandServiceId == dabActiveDataServiceId &&
+          dabCommandComponentId == dabActiveDataComponentId) {
+        dabActiveDataServiceValid = false;
+        dataServiceCheck = 0;
+      }
+      dabServiceSettlePending = true;
+      dabServiceStartNotBeforeMs = millis() + RADIO_DAB_SERVICE_SETTLE_MS;
+      break;
+
     case DabCommand::StopService:
       if (dabActiveServiceValid && dabCommandServiceId == dabActiveServiceId &&
           dabCommandComponentId == dabActiveComponentId) {
         dabActiveServiceValid = false;
         ServiceStart = false;
       }
+      dabServiceSettlePending = true;
+      dabServiceStartNotBeforeMs = millis() + RADIO_DAB_SERVICE_SETTLE_MS;
       break;
 
     case DabCommand::StartService:
@@ -2536,6 +2591,9 @@ void DAB::finishDabCommand(void) {
 
     case DabCommand::StartDataService:
       dataServiceCheck = dabCommandComponentId;
+      dabActiveDataServiceId = dabCommandServiceId;
+      dabActiveDataComponentId = dabCommandComponentId;
+      dabActiveDataServiceValid = true;
       dabDataServicePending = false;
       break;
 
@@ -2546,7 +2604,7 @@ void DAB::finishDabCommand(void) {
 
 void DAB::queueDabDataService(void) {
   if (!dabActiveServiceValid || dabServiceTypeScanIndex < numberofservices ||
-      dabDataServicePending)
+      dabDataServicePending || dabActiveDataServiceValid)
     return;
   for (uint8_t i = 0; i < numberofservices; ++i) {
     if (service[i].ServiceType == 3 &&
@@ -2562,9 +2620,71 @@ void DAB::queueDabDataService(void) {
 }
 
 void DAB::scheduleNextDabCommand(void) {
-  if (chip.busy() || dabCommand != DabCommand::None) return;
+  if (chip.busy() || dabCommand != DabCommand::None || dabTransportStalled)
+    return;
 
   const uint8_t zero = 0;
+
+  // A tune or audio-service change owns the command channel until teardown is
+  // complete. Stop the SLS/data component first, then audio, and delay the
+  // following START/tune by 200 ms from the most recent STOP completion.
+  if (dabTuneRequestPending || dabServiceRequestPending) {
+    uint8_t args[11] = {0};  // DAB SERTYPE is deliberately zero (AN649).
+    if (dabActiveDataServiceValid) {
+      si468x::writeLe32(args + 3, dabActiveDataServiceId);
+      si468x::writeLe32(args + 7, dabActiveDataComponentId);
+      dabCommandServiceId = dabActiveDataServiceId;
+      dabCommandComponentId = dabActiveDataComponentId;
+      startDabCommand(DabCommand::StopDataService,
+                      static_cast<uint8_t>(si468x::Command::STOP_DIGITAL_SERVICE),
+                      args, sizeof(args));
+      return;
+    }
+    if (dabActiveServiceValid) {
+      si468x::writeLe32(args + 3, dabActiveServiceId);
+      si468x::writeLe32(args + 7, dabActiveComponentId);
+      dabCommandServiceId = dabActiveServiceId;
+      dabCommandComponentId = dabActiveComponentId;
+      startDabCommand(DabCommand::StopService,
+                      static_cast<uint8_t>(si468x::Command::STOP_DIGITAL_SERVICE),
+                      args, sizeof(args));
+      return;
+    }
+    if (dabServiceSettlePending) {
+      if (static_cast<int32_t>(millis() - dabServiceStartNotBeforeMs) < 0)
+        return;
+      dabServiceSettlePending = false;
+    }
+
+    if (dabTuneRequestPending) {
+      const uint32_t requestId = dabTuneRequestId;
+      dabStcPending = false;
+      const si468x::Result result = chip.startDabTune(dabRequestedFrequency);
+      if (result == si468x::Result::Pending) {
+        dabTuneRequestPending = false;
+        dabCommandRequestId = requestId;
+        dabCommand = DabCommand::Tune;
+      } else {
+        finishCommandDiagnostics(result);
+        ++diagDabCommandErrorCount;
+        tunePending = false;
+        dabTuneRequestPending = false;
+        DIAG_PRINTF("[DAB/ASYNC] tune start failed result=%d\n",
+                      static_cast<int>(result));
+      }
+      return;
+    }
+
+    si468x::writeLe32(args + 3, dabRequestedServiceId);
+    si468x::writeLe32(args + 7, dabRequestedComponentId);
+    dabCommandServiceId = dabRequestedServiceId;
+    dabCommandComponentId = dabRequestedComponentId;
+    startDabCommand(DabCommand::StartService,
+                    static_cast<uint8_t>(si468x::Command::START_DIGITAL_SERVICE),
+                    args, sizeof(args));
+    return;
+  }
+
   if (dabDsrvPending && dabDsrvBurstCount < RADIO_DAB_MAX_DSRV_BURST) {
     const uint8_t args[1] = {0x01};
     if (startDabCommand(DabCommand::DsrvHeader,
@@ -2576,25 +2696,6 @@ void DAB::scheduleNextDabCommand(void) {
     return;
   }
   if (dabDsrvBurstCount >= RADIO_DAB_MAX_DSRV_BURST) dabDsrvBurstCount = 0;
-
-  if (dabTuneRequestPending) {
-    const uint32_t requestId = dabTuneRequestId;
-    dabStcPending = false;
-    const si468x::Result result = chip.startDabTune(dabRequestedFrequency);
-    if (result == si468x::Result::Pending) {
-      dabTuneRequestPending = false;
-      dabCommandRequestId = requestId;
-      dabCommand = DabCommand::Tune;
-    } else {
-      finishCommandDiagnostics(result);
-      ++diagDabCommandErrorCount;
-      tunePending = false;
-      dabTuneRequestPending = false;
-      DIAG_PRINTF("[DAB/ASYNC] tune start failed result=%d\n",
-                    static_cast<int>(result));
-    }
-    return;
-  }
 
   if (dabWaitingForStc &&
       (dabStcPending || static_cast<int32_t>(millis() - dabTuneDeadlineMs) >= 0)) {
@@ -2614,28 +2715,6 @@ void DAB::scheduleNextDabCommand(void) {
                         static_cast<uint8_t>(si468x::Command::DAB_GET_EVENT_STATUS),
                         args, sizeof(args), 8))
       dabDeviceEventPending = false;
-    return;
-  }
-
-  if (dabServiceRequestPending) {
-    uint8_t args[11] = {0};
-    if (dabActiveServiceValid) {
-      si468x::writeLe32(args + 3, dabActiveServiceId);
-      si468x::writeLe32(args + 7, dabActiveComponentId);
-      dabCommandServiceId = dabActiveServiceId;
-      dabCommandComponentId = dabActiveComponentId;
-      startDabCommand(DabCommand::StopService,
-                      static_cast<uint8_t>(si468x::Command::STOP_DIGITAL_SERVICE),
-                      args, sizeof(args));
-    } else {
-      si468x::writeLe32(args + 3, dabRequestedServiceId);
-      si468x::writeLe32(args + 7, dabRequestedComponentId);
-      dabCommandServiceId = dabRequestedServiceId;
-      dabCommandComponentId = dabRequestedComponentId;
-      startDabCommand(DabCommand::StartService,
-                      static_cast<uint8_t>(si468x::Command::START_DIGITAL_SERVICE),
-                      args, sizeof(args));
-    }
     return;
   }
 

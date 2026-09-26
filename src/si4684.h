@@ -183,6 +183,9 @@ class DAB {
     const char* controlModeName(void) const;
     const char* intbHardwareName(void) const;
     bool isTunePending(void) const { return tunePending; }
+    // Set only after repeated command CTS timeouts. Signal/ensemble lock state
+    // never participates in this decision.
+    bool transportStalled(void) const { return dabTransportStalled; }
     // True only after a complete, structurally valid DAB service-list reply
     // has been parsed for the currently tuned ensemble. This lets the UI make
     // one-shot restore decisions without guessing from numberofservices.
@@ -212,6 +215,7 @@ class DAB {
       AudioInfo,
       CurrentSubchannelInfo,
       CurrentServiceInfo,
+      StopDataService,
       StopService,
       StartService,
       StartDataService
@@ -280,6 +284,8 @@ class DAB {
     bool dabServiceRequestPending = false;
     bool dabActiveServiceValid = false;
     bool dabServiceListReady = false;
+    bool dabServiceSettlePending = false;
+    uint32_t dabServiceStartNotBeforeMs = 0;
 
     bool dabSignalRefreshPending = false;
     bool dabServiceListRefreshPending = false;
@@ -293,7 +299,12 @@ class DAB {
     bool dabDataServicePending = false;
     uint32_t dabDataServiceId = 0;
     uint32_t dabDataComponentId = 0;
+    uint32_t dabActiveDataServiceId = 0;
+    uint32_t dabActiveDataComponentId = 0;
+    bool dabActiveDataServiceValid = false;
     uint8_t dabDsrvBurstCount = 0;
+    uint8_t dabConsecutiveCtsTimeouts = 0;
+    bool dabTransportStalled = false;
 
     // One RAM-only MOT buffer. Received segments are kept packed in ascending
     // SegmentNumber order, so all 51200 bytes are usable payload capacity even

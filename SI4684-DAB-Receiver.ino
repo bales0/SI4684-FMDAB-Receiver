@@ -86,6 +86,7 @@ bool eepromDirty;
 bool dabSeekStarted;
 bool fmSeekStarted;
 bool radioSwitchMuted;
+bool dabServiceSelectionPending;
 byte audiomodeold;
 byte ContrastSet;
 byte CurrentTheme;
@@ -170,6 +171,16 @@ unsigned long TuningTimer;
 unsigned long VolumeTimer;
 unsigned long EepromDirtyTimer;
 unsigned long RadioSwitchMuteTimer;
+unsigned long DabServiceSelectionTimer;
+
+static constexpr uint32_t DAB_SERVICE_SELECTION_DEBOUNCE_MS = 300UL;
+static constexpr uint32_t RADIO_STALL_RECOVERY_MIN_INTERVAL_MS = 60000UL;
+static constexpr uint32_t LCD_POWER_ON_SETTLE_MS = 1500UL;
+static constexpr uint32_t LCD_QUALIFIED_RESET_LOW_MS = 50UL;
+static constexpr uint32_t LCD_RESET_RELEASE_SETTLE_MS = 200UL;
+static constexpr uint32_t LCD_POST_INIT_RETRY_DELAY_MS = 1000UL;
+static uint32_t LastRadioStallRecoveryMs = 0;
+static bool RadioStallRecoveryPerformed = false;
 
 struct SettingsSnapshot {
   uint8_t language;
@@ -874,6 +885,7 @@ bool SwitchRadioMode(RadioMode newMode, bool force) {
   dabSeekStarted = false;
   fmSeekStarted = false;
   tuning = false;
+  dabServiceSelectionPending = false;
   trysetservice = false;
   trysetserviceFreq = 0xFF;
   SlideShowView = false;
@@ -1165,6 +1177,22 @@ static bool buttonEdge(uint8_t pin, bool& armed) {
 // Order matters: Serial → GPIO drive → EEPROM → audio → display → radio →
 // menu state → encoders.
 void setup(void) {
+  // Establish safe external-peripheral levels before Serial, EEPROM or heap
+  // setup. On a cold power ramp the ESP32 bootloader leaves these GPIOs
+  // uncontrolled long enough for some ILI9341 modules to leave reset too soon.
+  // Holding the shared reset LOW throughout early setup gives both the LCD and
+  // SI4684 a deterministic reset after their supplies have stabilised.
+#ifdef TFT_CS
+  pinMode(TFT_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
+#endif
+  pinMode(15, OUTPUT);
+  digitalWrite(15, HIGH);
+  pinMode(17, OUTPUT);
+  digitalWrite(17, LOW);
+  pinMode(CONTRASTPIN, OUTPUT);
+  digitalWrite(CONTRASTPIN, LOW);
+
   // Keep the ESP32 brownout detector enabled so undervoltage resets remain
   // distinguishable from software failures.
   Serial.begin(115200);
@@ -1187,7 +1215,10 @@ void setup(void) {
   gpio_set_drive_capability((gpio_num_t) 14, GPIO_DRIVE_CAP_0);
   gpio_set_drive_capability((gpio_num_t) 15, GPIO_DRIVE_CAP_0);
   gpio_set_drive_capability((gpio_num_t) 16, GPIO_DRIVE_CAP_0);
-  gpio_set_drive_capability((gpio_num_t) 17, GPIO_DRIVE_CAP_0);
+  // GPIO17 drives two reset inputs and is not a high-frequency signal. Keep a
+  // stronger edge here; the weakest drive setting can release the shared reset
+  // too slowly on boards with higher reset-net capacitance.
+  gpio_set_drive_capability((gpio_num_t) 17, GPIO_DRIVE_CAP_2);
   gpio_set_drive_capability((gpio_num_t) 21, GPIO_DRIVE_CAP_0);
   gpio_set_drive_capability((gpio_num_t) 22, GPIO_DRIVE_CAP_0);
   DIAG_PRINTF("[BOOT] GPIO drive config OK; heap=%u\n", ESP.getFreeHeap());
@@ -1286,25 +1317,20 @@ void setup(void) {
   }
   LogRamUsage("after decoder + MOT/radio workspaces");
 
-  // Cold boot uses exactly one physical reset of the shared GPIO17 net. Keep
-  // both devices deselected and start the dedicated radio HSPI/SPI2 host while
-  // the external peripherals are held in reset. TFT_eSPI will start VSPI/SPI3
-  // later, once, in tft.init().
+  // GPIO17 has remained LOW since the first instructions in setup(), covering
+  // the complete cold power ramp. Start radio HSPI/SPI2 while both peripherals
+  // are still held in reset; TFT_eSPI starts VSPI/SPI3 later in tft.init().
 #ifdef TFT_CS
-  pinMode(TFT_CS, OUTPUT);
   digitalWrite(TFT_CS, HIGH);
 #endif
-  pinMode(15, OUTPUT);
   digitalWrite(15, HIGH);
-  pinMode(17, OUTPUT);
-  DIAG_PRINTLN("[BOOT] shared reset LOW; both CS HIGH; initialise radio HSPI/SPI2");
-  digitalWrite(17, LOW);
+  DIAG_PRINTLN("[BOOT] shared reset held LOW since setup entry; initialise radio HSPI/SPI2");
   if (!radio.prepareSpiBus()) {
     Serial.println("[BOOT] FATAL: radio HSPI/SPI2 init failed");
     while (true) delay(1000);
   }
-  // Preserve the existing conservative reset pulse requirement. Because this
-  // delay begins after HSPI initialisation, GPIO17 is LOW for at least 20 ms.
+  // The reset has already been asserted for hundreds of milliseconds. Keep the
+  // final guard interval so this remains safe even if early setup is shortened.
   delay(20);
   digitalWrite(17, HIGH);
   DIAG_PRINTLN("[BOOT] shared reset HIGH; wait 200 ms");
@@ -1320,11 +1346,55 @@ void setup(void) {
   Headphones.SetMute(true);
   DIAG_PRINTLN("[BOOT] headphones configured and muted");
 
-  // The ILI9341 has already seen its one physical reset. Initialise its VSPI
-  // host/controller exactly once; no boot-time controller restore is needed.
+  // Let a slowly rising LCD rail settle, then generate a fresh reset edge while
+  // the supply is known to be stable. Merely delaying tft.init() is insufficient
+  // when the controller left power-on reset during the voltage ramp. SI4684 has
+  // not been booted yet, so pulsing the shared reset here is safe.
+  DIAG_PRINTF("[BOOT] LCD cold-rail settle %u ms\n",
+                static_cast<unsigned>(LCD_POWER_ON_SETTLE_MS));
+  delay(LCD_POWER_ON_SETTLE_MS);
+#ifdef TFT_CS
+  digitalWrite(TFT_CS, HIGH);
+#endif
+  digitalWrite(15, HIGH);
+  digitalWrite(CONTRASTPIN, LOW);
+  DIAG_PRINTF("[BOOT] qualified shared reset LOW %u ms\n",
+                static_cast<unsigned>(LCD_QUALIFIED_RESET_LOW_MS));
+  digitalWrite(17, LOW);
+  delay(LCD_QUALIFIED_RESET_LOW_MS);
+  digitalWrite(17, HIGH);
+  DIAG_PRINTF("[BOOT] qualified reset released; settle %u ms\n",
+                static_cast<unsigned>(LCD_RESET_RELEASE_SETTLE_MS));
+  delay(LCD_RESET_RELEASE_SETTLE_MS);
+
+  // The ILI9341 has now received a reset edge after rail stabilisation.
+  // Initialise its VSPI host/controller exactly once.
   DIAG_PRINTF("[BOOT] TFT init begin; heap=%u\n", ESP.getFreeHeap());
   tft.init();
   DIAG_PRINTLN("[BOOT] TFT init OK (VSPI/SPI3)");
+
+  // Cold-start fallback: some LCD boards still ignore the first command table
+  // even after a qualified reset. Once VSPI is running, wait once more, pulse
+  // the shared hardware reset, and replay the ILI9341 register setup without a
+  // second tft.init() (which would duplicate ESP32 SPI/APB callbacks). The radio
+  // application image is not booted until later, so resetting SI4684 here is safe.
+  DIAG_PRINTF("[BOOT2/TFT] post-init wait %u ms before second reset\n",
+                static_cast<unsigned>(LCD_POST_INIT_RETRY_DELAY_MS));
+  delay(LCD_POST_INIT_RETRY_DELAY_MS);
+#ifdef TFT_CS
+  digitalWrite(TFT_CS, HIGH);
+#endif
+  digitalWrite(15, HIGH);
+  digitalWrite(CONTRASTPIN, LOW);
+  DIAG_PRINTF("[BOOT2/TFT] shared reset LOW %u ms\n",
+                static_cast<unsigned>(LCD_QUALIFIED_RESET_LOW_MS));
+  digitalWrite(17, LOW);
+  delay(LCD_QUALIFIED_RESET_LOW_MS);
+  digitalWrite(17, HIGH);
+  delay(LCD_RESET_RELEASE_SETTLE_MS);
+  RestoreTftControllerNoReset("BOOT2");
+  DIAG_PRINTLN("[BOOT2/TFT] second reset + controller init complete");
+
   LogRamUsage("after TFT init");
   doTheme();
   DIAG_PRINTLN("[BOOT] theme OK");
@@ -1440,9 +1510,19 @@ void setup(void) {
   tftPrintFixed(0, splashVersion, 160, 190, TFT_WHITE, TFT_DARKGREY, 16);
   DIAG_PRINTLN("[BOOT] splash OK");
 
-  for (int x = 0; x <= ContrastSet; x++) {
-    analogWrite(CONTRASTPIN, x * 2 + 27);
-    delay(30);
+  // Fade in from a genuinely dark backlight.  The previous linear ramp began
+  // at duty 27/255, which is already visibly bright on these LCD modules, so
+  // the splash appeared to switch on abruptly despite the three-second loop.
+  // A short quadratic ramp gives the eye a clear, smooth onset without making
+  // the already conservative cold-start sequence noticeably longer.
+  constexpr uint8_t LCD_FADE_STEPS = 40;
+  constexpr uint16_t LCD_FADE_STEP_MS = 20;
+  const uint16_t targetBacklight = ContrastSet * 2U + 27U;
+  for (uint16_t step = 0; step <= LCD_FADE_STEPS; ++step) {
+    const uint32_t duty = targetBacklight * step * step /
+                          (LCD_FADE_STEPS * LCD_FADE_STEPS);
+    analogWrite(CONTRASTPIN, duty);
+    delay(LCD_FADE_STEP_MS);
   }
 
   // Start/reuse SI4684. Its SPI bus was already initialised above.
@@ -1584,6 +1664,19 @@ void loop(void) {
     }
   }
 
+  // Scrolling changes only the highlighted DAB row. Commit the last selection
+  // after 300 ms without another detent, avoiding a STOP/START pair per step.
+  if (dabServiceSelectionPending) {
+    if (radioMode != RADIO_MODE_DAB || tuning || seek ||
+        radio.numberofservices == 0) {
+      dabServiceSelectionPending = false;
+    } else if (millis() - DabServiceSelectionTimer >=
+               DAB_SERVICE_SELECTION_DEBOUNCE_MS) {
+      dabServiceSelectionPending = false;
+      ActivateCurrentService();
+    }
+  }
+
   if (setvolume && millis() - VolumeTimer >= 3000) {
     closeVolume();
   }
@@ -1620,6 +1713,19 @@ void loop(void) {
 void ProcessDAB(void) {
   if (!tuning) {
     radio.Update();
+    if (radioMode == RADIO_MODE_DAB && radio.transportStalled()) {
+      const uint32_t now = millis();
+      if (!RadioStallRecoveryPerformed ||
+          static_cast<uint32_t>(now - LastRadioStallRecoveryMs) >=
+              RADIO_STALL_RECOVERY_MIN_INTERVAL_MS) {
+        RadioStallRecoveryPerformed = true;
+        LastRadioStallRecoveryMs = now;
+        dabServiceSelectionPending = false;
+        DIAG_PRINTLN("[DAB/STALL] rate-limited cold recovery");
+        doRecovery();
+        return;
+      }
+    }
     SignalLevel = radio.getRSSI();
     // During FM auto-seek the driver already reports the current candidate
     // frequency from FM_RSQ_STATUS about every 100 ms. Publish it while seek is
@@ -1639,11 +1745,8 @@ void ProcessDAB(void) {
     }
   }
 
-  // Automatic panic/recovery is intentionally disabled.
-  // With GPIO17 shared between SI4684 RSTB and TFT RESET, any recovery pulse
-  // also blanks the display.  No DAB lock (e.g. with no antenna connected) is
-  // not a reason to reset the tuner.  Re-enable recovery only after the display
-  // and DAB runtime path are proven stable.
+  // Recovery above is based solely on repeated CTS timeouts. Missing DAB lock
+  // is intentionally ignored because GPIO17 resets both the tuner and TFT.
 
   // A pending restore belongs to exactly one DAB frequency. Any user/serial
   // retune that changes dabfreq cancels it immediately, even before the new
@@ -1900,7 +2003,8 @@ void DABSelectService(bool dir) {
            radio.service[radio.ServiceIndex].ServiceType != 0x04 &&
            radio.service[radio.ServiceIndex].ServiceType != 0x05);
 
-  ActivateCurrentService();
+  dabServiceSelectionPending = true;
+  DabServiceSelectionTimer = millis();
 }
 
 // Persist the currently playing channel + service so the next boot can
@@ -2058,6 +2162,7 @@ void ButtonPress(void) {
         // OK confirms the row that is already highlighted. Previously OK only
         // closed the list, so the initial highlighted row was not started until
         // the user moved away and back (movement calls DABSelectService()).
+        dabServiceSelectionPending = false;
         ActivateCurrentService();
         BuildDisplay();
       } else if (SlideShowView || ShowServiceInformation) {
