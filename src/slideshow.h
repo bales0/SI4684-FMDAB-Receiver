@@ -1,6 +1,6 @@
 // Slideshow rendering: takes the assembled MOT image from radio RAM and
-// pushes it to the TFT, choosing the supported PNG or single-scan baseline
-// JPEG path. Unsupported progressive/multi-scan JPEG is rejected pre-render.
+// pushes it to the TFT, choosing the supported PNG, single-scan baseline JPEG
+// or Huffman-coded progressive JPEG path.
 
 #ifndef SLIDESHOW_H
 #define SLIDESHOW_H

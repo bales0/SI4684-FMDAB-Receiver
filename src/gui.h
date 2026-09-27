@@ -30,6 +30,7 @@ extern bool ShowServiceInformation;
 extern bool SlideShowAvailableOld;
 extern bool SlideShowView;
 extern bool slsWaitingView;
+extern bool slsWaitingOverlayVisible;
 extern bool trysetservice;
 extern bool tuning;
 extern byte audiomodeold;

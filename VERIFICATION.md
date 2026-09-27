@@ -10,22 +10,28 @@
   retries, linear backoff, cancellation reset and `millis()` wraparound.
 - Host JPEG tests with GCC C++11, `-Wall -Wextra -Werror -pedantic`:
   baseline grayscale, YCbCr 4:4:4/4:2:2/4:2:0, a complete 320×240 baseline
-  4:2:0 decode, DRI/RST, premature EOI,
-  malformed DHT, baseline multi-scan classification, oversized dimensions,
-  APP0 progressive SOF2 rejection and PNG RGBA fixture structure.
+  4:2:0 decode, and progressive grayscale/4:4:4/4:2:2/4:2:0 decodes including
+  DRI/RST, non-MCU-aligned 17×13 dimensions, complete 320×240 output and a
+  320×320 progressive/baseline pair reduced to matching 160×160 output.
+  Corruption coverage includes premature EOI, malformed DHT/DQT, skipped
+  progressive refinement levels, invalid restart sequence, baseline multi-scan
+  classification and oversized dimensions.
 - The display-sized progressive fixture is 320×240, begins `FF D8 FF E0`, has
-  valid SOF2/EOI and is approximately 12 KiB. It is rejected before any TFT
-  output; it is not the unavailable station object with hash `47083CD0`.
+  valid SOF2/EOI and is approximately 12 KiB. Its decoded RGB565 output is
+  pixel-identical to the matching baseline fixture. It is not the unavailable
+  station object with hash `47083CD0`.
 - PlatformIO release build with `espressif32@6.9.0`: success for `esp32dev`
-  without PSRAM. Reported static usage: 48,416 bytes RAM (14.8%) and
-  3,405,193 bytes flash (82.5%). The persistent 50 KiB MOT buffer and 76,800
+  without PSRAM. Reported static usage: 48,696 bytes RAM (14.9%) and
+  3,409,393 bytes flash (82.6%). The persistent 50 KiB MOT buffer and 76,800
   byte shared decoder arena are allocated at runtime and therefore are not
   included in that static RAM number.
 - Clang is not installed in this environment: **NOT VERIFIED**.
+- The installed MinGW GCC lacks ASan/UBSan runtime libraries: sanitizer run is
+  **NOT VERIFIED**.
 
 The generated `.pio/build/esp32dev/firmware.bin` is a successful development
-build of 3,405,808 bytes with SHA-256
-`9F1888F6B509B9C1E37A8892AA391B00A51F635086F042300A7DEF960E3A5A21`.
+build of 3,410,016 bytes with SHA-256
+`6FAA2FD85991D70B490BFED53FED10E364B42C3FB66C293BC161E43444F81584`.
 It is not copied into `Release/` or represented as a hardware-validated release.
 `Release/firmware_v2_0.bin` remains an unchanged historical image.
 
@@ -42,8 +48,11 @@ It is not copied into `Release/` or represented as a hardware-validated release.
    `hostAbort` before PRECHECK, successful image upload, and controllable UI if
    recovery fails.
 5. Display many baseline JPEG/PNG slides and the 320×240 progressive fixture.
-   Progressive rejection must not change backlight or TFT GRAM. Confirm PNG
-   alpha appearance and encoder responsiveness during validation/render.
+   Also exercise the 320×320 progressive fixture and manually request an
+   unsupported/corrupt slide. Confirm complete 160×160 square output, that a
+   failed object closes the "Loading slideshow" overlay, acceptable decode
+   time, no CTS timeout caused by rendering, PNG alpha appearance and encoder
+   responsiveness during validation/render.
 6. Repeat FM/RDS, DAB service restore, FM↔DAB switch, presets, light sleep/wake
    and cold boot regression checks.
 
@@ -54,7 +63,8 @@ It is not copied into `Release/` or represented as a hardware-validated release.
 [RADIO] PRECHECK result=0 image=...
 [RADIO/CTS] late host service gap=... us afterDeadline=... us result=0 (CTS-ready time unknown)
 [DAB/STOP] unconfirmed result=-4 retry=1/3 backoffUntil=...
-[SLS/JPEG] tid=... size=... hash=... coding=UNSUPPORTED_PROGRESSIVE_JPEG ...
+[SLS/JPEG] tid=... size=... hash=... coding=SUPPORTED_PROGRESSIVE_JPEG ...
+[SLS/JPEG] render=OK size=... lastMCURow=...
 ```
 
 `hostAbort=-11` means an old `WaitCts` was cancelled; `hostAbort=0` means the

@@ -620,6 +620,7 @@ void BuildMenu(void) {
   IrRemoteUiAbort();
   SlideShowView = false;
   slsWaitingView = false;
+  slsWaitingOverlayVisible = false;
   ShowServiceInformation = false;
   ChannelListView = false;
 
@@ -646,6 +647,7 @@ void BuildMenu(void) {
 void BuildDisplay(void) {
   SlideShowView = false;
   slsWaitingView = false;
+  slsWaitingOverlayVisible = false;
   ShowServiceInformation = false;
   ChannelListView = false;
   displayreset = true;

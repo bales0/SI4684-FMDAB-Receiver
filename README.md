@@ -16,8 +16,9 @@ This project is based on the original open-source SI4684/DAB receiver work publi
   applied to a newly selected frequency.
 - Failed service teardown and data-service starts use bounded retry/backoff;
   an unconfirmed STOP is not reported as successfully stopped.
-- JPEG/PNG content is validated before TFT fade/clear. Unsupported progressive
-  JPEG is reported explicitly and leaves the current screen unchanged.
+- JPEG/PNG content is validated before TFT fade/clear. Huffman-coded
+  progressive JPEG is reconstructed with bounded row workspace; malformed or
+  unsupported streams leave the current screen unchanged.
 - The PlatformIO platform is pinned to `espressif32@6.9.0`.
 
 > [!CAUTION]
@@ -613,16 +614,23 @@ The firmware implements a RAM-only DAB MOT SlideShow path intended for the DAB S
 
 - Maximum MOT image payload buffer: **51,200 bytes (50 KiB)**.
 - Supported display size: up to **320×240**.
+- JPEG artwork larger than the panel but fitting after the profile's exact
+  50% reduction is centred at half size; a 320×320 slide is shown as 160×160.
 - Static PNG support.
 - Single-scan baseline JPEG: grayscale or three-component YCbCr, including
   4:4:4, 4:2:2 and 4:2:0 sampling and valid DRI/RST restart sequences.
-- Progressive SOF2, baseline multi-scan, four-component JPEG and images above
-  320×240 are intentionally unsupported. They are rejected before `fadeDown()`
-  or `fillScreen()`, with an explicit diagnostic such as
-  `UNSUPPORTED_PROGRESSIVE_JPEG`; the existing UI remains visible.
+- Progressive SOF2 Huffman JPEG: grayscale or three-component YCbCr 4:4:4,
+  4:2:2 and 4:2:0, including spectral-selection/refinement scans, EOB runs and
+  valid DRI/RST sequences. It is decoded by replaying scans for one MCU row at
+  a time, without allocating a full-frame coefficient buffer.
+- Baseline multi-scan, arithmetic-coded JPEG, four-component CMYK/YCCK JPEG
+  and images above 320×240 remain unsupported. They are rejected before
+  `fadeDown()` or `fillScreen()` and the existing UI remains visible.
 - JPEG entropy data and PNG decode are checked in a dry validation pass before
   the render pass. `render=OK` is emitted only after every expected MCU row or
   PNG line has decoded successfully.
+- If a manually armed slide is rejected, the temporary "Loading slideshow"
+  overlay is explicitly closed and the normal radio screen remains usable.
 - Shared early decoder workspace: **76,800 bytes**.
 - No late JPEG/PNG fallback `malloc/calloc` allocation during normal rendering.
 - Incoming MOT segments may arrive out of order; the collector tracks received segments and assembles only a complete object.
@@ -883,12 +891,13 @@ to enable diagnostics.
 A complete MOT object must be received. With DEBUG enabled, inspect SLS/MOT
 TransportID, length, hash, format, dimensions, SOF0/SOF2 coding, component
 sampling, scan count, restart interval/markers, validation result and last MCU
-row. `UNSUPPORTED_PROGRESSIVE_JPEG` means that a valid-looking SOF2 object was
-deliberately left undisplayed without dimming or clearing the current screen.
-`INVALID_JPEG`/`INVALID_PNG_*` indicates structural or decode failure instead.
+row. `SUPPORTED_PROGRESSIVE_JPEG` identifies the SOF2 path; it is followed by
+validation and render status. `INVALID_JPEG`/`INVALID_PNG_*` indicates a
+structural or decode failure before the screen is changed whenever validation
+can detect it.
 The exact station object identified by `hash=47083CD0` is not included in this
-repository, so its full integrity is not claimed by the synthetic regression
-fixture.
+repository. Its coding profile is now covered by synthetic SOF2 regressions,
+but that exact object's integrity and pixels are still not claimed as verified.
 
 ---
 

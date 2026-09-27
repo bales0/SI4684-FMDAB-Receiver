@@ -6,9 +6,8 @@
 #include <new>
 
 // DAB SlideShow Simple Profile limits (ETSI TS 101 499): one JPEG/PNG image
-// up to 50 KiB and display support through 320 x 240.  JPEG baseline support
-// is mandatory; progressive/multiscan is optional and is deliberately not
-// accepted by this resource-constrained receiver.
+// up to 50 KiB and display support through 320 x 240. Single-scan baseline and
+// Huffman-coded progressive JPEG are decoded from the same fixed workspace.
 static constexpr size_t SLS_PROFILE_MAX_FILE_BYTES = 50U * 1024U;
 static constexpr uint16_t SLS_PROFILE_MAX_WIDTH = 320U;
 static constexpr uint16_t SLS_PROFILE_MAX_HEIGHT = 240U;
@@ -159,20 +158,22 @@ bool ShowSlideShow(void) {
     const JPEGPreflightResult preflight = JPEGpreflight(
         image, fileSize, SLS_PROFILE_MAX_WIDTH, SLS_PROFILE_MAX_HEIGHT, info);
     const uint32_t fingerprint = slideshowFingerprint(image, fileSize);
-    DIAG_PRINTF("[SLS/JPEG] tid=%u size=%u hash=%08X coding=%s dimensions=%ux%u components=%u sampling=%ux%u scans=%u dri=%u rst=%u\n",
+    DIAG_PRINTF("[SLS/JPEG] tid=%u size=%u hash=%08X coding=%s dimensions=%ux%u scale=1/%u components=%u sampling=%ux%u scans=%u dri=%u rst=%u\n",
                   static_cast<unsigned>(radio.slideshowTransportId()),
                   static_cast<unsigned>(fileSize),
                   static_cast<unsigned>(fingerprint),
                   JPEGpreflightName(preflight),
                   static_cast<unsigned>(info.width),
                   static_cast<unsigned>(info.height),
+                  static_cast<unsigned>(info.scaleDivisor),
                   static_cast<unsigned>(info.components),
                   static_cast<unsigned>(info.maxHorizontalSampling),
                   static_cast<unsigned>(info.maxVerticalSampling),
                   static_cast<unsigned>(info.scans),
                   static_cast<unsigned>(info.restartInterval),
                   static_cast<unsigned>(info.restartMarkers));
-    if (preflight != JPEGPreflightResult::SupportedBaseline) return false;
+    if (preflight != JPEGPreflightResult::SupportedBaseline &&
+        preflight != JPEGPreflightResult::SupportedProgressive) return false;
 
     // Validate the complete entropy stream before changing the visible frame.
     // The published MOT buffer remains locked until acknowledgeSlideshow().

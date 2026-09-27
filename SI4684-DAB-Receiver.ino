@@ -271,6 +271,7 @@ static void EnterLightSleep(bool showStandbyScreen);
 
 static bool slsReceiving = false;
 bool slsWaitingView = false;
+bool slsWaitingOverlayVisible = false;
 static bool slsDisplayedFingerprintValid = false;
 static uint32_t slsDisplayedHash = 0;
 static uint32_t slsDisplayedSize = 0;
@@ -468,6 +469,7 @@ static void ShowSlideshowWaitingOverlay(void) {
   // Remember which 10 Hz signal-meter frame is covered by this overlay. The
   // main DAB renderer redraws the bubble only after a newer frame was painted.
   slsWaitingOverlayRssiStamp = rssiTimer;
+  slsWaitingOverlayVisible = true;
 }
 
 static uint32_t SlideshowFingerprint(const uint8_t* data, uint32_t size) {
@@ -1882,16 +1884,18 @@ void ProcessDAB(void) {
         DIAG_PRINTF("[SLS/UI] slideshow render=%s size=%u hash=%08X\n",
                       displayed ? "OK" : "FAIL", imageSize, imageHash);
         if (displayed) {
+          slsWaitingOverlayVisible = false;
           slsDisplayedFingerprintValid = true;
           slsDisplayedHash = imageHash;
           slsDisplayedSize = imageSize;
         } else {
-          // Unsupported/corrupt images are rejected before TFT changes, so do
-          // not redraw the already-visible main UI. Restore only if a validated
-          // render pass unexpectedly failed after it started touching TFT.
+          // Unsupported/corrupt images are rejected before TFT changes. Keep
+          // an intact main UI as-is, but explicitly remove a manual "loading"
+          // overlay or repair a validated render that failed after TFT writes.
           SlideShowView = false;
           slsDisplayedFingerprintValid = false;
-          if (SlideshowLastRenderTouchedDisplay())
+          if (SlideshowLastRenderTouchedDisplay() ||
+              slsWaitingOverlayVisible)
             RestoreMainDisplayAfterSlideshow();
         }
       }
