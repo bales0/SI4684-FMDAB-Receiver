@@ -1,25 +1,10 @@
-# SI4684 FM/DAB Receiver v2.1.1
+# SI4684 FM/DAB Receiver v2.2
 
 Advanced FM, RDS/RBDS, DAB/DAB+ and DAB SlideShow receiver for the **Skyworks SI4684**, **ESP32-WROOM-32D** and a **320×240 ILI9341** display.
 
-Firmware v2.1.1 uses separate SPI controllers for the TFT and radio, supports learned IR remote control, FM/DAB presets, multilingual UI, DAB MOT SlideShow, light-sleep standby and an optional serial control/diagnostic interface. It includes a project-local universal **Si468x driver library** that centralizes the tuner command/CTS/error state machine and supports both bounded polling and real **INTB interrupt-driven handling**.
+Firmware v2.2 uses separate SPI controllers for the TFT and radio, supports learned IR remote control, FM/DAB presets, multilingual UI, DAB MOT SlideShow, light-sleep standby and an optional serial control/diagnostic interface. It includes a project-local universal **Si468x driver library** that centralizes the tuner command/CTS/error state machine and supports both bounded polling and real **INTB interrupt-driven handling**.
 
-This project is based on the original open-source SI4684/DAB receiver work published by **PE5PVB** and has since been extensively reworked and extended for FM/RDS, the new Si468x driver, interrupt/poll operation, learned IR control, SlideShow, memory diagnostics and the current v2.1.1 architecture.
-
-## v2.1.1 reliability update
-
-- CTS transport continues to run during manual tuning debounce while new
-  metadata/DSRV work is paused.
-- A completed physical tuner reset explicitly cancels pre-reset host command
-  state before `GET_SYS_STATE` PRECHECK.
-- Retunes use multiplex generations so late metadata and DSRV results cannot be
-  applied to a newly selected frequency.
-- Failed service teardown and data-service starts use bounded retry/backoff;
-  an unconfirmed STOP is not reported as successfully stopped.
-- JPEG/PNG content is validated before TFT fade/clear. Huffman-coded
-  progressive JPEG is reconstructed with bounded row workspace; malformed or
-  unsupported streams leave the current screen unchanged.
-- The PlatformIO platform is pinned to `espressif32@6.9.0`.
+This project is based on the original open-source SI4684/DAB receiver work published by **PE5PVB**.
 
 > [!CAUTION]
 > ## GPIO12 / MTDI eFuse requirement — read before using INTB or IR
@@ -151,7 +136,7 @@ The TFT uses **VSPI/SPI3**. `TFT_RST=-1` is intentional: GPIO17 is controlled by
 
 The Si4684 uses a dedicated **HSPI/SPI2** instance. The radio SPI bus is initialized once and is not re-created during normal FM/DAB operation.
 
-Firmware v2.1.1 uses a project-local universal **`Si468x` driver layer** (`vendor/si468x/Si468x.*`). It provides the common low-level transport and command state machine for the tuner instead of duplicating command handling in the FM and DAB paths. In particular it supports:
+Firmware v2.2 uses a project-local universal **`Si468x` driver layer** (`vendor/si468x/Si468x.*`). It provides the common low-level transport and command state machine for the tuner. In particular it supports:
 
 - normal bounded **polling** for CTS/status completion;
 - **INTB interrupt-driven** command/event handling when the Si4684 INTB line is connected;
@@ -808,9 +793,9 @@ The IR receiver/capture runtime is implemented locally and therefore does not re
 
 # Software architecture, firmware and acknowledgements
 
-## New universal Si468x driver
+## Universal Si468x driver
 
-Firmware v2.1.1 uses the universal **Si468x** library/driver layer introduced after the older duplicated radio-transport implementation. The same driver handles low-level Si468x command transport for both FM and DAB operation and supports two radio-control methods:
+Firmware v2.2 uses the universal **Si468x** library/driver layer. The same driver handles low-level Si468x command transport for both FM and DAB operation and supports two radio-control methods:
 
 - **POLL** — bounded CTS/status polling;
 - **INTB** — hardware interrupt/event handling on GPIO12, with polling retained as a safety fallback.
@@ -832,7 +817,7 @@ The IR subsystem uses its own ESP32 GPIO edge capture, timing collection, learni
 
 ## Original open-source project
 
-This receiver is **based on the original open-source SI4684/DAB receiver project by PE5PVB**. The original project provided the foundation for the hardware/software concept and earlier receiver implementation. The current v2.1.1 branch extends and restructures that work substantially, including FM/RDS/RBDS, the universal Si468x driver, polling/INTB operation, learned IR remote control and wake, memory/SPI redesign, SlideShow handling and the current diagnostics/system-information architecture.
+This receiver is **based on the original open-source SI4684/DAB receiver project by PE5PVB**, which provided the foundation for the hardware and software concept.
 
 Original project information and build material remain linked in the resources section below.
 
@@ -844,7 +829,7 @@ Original project information and build material remain linked in the resources s
 2. Confirm the ESP32 module type and flash voltage.
 3. **If GPIO12 will be connected to Si4684 INTB or an IR receiver, burn the ESP32-WROOM-32D VDD_SDIO eFuse to fixed 3.3 V before normal use.**
 4. Verify the burn with `espefuse ... summary`.
-5. Build and flash firmware v2.1.1.
+5. Build and flash firmware v2.2.
 6. Start with `GPIO12 = AUTO` if no IR receiver is fitted.
 7. For a known INTB-wired board, select `GPIO12 = INTB` if desired.
 8. For IR hardware, select `GPIO12 = IR`, leave Settings and allow the automatic restart.
