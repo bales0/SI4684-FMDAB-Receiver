@@ -3,7 +3,7 @@
 
 #include "FmRegion.h"
 
-#define VERSION "v2.0"
+#define VERSION "v2.1"
 
 // [number of languages][number of texts]
 // *** means the text is the same as in English
