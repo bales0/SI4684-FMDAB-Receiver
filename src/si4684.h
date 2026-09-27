@@ -109,6 +109,9 @@ class DAB {
     // resets do not require (and must not trigger) another SPI.begin().
     bool prepareSpiBus(void);
     bool begin(uint8_t SSpin, RadioMode requestedMode = RADIO_MODE_DAB);
+    // Call only after the shared SI4684/TFT reset pulse has physically
+    // completed. Cancels host-side command state without touching the bus.
+    void onHardwareResetComplete(void);
     bool panic(void);
     bool ServiceStart;
     bool signallock;
@@ -172,7 +175,9 @@ class DAB {
     void setFmFrequency(uint16_t frequency10kHz);
     bool startFmSeek(bool up);
     void setService(uint8_t index);
-    void Update(void);
+    // Always pumps an in-flight transport operation. When allowNewWork is
+    // false no new metadata, DSRV or status command is scheduled.
+    void Update(bool allowNewWork = true);
     void vol(uint8_t vol);
     RadioMode mode(void) const { return activeMode; }
     bool isFm(void) const { return activeMode == RADIO_MODE_FM; }
@@ -195,6 +200,9 @@ class DAB {
     size_t slideshowCapacity(void) const { return SLS_BUFFER_BYTES; }
     uint32_t slideshowReceivedBytes(void) const { return SlideShowByteCounter; }
     uint32_t slideshowExpectedBytes(void) const { return SlideShowLength; }
+    uint16_t slideshowTransportId(void) const {
+      return lastCompletedTransportIdValid ? lastCompletedTransportId : 0U;
+    }
     // Release the published single-buffer image after the UI has completed
     // its hash/decode step. Until then incoming MOT objects are drained but
     // must not overwrite slideshowSegBuf.
@@ -268,6 +276,8 @@ class DAB {
     // persistent SPIbuffer rather than in a temporary stack array.
     DabCommand dabCommand = DabCommand::None;
     uint32_t dabCommandRequestId = 0;
+    uint32_t dabGeneration = 1;
+    uint32_t dabCommandGeneration = 1;
     uint32_t dabTuneRequestId = 0;
     uint32_t dabWaitingTuneRequestId = 0;
     uint8_t dabRequestedFrequency = 0;
@@ -303,6 +313,10 @@ class DAB {
     uint32_t dabActiveDataComponentId = 0;
     bool dabActiveDataServiceValid = false;
     uint8_t dabDsrvBurstCount = 0;
+    uint8_t dabDataServiceRetryCount = 0;
+    uint32_t dabDataServiceRetryNotBeforeMs = 0;
+    uint8_t dabStopRetryCount = 0;
+    uint32_t dabStopRetryNotBeforeMs = 0;
     uint8_t dabConsecutiveCtsTimeouts = 0;
     bool dabTransportStalled = false;
 

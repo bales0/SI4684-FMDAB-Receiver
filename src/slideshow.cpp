@@ -36,6 +36,27 @@ static_assert(JPEG_BASELINE_ROW_WORKSPACE == 76800U,
               "Unexpected JPEG baseline workspace calculation");
 static uint8_t* decoderWorkspace = nullptr;
 static bool decoderWorkspaceAttempted = false;
+static bool lastRenderTouchedDisplay = false;
+
+bool SlideshowLastRenderTouchedDisplay(void) {
+  return lastRenderTouchedDisplay;
+}
+
+static uint32_t slideshowFingerprint(const uint8_t* data, size_t size) {
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; data && i < size; ++i) {
+    hash ^= data[i];
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
+static void pumpRadioDuringImageDecode(void*) {
+  // Only complete the current transport operation. The slideshow buffer stays
+  // published/locked and no new metadata or DSRV command is scheduled here.
+  radio.Update(false);
+  yield();
+}
 
 bool SlideshowPrepareWorkspace(void) {
   if (decoderWorkspace) return true;
@@ -81,6 +102,7 @@ static void fadeDown(void) {
   for (int x = ContrastSet; x > 0; --x) {
     analogWrite(CONTRASTPIN, x * 2);
     delay(5);
+    radio.Update(false);
   }
   analogWrite(CONTRASTPIN, 0);
 }
@@ -89,11 +111,13 @@ static void fadeUp(void) {
   for (int x = 0; x <= ContrastSet; ++x) {
     analogWrite(CONTRASTPIN, x * 2 + 27);
     delay(5);
+    radio.Update(false);
   }
 }
 
 
 bool ShowSlideShow(void) {
+  lastRenderTouchedDisplay = false;
   if (diagnosticDebug) DIAG_PRINTLN("[SLS] ShowSlideShow() called");
 
   // The decoder arena is mandatory and is reserved once during setup().
@@ -131,17 +155,53 @@ bool ShowSlideShow(void) {
                   image[fileSize - 2], image[fileSize - 1]);
 
   if (isJPG) {
+    JPEGImageInfo info;
+    const JPEGPreflightResult preflight = JPEGpreflight(
+        image, fileSize, SLS_PROFILE_MAX_WIDTH, SLS_PROFILE_MAX_HEIGHT, info);
+    const uint32_t fingerprint = slideshowFingerprint(image, fileSize);
+    DIAG_PRINTF("[SLS/JPEG] tid=%u size=%u hash=%08X coding=%s dimensions=%ux%u components=%u sampling=%ux%u scans=%u dri=%u rst=%u\n",
+                  static_cast<unsigned>(radio.slideshowTransportId()),
+                  static_cast<unsigned>(fileSize),
+                  static_cast<unsigned>(fingerprint),
+                  JPEGpreflightName(preflight),
+                  static_cast<unsigned>(info.width),
+                  static_cast<unsigned>(info.height),
+                  static_cast<unsigned>(info.components),
+                  static_cast<unsigned>(info.maxHorizontalSampling),
+                  static_cast<unsigned>(info.maxVerticalSampling),
+                  static_cast<unsigned>(info.scans),
+                  static_cast<unsigned>(info.restartInterval),
+                  static_cast<unsigned>(info.restartMarkers));
+    if (preflight != JPEGPreflightResult::SupportedBaseline) return false;
+
+    // Validate the complete entropy stream before changing the visible frame.
+    // The published MOT buffer remains locked until acknowledgeSlideshow().
+    if (!JPEGvalidate(image, fileSize, SLS_PROFILE_MAX_WIDTH,
+                      SLS_PROFILE_MAX_HEIGHT, decoderWorkspace,
+                      SLS_DECODER_WORKSPACE_BYTES, &info,
+                      pumpRadioDuringImageDecode, nullptr)) {
+      DIAG_PRINTF("[SLS/JPEG] validation=FAIL tid=%u size=%u hash=%08X lastMCURow=%d\n",
+                    static_cast<unsigned>(radio.slideshowTransportId()),
+                    static_cast<unsigned>(fileSize),
+                    static_cast<unsigned>(fingerprint),
+                    static_cast<int>(info.lastRenderedMcuRow));
+      return false;
+    }
+
+    lastRenderTouchedDisplay = true;
     fadeDown();
     tft.fillScreen(TFT_BLACK);
     tft.startWrite();
     bool ok = JPEGdecoder(image, fileSize, tft, SLS_PROFILE_MAX_WIDTH,
                           SLS_PROFILE_MAX_HEIGHT,
                           decoderWorkspace,
-                          decoderWorkspace ? SLS_DECODER_WORKSPACE_BYTES : 0);
+                          decoderWorkspace ? SLS_DECODER_WORKSPACE_BYTES : 0,
+                          &info, pumpRadioDuringImageDecode, nullptr);
     tft.endWrite();
 
-    DIAG_PRINTF("[SLS/JPEG] render=%s size=%u\n",
-                  ok ? "OK" : "FAIL", static_cast<unsigned>(fileSize));
+    DIAG_PRINTF("[SLS/JPEG] render=%s size=%u lastMCURow=%d\n",
+                  ok ? "OK" : "FAIL", static_cast<unsigned>(fileSize),
+                  static_cast<int>(info.lastRenderedMcuRow));
     fadeUp();
     return ok;
   }
@@ -176,12 +236,50 @@ bool ShowSlideShow(void) {
       return false;
     }
 
+    const uint32_t fingerprint = slideshowFingerprint(image, fileSize);
     bool pngInSharedWorkspace = false;
     PNG* png = acquirePngDecoder(pngInSharedWorkspace);
     if (!png) return false;
 
-    fadeDown();
+    // First pass validates the complete PNG without drawing. Reopen the same
+    // immutable RAM object for the render pass only after decode succeeds.
     int16_t rc = png->openRAM(const_cast<uint8_t*>(image), fileSize,
+      +[](PNGDRAW*) {
+        radio.Update(false);
+        yield();
+        return 1;
+      });
+    if (diagnosticDebug) DIAG_PRINTF("[SLS/PNG] validation openRAM rc=%d\n", rc);
+    if (rc != PNG_SUCCESS) {
+      releasePngDecoder(png, pngInSharedWorkspace);
+      DIAG_PRINTF("[SLS/PNG] tid=%u size=%u hash=%08X result=INVALID_PNG_OPEN\n",
+                    static_cast<unsigned>(radio.slideshowTransportId()),
+                    static_cast<unsigned>(fileSize),
+                    static_cast<unsigned>(fingerprint));
+      return false;
+    }
+    const int pngWidth = png->getWidth();
+    const int pngHeight = png->getHeight();
+    if (pngWidth <= 0 || pngWidth > SLS_PROFILE_MAX_WIDTH ||
+        pngHeight <= 0 || pngHeight > SLS_PROFILE_MAX_HEIGHT) {
+      DIAG_PRINTF("[SLS/PNG] unsupported dimensions=%dx%d\n",
+                    pngWidth, pngHeight);
+      png->close();
+      releasePngDecoder(png, pngInSharedWorkspace);
+      return false;
+    }
+    rc = png->decode(png, 0);
+    png->close();
+    if (rc != PNG_SUCCESS) {
+      DIAG_PRINTF("[SLS/PNG] tid=%u size=%u hash=%08X dimensions=%dx%d result=INVALID_PNG_DECODE rc=%d\n",
+                    static_cast<unsigned>(radio.slideshowTransportId()),
+                    static_cast<unsigned>(fileSize),
+                    static_cast<unsigned>(fingerprint), pngWidth, pngHeight, rc);
+      releasePngDecoder(png, pngInSharedWorkspace);
+      return false;
+    }
+
+    rc = png->openRAM(const_cast<uint8_t*>(image), fileSize,
       +[](PNGDRAW *pDraw) {
         if (!pDraw || !pDraw->pUser ||
             pDraw->iWidth <= 0 || pDraw->iWidth > SLS_PROFILE_MAX_WIDTH) {
@@ -196,31 +294,22 @@ bool ShowSlideShow(void) {
         tft.pushImage((SLS_PROFILE_MAX_WIDTH - decoder->getWidth()) / 2,
                       ((SLS_PROFILE_MAX_HEIGHT - decoder->getHeight()) / 2) + pDraw->y,
                       pDraw->iWidth, 1, lineBuffer);
+        radio.Update(false);
+        yield();
         return 1;
       });
 
-    if (diagnosticDebug) DIAG_PRINTF("[SLS/PNG] openRAM rc=%d\n", rc);
+    if (diagnosticDebug) DIAG_PRINTF("[SLS/PNG] render openRAM rc=%d\n", rc);
     if (rc != PNG_SUCCESS) {
       releasePngDecoder(png, pngInSharedWorkspace);
-      fadeUp();
-      return false;
-    }
-
-    const int pngWidth = png->getWidth();
-    const int pngHeight = png->getHeight();
-    if (pngWidth <= 0 || pngWidth > SLS_PROFILE_MAX_WIDTH ||
-        pngHeight <= 0 || pngHeight > SLS_PROFILE_MAX_HEIGHT) {
-      DIAG_PRINTF("[SLS/PNG] unsupported dimensions=%dx%d\n",
-                    pngWidth, pngHeight);
-      png->close();
-      releasePngDecoder(png, pngInSharedWorkspace);
-      fadeUp();
       return false;
     }
 
     if (diagnosticDebug)
       DIAG_PRINTF("[SLS/PNG] dimensions=%dx%d alpha=%u\n",
                     pngWidth, pngHeight, png->hasAlpha());
+    lastRenderTouchedDisplay = true;
+    fadeDown();
     tft.fillScreen(png->hasAlpha() ? TFT_WHITE : TFT_BLACK);
     tft.startWrite();
     rc = png->decode(png, 0);

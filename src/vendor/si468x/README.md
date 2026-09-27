@@ -1,5 +1,14 @@
 # Si468x Universal Driver
 
+## Vendored source
+
+This application vendors `Si468x.h` from `bales0/Si468x_library` commit
+`b671d372a4fe5bb4df493ea6147c215577b25dc2` (driver documentation revision
+0.9.6). The raw file SHA-256 at integration time is
+`A894CF940CBD143D9C0917BF68C3F335370AF28FC06E9D074F0EEA91545FBF6E`.
+The application copy must remain byte-for-byte identical to that committed
+upstream header.
+
 `Si468x.h` is a **single-header, platform-neutral C++11 driver** for the Si468x digital-radio family. It is designed as a reusable device driver rather than as an Arduino radio application.
 
 The driver is intentionally independent of:
@@ -119,6 +128,14 @@ for (;;) {
 ```
 
 `service()` handles command CTS completion and optional status polling. With INTB connected, `notifyInterrupt()` causes the status to be serviced promptly. Without a timer, the non-blocking engine can still poll once per `service()` call; blocking convenience functions and enforced timeouts require `HostInterface::timeUs`.
+
+If host servicing occurs after a command deadline, `service()` performs exactly
+one final CTS read. Ready CTS completes normally; non-ready CTS becomes
+`Result::Timeout`; a failed read remains `Result::TransportError`. Timing
+accessors report host lateness only and cannot prove when the tuner asserted
+CTS. `abortCommand()` cancels caller-owned reply/IRQ/timing state without a bus
+transaction and is reserved for confirmed physical reset or deliberate
+operation cancellation, not ordinary scheduling conflicts.
 
 The status callback is intended to **record/schedule work only**. Do not issue a nested Si468x command from inside the callback while `service()` is processing the current command.
 
@@ -416,6 +433,13 @@ See `MIGRATION_FROM_DABSHIELD.md` for a conceptual mapping. There is deliberatel
 This release has desktop C++11 compile tests and parser/command tests. It has **not yet been validated on every physical Si468x part or every firmware revision**. Hardware validation should include boot, tune/seek, interrupt timing, DSRV load, NVSPI programming and error recovery on the actual board.
 
 ## Revision notes
+
+### 0.9.6 command cancellation and late-service revision
+
+- Added bus-free `abortCommand()` and `Result::Aborted` while preserving all
+  previous numeric result values.
+- Added one final CTS observation at an expired deadline without rearming it.
+- Added host service-gap/deadline-lateness diagnostics and state-machine tests.
 
 ### 0.9.5 protocol-boundary and audit revision
 

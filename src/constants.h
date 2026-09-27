@@ -46,7 +46,9 @@ enum Gpio12Mode : uint8_t {
 };
 
 static inline uint8_t sanitizeGpio12Mode(uint8_t value) {
-  return value <= GPIO12_IR ? value : GPIO12_AUTO;
+  return value <= static_cast<uint8_t>(GPIO12_IR)
+      ? value
+      : static_cast<uint8_t>(GPIO12_AUTO);
 }
 
 static const char* const Gpio12ModeText[] = {"AUTO", "INTB", "IR"};

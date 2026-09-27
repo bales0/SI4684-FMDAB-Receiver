@@ -3,7 +3,7 @@
 
 /*
  * Si468x Universal Driver -- single-header, platform-neutral C++11 library
- * Revision: 0.9.5 (documentation metadata only; no runtime library-version API)
+ * Revision: 0.9.6 (documentation metadata only; no runtime library-version API)
  * -----------------------------------------------------------------------
  * Target devices: Si4682 / Si4683 / Si4684 / Si4685 / Si4688 / Si4689
  *
@@ -1105,7 +1105,8 @@ enum class Result : int8_t {
     BufferTooSmall = -7,
     Unsupported = -8,
     MalformedReply = -9,
-    EndOfData = -10
+    EndOfData = -10,
+    Aborted = -11
 };
 
 /*
@@ -1726,6 +1727,8 @@ public:
                _irqPending(0), _state(State::Idle), _lastResult(Result::Ok), _reply(0),
                _replyLength(0), _deadline(0), _nextCtsPoll(0), _nextIdlePoll(0),
                _ctsPollIntervalUs(1000), _idlePollIntervalUs(50000), _lastDeviceError(0),
+               _lastServiceTime(0), _lastServiceGap(0), _lastDeadlineLateness(0),
+               _serviceTimeValid(false),
                _detectedPart(Part::Unknown), _activeImage(Image::Unknown) {}
 
     // SI468X-API: Si468x | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: none (host-side configuration) | SI468X-AN649: host abstraction
@@ -1787,7 +1790,9 @@ public:
         }
         Result r=delayUs(resetAssertUs); if (r!=Result::Ok) return r;
         _host.setReset(_host.context,false);
-        return delayUs(resetReleaseUs);
+        r=delayUs(resetReleaseUs);
+        if (r==Result::Ok) (void)abortCommand();
+        return r;
     }
 
     /* Call from the platform ISR.  Do not perform bus traffic in the ISR. */
@@ -1798,6 +1803,10 @@ public:
     bool busy() const { return _state != State::Idle; }
     // SI468X-API: lastResult | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: any state | SI468X-AN649: host-side state/event engine
     Result lastResult() const { return _lastResult; }
+    // SI468X-API: lastServiceGapUs | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: none (host-side diagnostics) | SI468X-AN649: host abstraction
+    uint32_t lastServiceGapUs() const { return _lastServiceGap; }
+    // SI468X-API: lastDeadlineLatenessUs | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: none (host-side diagnostics) | SI468X-AN649: host abstraction
+    uint32_t lastDeadlineLatenessUs() const { return _lastDeadlineLateness; }
     // SI468X-API: lastStatus | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: any state | SI468X-AN649: host-side state/event engine
     const Status& lastStatus() const { return _lastStatus; }
     // SI468X-API: lastDeviceError | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: any state | SI468X-AN649: ERR_CMD DATA_0 error code
@@ -1930,10 +1939,45 @@ public:
         _reply=reply; _replyLength=replyLength;
         _deadline = now + timeoutUs;
         _nextCtsPoll = now;
+        _lastServiceTime = now;
+        _lastServiceGap = 0;
+        _lastDeadlineLateness = 0;
+        _serviceTimeValid = _host.timeUs != 0;
         _lastResult=Result::Pending;
         _lastDeviceError=0;
         _state=State::WaitCts;
         return Result::Pending;
+    }
+
+    /*
+     * Cancel only host-side command state. No command or status transaction is
+     * performed. Use this after a confirmed physical device reset or when the
+     * application deliberately abandons an operation whose reply buffer and
+     * completion can no longer be accepted. It is not a substitute for normal
+     * command serialization: a live command must not be aborted merely to hide
+     * an application scheduling error.
+     *
+     * Returns Aborted when WaitCts was cancelled and Ok when already Idle.
+     * Existing Result numeric values are preserved.
+     */
+    // SI468X-API: abortCommand | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: none (host-side state only) | SI468X-AN649: host abstraction
+    Result abortCommand() {
+        const bool wasBusy=busy();
+        _state=State::Idle;
+        _reply=0;
+        _replyLength=0;
+        _irqPending=0;
+        _deadline=0;
+        _nextCtsPoll=0;
+        _nextIdlePoll=_host.timeUs ? nowUs()+_idlePollIntervalUs : 0u;
+        _lastServiceTime=0;
+        _lastServiceGap=0;
+        _lastDeadlineLateness=0;
+        _serviceTimeValid=false;
+        _lastDeviceError=0;
+        _lastStatus=Status();
+        _lastResult=wasBusy ? Result::Aborted : Result::Ok;
+        return _lastResult;
     }
 
     /*
@@ -1944,14 +1988,18 @@ public:
     // SI468X-API: service | SI468X-SUPPORT: ALL | SI468X-FIRMWARE: command/state dependent | SI468X-AN649: common command/response engine
     Result service() {
         const uint32_t now = nowUs();
+        if (_host.timeUs) {
+            if (_serviceTimeValid) _lastServiceGap=now-_lastServiceTime;
+            _lastServiceTime=now;
+            _serviceTimeValid=true;
+        }
         if (_state == State::WaitCts) {
-            if (_host.timeUs && timeReached(now, _deadline)) {
-                finish(Result::Timeout); return _lastResult;
-            }
+            const bool deadlineReached=_host.timeUs && timeReached(now,_deadline);
+            _lastDeadlineLateness=deadlineReached ? now-_deadline : 0u;
             // If the platform does not provide a timer, poll once per service() call.
             // This keeps the cooperative non-blocking API usable on very small bare-metal
             // hosts; only timeout enforcement then remains unavailable.
-            if (_host.timeUs && !_irqPending && _ctsPollIntervalUs && !timeReached(now, _nextCtsPoll))
+            if (!deadlineReached && _host.timeUs && !_irqPending && _ctsPollIntervalUs && !timeReached(now, _nextCtsPoll))
                 return Result::Pending;
             _irqPending=0;
             _nextCtsPoll = now + _ctsPollIntervalUs;
@@ -1959,7 +2007,10 @@ public:
             if (!_host.readReply(_host.context, s, 4)) { finish(Result::TransportError); return _lastResult; }
             parseStatus(s, 4, _lastStatus);
             if (_statusCallback) _statusCallback(_statusContext, _lastStatus);
-            if (!_lastStatus.cts()) return Result::Pending;
+            if (!_lastStatus.cts()) {
+                if (deadlineReached) finish(Result::Timeout);
+                return _lastResult;
+            }
 
             if (_replyLength) {
                 if (!_host.readReply(_host.context, _reply, _replyLength)) {
@@ -3121,6 +3172,8 @@ private:
     uint32_t _deadline, _nextCtsPoll, _nextIdlePoll;
     uint32_t _ctsPollIntervalUs, _idlePollIntervalUs;
     uint8_t _lastDeviceError;
+    uint32_t _lastServiceTime, _lastServiceGap, _lastDeadlineLateness;
+    bool _serviceTimeValid;
     Part _detectedPart;
     Image _activeImage;
 

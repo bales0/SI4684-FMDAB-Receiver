@@ -5,21 +5,29 @@
 
 class MemoryFile {
  public:
-  MemoryFile(const uint8_t* data, size_t size) : data_(data), size_(size), position_(0) {}
+  MemoryFile(const uint8_t* data, size_t size)
+      : data_(data), size_(size), position_(0), valid_(data != nullptr && size != 0) {}
   explicit operator bool() const { return data_ != nullptr && size_ != 0; }
-  int read() { return position_ < size_ ? data_[position_++] : -1; }
+  int read() {
+    if (position_ < size_) return data_[position_++];
+    valid_ = false;
+    return -1;
+  }
   bool seek(size_t position) {
-    if (position > size_) return false;
+    if (position > size_) { valid_ = false; return false; }
     position_ = position;
+    valid_ = true;
     return true;
   }
   size_t position() const { return position_; }
+  bool valid() const { return valid_; }
   void close() {}
 
  private:
   const uint8_t* data_;
   size_t size_;
   size_t position_;
+  bool valid_;
 };
 
 // ============================================================================
@@ -53,6 +61,124 @@ class MemoryFile {
 #define M_APP15 0xEF
 #define M_COM   0xFE
 
+const char* JPEGpreflightName(JPEGPreflightResult result) {
+  switch (result) {
+    case JPEGPreflightResult::SupportedBaseline: return "SUPPORTED_BASELINE_JPEG";
+    case JPEGPreflightResult::InvalidJpeg: return "INVALID_JPEG";
+    case JPEGPreflightResult::UnsupportedProgressive: return "UNSUPPORTED_PROGRESSIVE_JPEG";
+    case JPEGPreflightResult::UnsupportedMultiscan: return "UNSUPPORTED_MULTISCAN_JPEG";
+    case JPEGPreflightResult::UnsupportedDimensions: return "UNSUPPORTED_JPEG_DIMENSIONS";
+    case JPEGPreflightResult::UnsupportedComponents: return "UNSUPPORTED_JPEG_COMPONENTS";
+  }
+  return "INVALID_JPEG";
+}
+
+JPEGPreflightResult JPEGpreflight(const uint8_t* data, size_t size,
+                                  int displayWidth, int displayHeight,
+                                  JPEGImageInfo& info) {
+  info = JPEGImageInfo();
+  if (!data || size < 4U || data[0] != 0xFFU || data[1] != M_SOI)
+    return JPEGPreflightResult::InvalidJpeg;
+
+  size_t position = 2U;
+  int pendingMarker = -1;
+  uint8_t firstScanComponents = 0;
+  bool foundEoi = false;
+
+  while (position < size || pendingMarker >= 0) {
+    int marker = pendingMarker;
+    pendingMarker = -1;
+    if (marker < 0) {
+      if (data[position++] != 0xFFU) return JPEGPreflightResult::InvalidJpeg;
+      while (position < size && data[position] == 0xFFU) ++position;
+      if (position >= size) return JPEGPreflightResult::InvalidJpeg;
+      marker = data[position++];
+    }
+
+    if (marker == M_EOI) { foundEoi = true; break; }
+    if (marker == M_SOI || (marker >= M_RST0 && marker <= M_RST7))
+      return JPEGPreflightResult::InvalidJpeg;
+    if (position + 2U > size) return JPEGPreflightResult::InvalidJpeg;
+    const uint16_t segmentLength = static_cast<uint16_t>(
+        (static_cast<uint16_t>(data[position]) << 8) | data[position + 1U]);
+    if (segmentLength < 2U || position + segmentLength > size)
+      return JPEGPreflightResult::InvalidJpeg;
+    const size_t payload = position + 2U;
+    const size_t segmentEnd = position + segmentLength;
+
+    if (marker == M_APP0) info.app0 = true;
+    if (marker == M_SOF0 || marker == M_SOF2) {
+      if (info.sof0 || info.sof2 || segmentLength < 11U || data[payload] != 8U)
+        return JPEGPreflightResult::InvalidJpeg;
+      info.sof0 = marker == M_SOF0;
+      info.sof2 = marker == M_SOF2;
+      info.height = static_cast<uint16_t>((data[payload + 1U] << 8) |
+                                          data[payload + 2U]);
+      info.width = static_cast<uint16_t>((data[payload + 3U] << 8) |
+                                         data[payload + 4U]);
+      info.components = data[payload + 5U];
+      if (info.width == 0U || info.height == 0U || info.components == 0U ||
+          segmentLength != static_cast<uint16_t>(8U + 3U * info.components))
+        return JPEGPreflightResult::InvalidJpeg;
+      for (uint8_t component = 0; component < info.components; ++component) {
+        const uint8_t sampling = data[payload + 7U + 3U * component];
+        const uint8_t horizontal = sampling >> 4;
+        const uint8_t vertical = sampling & 0x0FU;
+        if (horizontal == 0U || horizontal > 4U || vertical == 0U || vertical > 4U)
+          return JPEGPreflightResult::InvalidJpeg;
+        if (horizontal > info.maxHorizontalSampling)
+          info.maxHorizontalSampling = horizontal;
+        if (vertical > info.maxVerticalSampling)
+          info.maxVerticalSampling = vertical;
+      }
+    } else if (marker == M_DRI) {
+      if (segmentLength != 4U) return JPEGPreflightResult::InvalidJpeg;
+      info.restartInterval = static_cast<uint16_t>(
+          (static_cast<uint16_t>(data[payload]) << 8) | data[payload + 1U]);
+    }
+
+    position = segmentEnd;
+    if (marker != M_SOS) continue;
+    if (!info.sof0 && !info.sof2) return JPEGPreflightResult::InvalidJpeg;
+    const uint8_t scanComponents = data[payload];
+    if (scanComponents == 0U || scanComponents > info.components ||
+        segmentLength != static_cast<uint16_t>(6U + 2U * scanComponents))
+      return JPEGPreflightResult::InvalidJpeg;
+    if (info.scans == 0U) firstScanComponents = scanComponents;
+    if (info.scans == 0xFFU) return JPEGPreflightResult::InvalidJpeg;
+    ++info.scans;
+
+    // Skip entropy-coded data while respecting byte stuffing and restart
+    // markers. The first non-stuffed, non-RST marker is processed by the outer
+    // loop without treating entropy bytes as segment headers.
+    while (position < size) {
+      if (data[position++] != 0xFFU) continue;
+      while (position < size && data[position] == 0xFFU) ++position;
+      if (position >= size) return JPEGPreflightResult::InvalidJpeg;
+      const uint8_t entropyMarker = data[position++];
+      if (entropyMarker == 0x00U) continue;
+      if (entropyMarker >= M_RST0 && entropyMarker <= M_RST7) {
+        ++info.restartMarkers;
+        continue;
+      }
+      pendingMarker = entropyMarker;
+      break;
+    }
+  }
+
+  if (!foundEoi || (!info.sof0 && !info.sof2) || info.scans == 0U)
+    return JPEGPreflightResult::InvalidJpeg;
+  if (info.sof2) return JPEGPreflightResult::UnsupportedProgressive;
+  if (info.scans != 1U || firstScanComponents != info.components)
+    return JPEGPreflightResult::UnsupportedMultiscan;
+  if (info.width > static_cast<uint16_t>(displayWidth) ||
+      info.height > static_cast<uint16_t>(displayHeight))
+    return JPEGPreflightResult::UnsupportedDimensions;
+  if (info.components != 1U && info.components != 3U)
+    return JPEGPreflightResult::UnsupportedComponents;
+  return JPEGPreflightResult::SupportedBaseline;
+}
+
 static const uint8_t zigzag[64] = {
    0,  1,  8, 16,  9,  2,  3, 10,
   17, 24, 32, 25, 18, 11,  4,  5,
@@ -66,7 +192,7 @@ static const uint8_t zigzag[64] = {
 
 static inline int pjExtend(int v, int bits) {
   int vt = 1 << (bits - 1);
-  if (v < vt) v += (-1 << bits) + 1;
+  if (v < vt) v -= (1 << bits) - 1;
   return v;
 }
 
@@ -159,10 +285,11 @@ struct PJBitReader {
   bool hitMarker;
   uint8_t markerVal;
   bool safeTail;
+  bool decodeError;
 
   void init(MemoryFile* f) {
     file = f; buf = 0; bits = 0;
-    hitMarker = false; markerVal = 0; safeTail = false;
+    hitMarker = false; markerVal = 0; safeTail = false; decodeError = false;
   }
 
   void reset() {
@@ -212,7 +339,7 @@ struct PJBitReader {
 
   int getBits(int n) {
     if (bits < n) { if (safeTail) fillBitsMin(n); else fillBits(); }
-    if (bits < n) return 0;
+    if (bits < n) { decodeError = true; return 0; }
     bits -= n;
     return (buf >> bits) & ((1 << n) - 1);
   }
@@ -230,6 +357,7 @@ struct PJBitReader {
 
 // --- Huffman decode ---
 static int pjHuffDecode(PJBitReader* br, PJHuffTable* ht) {
+  if (!ht || ht->total <= 0) { br->decodeError = true; return 0; }
   if (br->safeTail) {
     if (br->bits < 8 && !br->hitMarker) br->fillBitsMin(8);
     if (br->bits >= 8) {
@@ -248,11 +376,13 @@ static int pjHuffDecode(PJBitReader* br, PJHuffTable* ht) {
   }
   int code = br->getBits(1);
   for (int l = 1; l <= 16; l++) {
+    if (br->decodeError) return 0;
     if (code <= ht->maxcode[l]) {
       return ht->vals[ht->valptr[l] + code - (ht->maxcode[l] - ht->bits[l] + 1)];
     }
     code = (code << 1) | br->getBits(1);
   }
+  br->decodeError = true;
   return 0;
 }
 
@@ -327,12 +457,15 @@ static void pjSkip(MemoryFile& f, int n) {
 // --- Parse DQT ---
 // DQT (Define Quantization Table) parser - up to 4 tables, 8 or 16 bit each.
 static bool pjParseDQT(MemoryFile& f, PJDecoder* d) {
-  int len = pjRead16(f) - 2;
+  const int segmentLength = pjRead16(f);
+  if (!f.valid() || segmentLength < 3) return false;
+  int len = segmentLength - 2;
   while (len > 0) {
     int info = pjRead8(f); len--;
     int tblIdx = info & 0x0F;
     int prec = (info >> 4) & 0x0F;
-    if (tblIdx > 3) return false;
+    const int tableBytes = prec ? 128 : 64;
+    if (tblIdx > 3 || prec > 1 || len < tableBytes) return false;
     for (int i = 0; i < 64; i++) {
       if (prec) {
         d->qtable[tblIdx][zigzag[i]] = pjRead16(f);
@@ -343,41 +476,47 @@ static bool pjParseDQT(MemoryFile& f, PJDecoder* d) {
       }
     }
   }
-  return true;
+  return len == 0 && f.valid();
 }
 
 // --- Parse DHT ---
 // DHT (Define Huffman Table) parser - stores DC/AC tables for each component.
 static bool pjParseDHT(MemoryFile& f, PJDecoder* d) {
-  int len = pjRead16(f) - 2;
+  const int segmentLength = pjRead16(f);
+  if (!f.valid() || segmentLength < 19) return false;
+  int len = segmentLength - 2;
   while (len > 0) {
+    if (len < 17) return false;
     int info = pjRead8(f); len--;
     int cls = (info >> 4) & 0x0F;
     int tblIdx = info & 0x0F;
-    if (tblIdx > 3) return false;
+    if (cls > 1 || tblIdx > 3) return false;
     PJHuffTable* ht = (cls == 0) ? &d->dcHuff[tblIdx] : &d->acHuff[tblIdx];
     int total = 0;
     for (int i = 1; i <= 16; i++) {
       ht->bits[i] = pjRead8(f); len--;
       total += ht->bits[i];
     }
+    if (total > 256 || total > len) return false;
     for (int i = 0; i < total; i++) {
       ht->vals[i] = pjRead8(f); len--;
     }
     pjBuildHuff(ht);
   }
-  return true;
+  return len == 0 && f.valid();
 }
 
 // --- Parse SOF2 ---
 // SOF (Start Of Frame) parser - extracts image dimensions and subsampling info.
 static bool pjParseSOF(MemoryFile& f, PJDecoder* d) {
-  pjRead16(f); // length
+  const int segmentLength = pjRead16(f);
+  if (!f.valid() || segmentLength < 11) return false;
   if (pjRead8(f) != 8) return false; // precision must be 8 bit
   d->height = pjRead16(f);
   d->width = pjRead16(f);
   d->nComp = pjRead8(f);
-  if (d->nComp == 0 || d->nComp > PJ_MAX_COMPONENTS) return false;
+  if (d->nComp == 0 || d->nComp > PJ_MAX_COMPONENTS ||
+      segmentLength != 8 + 3 * d->nComp) return false;
 
   d->maxH = 0;
   d->maxV = 0;
@@ -411,39 +550,53 @@ static bool pjParseSOF(MemoryFile& f, PJDecoder* d) {
   d->blocksPerMCU = static_cast<uint8_t>(blocksPerMcu);
 
   pjComputeBlockOffsets(d);
-  return true;
+  return f.valid();
 }
 
 // --- Parse SOS ---
 // SOS (Start Of Scan) parser - reads component selectors and the band/Ah/Al
 // fields that drive progressive-mode pass dispatch.
 static bool pjParseSOS(MemoryFile& f, PJDecoder* d) {
-  pjRead16(f); // length
+  const int segmentLength = pjRead16(f);
+  if (!f.valid() || segmentLength < 8) return false;
   d->scanNComp = pjRead8(f);
-  if (d->scanNComp > PJ_MAX_COMPONENTS) return false;
+  if (d->scanNComp == 0 || d->scanNComp > PJ_MAX_COMPONENTS ||
+      d->scanNComp > d->nComp || segmentLength != 6 + 2 * d->scanNComp)
+    return false;
 
+  uint8_t seenComponents = 0;
   for (int i = 0; i < d->scanNComp; i++) {
     int id = pjRead8(f);
     int tbl = pjRead8(f);
-    d->scanCompIdx[i] = 0;
+    bool found = false;
     for (int c = 0; c < d->nComp; c++) {
-      if (d->comp[c].id == id) { d->scanCompIdx[i] = c; break; }
+      if (d->comp[c].id == id) {
+        if (seenComponents & (1U << c)) return false;
+        seenComponents |= static_cast<uint8_t>(1U << c);
+        d->scanCompIdx[i] = c;
+        found = true;
+        break;
+      }
     }
+    if (!found) return false;
     d->scanDcTbl[i] = (tbl >> 4) & 0x0F;
     d->scanAcTbl[i] = tbl & 0x0F;
+    if (d->scanDcTbl[i] >= PJ_MAX_HTABLES ||
+        d->scanAcTbl[i] >= PJ_MAX_HTABLES) return false;
   }
   d->ss = pjRead8(f);
   d->se = pjRead8(f);
   int approx = pjRead8(f);
   d->ah = (approx >> 4) & 0x0F;
   d->al = approx & 0x0F;
-  return true;
+  return f.valid();
 }
 
 // --- Parse DRI ---
-static void pjParseDRI(MemoryFile& f, PJDecoder* d) {
-  pjRead16(f);
+static bool pjParseDRI(MemoryFile& f, PJDecoder* d) {
+  if (pjRead16(f) != 4) return false;
   d->restartInterval = pjRead16(f);
+  return f.valid();
 }
 
 // --- Entropy decoders ---
@@ -492,7 +645,7 @@ static void pjDecodeACFirst(PJDecoder* d, int16_t* coef, int compScanIdx) {
 static void pjDecodeACRefine(PJDecoder* d, int16_t* coef, int compScanIdx) {
   PJHuffTable* ht = &d->acHuff[d->scanAcTbl[compScanIdx]];
   int p1 = 1 << d->al;
-  int m1 = (-1) << d->al;
+  int m1 = -(1 << d->al);
   int k = d->ss;
 
   if (d->eobRun == 0) {
@@ -555,6 +708,7 @@ static void pjDecodeACRefine(PJDecoder* d, int16_t* coef, int compScanIdx) {
 static void pjDecodeBaseline(PJDecoder* d, int16_t* coef, int compScanIdx) {
   PJHuffTable* dcHt = &d->dcHuff[d->scanDcTbl[compScanIdx]];
   int s = pjHuffDecode(&d->br, dcHt);
+  if (d->br.decodeError || s > 11) { d->br.decodeError = true; return; }
   int diff = (s > 0) ? pjReceive(&d->br, s) : 0;
   int ci = d->scanCompIdx[compScanIdx];
   d->comp[ci].dcPred += diff;
@@ -563,8 +717,10 @@ static void pjDecodeBaseline(PJDecoder* d, int16_t* coef, int compScanIdx) {
   PJHuffTable* acHt = &d->acHuff[d->scanAcTbl[compScanIdx]];
   for (int k = 1; k <= 63; k++) {
     int rs = pjHuffDecode(&d->br, acHt);
+    if (d->br.decodeError) return;
     int r = rs >> 4;
     s = rs & 0x0F;
+    if (s > 10) { d->br.decodeError = true; return; }
     if (s == 0) {
       if (r == 15) { k += 15; continue; }
       break;
@@ -950,7 +1106,7 @@ static bool pjProcessFileForRow(MemoryFile& f, PJDecoder* d, int16_t* rowCoefs,
         if (!pjParseDQT(f, d)) return false;
         break;
       case M_DRI:
-        pjParseDRI(f, d);
+        if (!pjParseDRI(f, d)) return false;
         break;
       case M_SOS:
         if (!pjParseSOS(f, d)) return false;
@@ -982,9 +1138,12 @@ static bool pjProcessFileForRow(MemoryFile& f, PJDecoder* d, int16_t* rowCoefs,
 // --- Baseline single-pass decode ---
 // Single-pass baseline decoder: walks the file once, decoding and rendering
 // each MCU row on the fly. Used for SOF0 images where no multi-pass needed.
-static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
+static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI* tft,
                                   int offsetX, int offsetY,
-                                  uint8_t* workspace, size_t workspaceSize) {
+                                  uint8_t* workspace, size_t workspaceSize,
+                                  JPEGImageInfo* info,
+                                  JPEGRowCallback rowCallback,
+                                  void* rowContext) {
   f.seek(0);
   if (pjRead8(f) != 0xFF || pjRead8(f) != M_SOI) return false;
 
@@ -1004,7 +1163,7 @@ static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
         if (!pjParseDQT(f, d)) return false;
         break;
       case M_DRI:
-        pjParseDRI(f, d);
+        if (!pjParseDRI(f, d)) return false;
         break;
       case M_SOS: {
         if (!pjParseSOS(f, d)) return false;
@@ -1018,9 +1177,9 @@ static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
           return false;
         }
         d->br.init(&f);
-        // Prevent baseline bitstream read-ahead past the final MCU when no
-        // restart markers are present.
-        d->br.safeTail = (d->restartInterval == 0);
+        // Read only as many entropy bytes as the current symbol needs. This
+        // keeps EOI/RST markers observable at deterministic MCU boundaries.
+        d->br.safeTail = true;
 
         int blocksPerRow = d->mcuCntX * d->blocksPerMCU;
         size_t coefSize = blocksPerRow * 64 * sizeof(int16_t);
@@ -1042,6 +1201,9 @@ static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
 
         d->mcuCount = 0;
         for (int i = 0; i < d->nComp; i++) d->comp[i].dcPred = 0;
+        const int totalMcus = d->mcuCntX * d->mcuCntY;
+        int decodedMcus = 0;
+        uint8_t expectedRestart = 0;
 
         for (int row = 0; row < d->mcuCntY; row++) {
           memset(rowCoefs, 0, coefSize);
@@ -1053,31 +1215,49 @@ static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
                 for (int bh = 0; bh < d->comp[ci].hSamp; bh++) {
                   int idx = pjRowBlockIndex(d, mcuX, ci, bh, bv);
                   pjDecodeBaseline(d, &rowCoefs[idx * 64], si);
+                  if (d->br.decodeError) return false;
                 }
               }
             }
-            if (d->restartInterval > 0) {
-              d->mcuCount++;
-              if (d->mcuCount >= d->restartInterval) {
-                d->mcuCount = 0;
-                for (int i = 0; i < d->nComp; i++) d->comp[i].dcPred = 0;
-                d->br.reset();
-              }
-            }
-            // Handle RST markers encountered by bitreader read-ahead
-            if (d->br.hitMarker && d->br.markerVal >= M_RST0 && d->br.markerVal <= M_RST7) {
+            ++decodedMcus;
+            ++d->mcuCount;
+
+            const bool restartBoundary = d->restartInterval > 0 &&
+                d->mcuCount >= d->restartInterval && decodedMcus < totalMcus;
+            if (restartBoundary) {
+              int restartMarker = d->br.hitMarker
+                  ? d->br.markerVal
+                  : pjSkipEntropy(f);
+              if (restartMarker != M_RST0 + expectedRestart) return false;
+              expectedRestart = static_cast<uint8_t>((expectedRestart + 1U) & 7U);
               d->mcuCount = 0;
               for (int i = 0; i < d->nComp; i++) d->comp[i].dcPred = 0;
               d->br.reset();
+              d->br.safeTail = true;
+            } else if (d->br.hitMarker && decodedMcus < totalMcus) {
+              // EOI, SOS or an out-of-place RST before all expected MCUs is a
+              // truncated/corrupt stream, never a partial success.
+              return false;
             }
-            if (d->br.hitMarker) break;
           }
 
-          pjOutputMCURow(d, rowCoefs, row, tft, offsetX, offsetY, allBlocks);
-          if (d->br.hitMarker) break;
+          if (tft) {
+            pjOutputMCURow(d, rowCoefs, row, *tft, offsetX, offsetY, allBlocks);
+            if (info) info->lastRenderedMcuRow = static_cast<int16_t>(row);
+          }
+          if (rowCallback) rowCallback(rowContext);
         }
 
-        return true;
+        if (decodedMcus != totalMcus || d->br.decodeError) return false;
+        int finalMarker = d->br.hitMarker ? d->br.markerVal : pjSkipEntropy(f);
+        // Some encoders emit the scheduled restart marker even when the final
+        // MCU lands exactly on the interval boundary. Accept it only in the
+        // expected sequence, then require EOI immediately afterwards.
+        if (finalMarker >= M_RST0 && finalMarker <= M_RST7) {
+          if (finalMarker != M_RST0 + expectedRestart) return false;
+          finalMarker = pjSkipEntropy(f);
+        }
+        return finalMarker == M_EOI;
       }
       default:
         if ((marker >= M_APP0 && marker <= M_APP15) || marker == M_COM) {
@@ -1092,13 +1272,21 @@ static bool pjDecodeBaselinePass(MemoryFile& f, PJDecoder* d, TFT_eSPI& tft,
   return false;
 }
 
-// --- Main entry point ---
-// Public entry point: opens the file, parses headers, then dispatches to
-// either the single-pass baseline decoder (SOF0) or the multi-pass
-// progressive decoder (SOF2). Returns true on success.
-bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
-                 int displayWidth, int displayHeight,
-                 uint8_t* workspace, size_t workspaceSize) {
+// --- Main entry points ---
+// Parse and decode the complete baseline stream. A null TFT performs the same
+// entropy/marker validation without changing display state.
+static bool JPEGdecodePass(const uint8_t* data, size_t size, TFT_eSPI* tft,
+                           int displayWidth, int displayHeight,
+                           uint8_t* workspace, size_t workspaceSize,
+                           JPEGImageInfo* callerInfo,
+                           JPEGRowCallback rowCallback,
+                           void* rowContext) {
+  JPEGImageInfo localInfo;
+  JPEGImageInfo& info = callerInfo ? *callerInfo : localInfo;
+  const JPEGPreflightResult preflight =
+      JPEGpreflight(data, size, displayWidth, displayHeight, info);
+  if (preflight != JPEGPreflightResult::SupportedBaseline) return false;
+
   MemoryFile f(data, size);
   if (!f) return false;
 
@@ -1108,19 +1296,15 @@ bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
   // Pre-scan only far enough to identify frame coding and dimensions.
   f.seek(0);
   bool foundSOF = false;
-  bool isBaseline = false;
-  bool isProgressive = false;
   while (!foundSOF) {
     const int marker = pjSkipToMarker(f);
     if (marker < 0 || marker == M_EOI) break;
     if (marker == M_SOF0) {
       if (!pjParseSOF(f, d)) { f.close(); return false; }
-      isBaseline = true;
       foundSOF = true;
     } else if (marker == M_SOF2) {
-      if (!pjParseSOF(f, d)) { f.close(); return false; }
-      isProgressive = true;
-      foundSOF = true;
+      f.close();
+      return false;
     } else if (marker != M_SOI && !(marker >= M_RST0 && marker <= M_RST7)) {
       const int len = pjRead16(f);
       if (len >= 2) pjSkip(f, len - 2);
@@ -1128,11 +1312,6 @@ bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
   }
 
   if (!foundSOF || d->width == 0 || d->height == 0) {
-    f.close();
-    return false;
-  }
-  if (isProgressive || !isBaseline) {
-    DIAG_PRINTLN("[SLS/JPEG] progressive coding ignored (optional in DAB SlideShow Simple Profile)");
     f.close();
     return false;
   }
@@ -1158,7 +1337,30 @@ bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
   const int offsetX = (displayWidth - d->width) / 2;
   const int offsetY = (displayHeight - d->height) / 2;
   const bool result = pjDecodeBaselinePass(f, d, tft, offsetX, offsetY,
-                                           workspace, workspaceSize);
+                                            workspace, workspaceSize, &info,
+                                            rowCallback, rowContext);
   f.close();
   return result;
+}
+
+bool JPEGvalidate(const uint8_t* data, size_t size,
+                  int displayWidth, int displayHeight,
+                  uint8_t* workspace, size_t workspaceSize,
+                  JPEGImageInfo* info,
+                  JPEGRowCallback rowCallback,
+                  void* rowContext) {
+  return JPEGdecodePass(data, size, nullptr, displayWidth, displayHeight,
+                        workspace, workspaceSize, info,
+                        rowCallback, rowContext);
+}
+
+bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
+                 int displayWidth, int displayHeight,
+                 uint8_t* workspace, size_t workspaceSize,
+                 JPEGImageInfo* info,
+                 JPEGRowCallback rowCallback,
+                 void* rowContext) {
+  return JPEGdecodePass(data, size, &tft, displayWidth, displayHeight,
+                        workspace, workspaceSize, info,
+                        rowCallback, rowContext);
 }

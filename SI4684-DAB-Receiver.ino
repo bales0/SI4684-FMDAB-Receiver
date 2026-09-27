@@ -853,6 +853,9 @@ bool SwitchRadioMode(RadioMode newMode, bool force) {
   DIAG_PRINTLN("[SWITCH] shared RST GPIO17 HIGH; settle 20 ms before TFT restore");
   digitalWrite(17, HIGH);
   delay(20);
+  // The physical tuner reset has completed. Only now is it safe to invalidate
+  // a pre-reset host command and its caller-owned reply pointer.
+  radio.onHardwareResetComplete();
 
   // TFT and radio use separate SPI buses. Restore only the ILI9341 controller
   // registers before the long radio upload; shared GPIO17 remains HIGH.
@@ -1708,11 +1711,11 @@ void loop(void) {
   IrRemoteProcess();
 }
 
-// Pump the radio driver and refresh the on-screen indicators. Skipped while
-// `tuning` is true so we don't fight an in-progress retune.
+// Always pump an in-flight radio command. During manual selection, suppress
+// only new metadata/DSRV scheduling so CTS cannot expire behind the debounce.
 void ProcessDAB(void) {
+  radio.Update(!tuning);
   if (!tuning) {
-    radio.Update();
     if (radioMode == RADIO_MODE_DAB && radio.transportStalled()) {
       const uint32_t now = millis();
       if (!RadioStallRecoveryPerformed ||
@@ -1883,11 +1886,13 @@ void ProcessDAB(void) {
           slsDisplayedHash = imageHash;
           slsDisplayedSize = imageSize;
         } else {
-          // A failed decoder may have left a partially cleared frame. Return
-          // to a usable UI instead of keeping an empty slideshow view armed.
+          // Unsupported/corrupt images are rejected before TFT changes, so do
+          // not redraw the already-visible main UI. Restore only if a validated
+          // render pass unexpectedly failed after it started touching TFT.
           SlideShowView = false;
           slsDisplayedFingerprintValid = false;
-          RestoreMainDisplayAfterSlideshow();
+          if (SlideshowLastRenderTouchedDisplay())
+            RestoreMainDisplayAfterSlideshow();
         }
       }
       radio.acknowledgeSlideshow();

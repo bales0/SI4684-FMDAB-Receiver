@@ -1,6 +1,6 @@
 // Slideshow rendering: takes the assembled MOT image from radio RAM and
-// pushes it to the TFT, choosing the right decoder (PNG or
-// baseline/progressive JPEG) based on the magic bytes.
+// pushes it to the TFT, choosing the supported PNG or single-scan baseline
+// JPEG path. Unsupported progressive/multi-scan JPEG is rejected pre-render.
 
 #ifndef SLIDESHOW_H
 #define SLIDESHOW_H
@@ -25,5 +25,7 @@ bool SlideshowPrepareWorkspace(void);
 // Decode and display the current RAM image; called from the main loop when
 // radio.SlideShowAvailable && radio.SlideShowUpdate are set.
 bool ShowSlideShow(void);
+// True only when the most recent ShowSlideShow() attempt began modifying TFT.
+bool SlideshowLastRenderTouchedDisplay(void);
 
 #endif
