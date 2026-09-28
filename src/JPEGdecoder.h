@@ -42,7 +42,8 @@ bool JPEGvalidate(const uint8_t* data, size_t size,
                   uint8_t* workspace, size_t workspaceSize,
                   JPEGImageInfo* info = nullptr,
                   JPEGRowCallback rowCallback = nullptr,
-                  void* rowContext = nullptr);
+                  void* rowContext = nullptr,
+                  bool verboseScanDiagnostics = false);
 
 // Decode a JPEG directly from RAM and render it. Baseline and progressive
 // Huffman streams use bounded caller-owned workspace and strict end-of-scan
@@ -52,4 +53,5 @@ bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
                  uint8_t* workspace = nullptr, size_t workspaceSize = 0,
                  JPEGImageInfo* info = nullptr,
                  JPEGRowCallback rowCallback = nullptr,
-                 void* rowContext = nullptr);
+                 void* rowContext = nullptr,
+                 bool verboseScanDiagnostics = false);

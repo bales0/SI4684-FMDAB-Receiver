@@ -1551,6 +1551,7 @@ void setup(void) {
   // toggle detailed MOT segment tracing on demand.
   diagnosticDebug = false;
   radio.SlideShowDebug = false;
+  radio.SlideShowVerbose = false;
   DIAG_PRINTLN("[SLS] segment diagnostics OFF (DEBUG toggles details)");
   tftPrintFixed(0, detectedRadioVersion, 160, 210,
                 TFT_WHITE, TFT_DARKGREY, 16);
@@ -1818,7 +1819,7 @@ void ProcessDAB(void) {
     if (!ChannelListView) {
       ShowSignalLevel();
       // The Q/M bar overlaps the lower edge of the volume panel. Repaint the
-      // volume panel immediately after that 10 Hz bar update, matching the
+      // volume panel immediately after that mode-specific bar update, matching the
       // slideshow-loading timing instead of leaving the bar visible until the
       // rest of the dynamic widgets have finished drawing.
       if (setvolume && volumeOverlayRssiStamp != rssiTimer) {
@@ -1844,7 +1845,7 @@ void ProcessDAB(void) {
         ShowSlideshowReceiveIndicator();
         ShowECC();
         // ShowSignalLevel() and the other dynamic fields are rendered first.
-        // Repaint the bubble in this same pass whenever the 10 Hz signal frame
+        // Repaint the bubble in this same pass whenever the signal frame
         // changed, so the quality bar can never remain over its lower edge.
         if (slsWaitingView &&
             slsWaitingOverlayRssiStamp != rssiTimer)
@@ -1908,7 +1909,7 @@ void ProcessDAB(void) {
   // Final composition pass. When the signal/Q bar changed, the overlay was
   // already restored immediately after ShowSignalLevel() above; draw it once
   // more after all remaining dynamic widgets so fields such as protection
-  // level cannot cut into its lower edge. This is only 10 Hz and keeps the
+  // level cannot cut into its lower edge. This follows the 2/4 Hz signal UI and keeps the
   // overlay visually as solid as the slideshow-loading panel.
   // Do not call ShowVolume() here: it would restart the 3-second close timer.
   if (setvolume && !menu &&

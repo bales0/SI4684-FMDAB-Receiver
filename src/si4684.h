@@ -117,6 +117,7 @@ class DAB {
     bool signallock;
     bool SlideShowAvailable;
     bool SlideShowDebug;
+    bool SlideShowVerbose;
     bool SlideShowUpdate;
     bool SlideShowUpdate2;
     char EID[5];
@@ -134,6 +135,8 @@ class DAB {
     uint16_t ensembleEcc;
     bool serviceHasOwnEcc;
     int16_t getRSSI(void);
+    uint32_t signalSampleGeneration(void) const { return rfSampleGeneration; }
+    uint32_t timeSampleGeneration(void) const { return dabTimeGeneration; }
     uint16_t samplerate;
     uint16_t Year;
     uint32_t getFreq(uint8_t freq);
@@ -239,6 +242,8 @@ class DAB {
     uint32_t fmAcfTimer;
     uint32_t fmRdsTimer;
     uint32_t dabSignalTimer;
+    uint32_t rfSampleGeneration = 0;
+    uint32_t dabTimeGeneration = 0;
     int16_t dabRssi10;
     uint8_t fmPsSeenMask;
     uint8_t fmPsConfirmedMask;
@@ -305,6 +310,13 @@ class DAB {
     bool dabCurrentSubchannelRefreshPending = false;
     bool dabCurrentServiceRefreshPending = false;
     uint8_t dabServiceTypeScanIndex = 0;
+    uint32_t dabSignalNextDueMs = 0;
+    uint32_t dabEnsembleNextDueMs = 0;
+    uint32_t dabTimeNextDueMs = 0;
+    uint32_t dabAudioNextDueMs = 0;
+    uint32_t dabCurrentServiceNextDueMs = 0;
+    uint32_t dabCurrentSubchannelNextDueMs = 0;
+    uint32_t dabLastLowPriorityCommandMs = 0;
 
     bool dabDataServicePending = false;
     uint32_t dabDataServiceId = 0;
@@ -351,6 +363,9 @@ class DAB {
                          uint32_t timeoutUs = 1000000UL);
     void finishDabCommand(void);
     void scheduleNextDabCommand(void);
+    void resetDabPeriodicDeadlines(uint32_t now);
+    void resetDabServiceDeadlines(uint32_t now);
+    void updateDabPeriodicRequests(uint32_t now);
     void parseDabServiceListReply(uint16_t replyLength);
     void queueDabDataService(void);
 };

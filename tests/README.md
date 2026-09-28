@@ -20,8 +20,10 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
 ./test_jpeg.exe
 ```
 
-`test_scheduler.cpp` exercises the actual generation and retry/backoff helpers
-used by the DAB scheduler. `test_jpeg.cpp` runs the application JPEG parser and
+`test_scheduler.cpp` exercises the actual generation, retry/backoff, phased
+deadline, continuous-DSRV fairness, FM work-priority, RF/display-filter,
+one-shot time-sample and debug-throttling helpers used by the firmware.
+`test_jpeg.cpp` runs the application JPEG parser and
 decoder against baseline grayscale, 4:4:4, 4:2:2, 4:2:0 and restart-marker
 fixtures, including a complete 320×240 baseline 4:2:0 decode. Progressive
 coverage includes grayscale, 4:4:4, 4:2:2, 4:2:0, DRI/RST, 17×13 edge blocks

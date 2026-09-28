@@ -1,8 +1,8 @@
-# SI4684 FM/DAB Receiver v2.2
+# SI4684 FM/DAB Receiver v2.2.1
 
 Advanced FM, RDS/RBDS, DAB/DAB+ and DAB SlideShow receiver for the **Skyworks SI4684**, **ESP32-WROOM-32D** and a **320×240 ILI9341** display.
 
-Firmware v2.2 uses separate SPI controllers for the TFT and radio, supports learned IR remote control, FM/DAB presets, multilingual UI, DAB MOT SlideShow, light-sleep standby and an optional serial control/diagnostic interface. It includes a project-local universal **Si468x driver library** that centralizes the tuner command/CTS/error state machine and supports both bounded polling and real **INTB interrupt-driven handling**.
+Firmware v2.2.1 uses separate SPI controllers for the TFT and radio, supports learned IR remote control, FM/DAB presets, multilingual UI, DAB MOT SlideShow, light-sleep standby and an optional serial control/diagnostic interface. It includes a project-local universal **Si468x driver library** that centralizes the tuner command/CTS/error state machine and supports both bounded polling and real **INTB interrupt-driven handling**.
 
 This project is based on the original open-source SI4684/DAB receiver work published by **PE5PVB**.
 
@@ -136,7 +136,7 @@ The TFT uses **VSPI/SPI3**. `TFT_RST=-1` is intentional: GPIO17 is controlled by
 
 The Si4684 uses a dedicated **HSPI/SPI2** instance. The radio SPI bus is initialized once and is not re-created during normal FM/DAB operation.
 
-Firmware v2.2 uses a project-local universal **`Si468x` driver layer** (`vendor/si468x/Si468x.*`). It provides the common low-level transport and command state machine for the tuner. In particular it supports:
+Firmware v2.2.1 uses a project-local universal **`Si468x` driver layer** (`vendor/si468x/Si468x.*`). It provides the common low-level transport and command state machine for the tuner. In particular it supports:
 
 - normal bounded **polling** for CTS/status completion;
 - **INTB interrupt-driven** command/event handling when the Si4684 INTB line is connected;
@@ -150,6 +150,23 @@ mode. With INTB connected, interrupt completion is the fast path and a bounded
 2 ms safety poll remains enabled; occasional `ctsPoll` completions do not by
 themselves indicate fallback or a wiring fault. The ISR only records an event;
 all SPI work remains in the foreground transport pump.
+
+Application-level radio work is scheduled cooperatively and starts at most one
+new Si4684 command per pass. Continuous DSRV/MOT traffic is drained in bounded
+bursts of four commands; overdue RF status and then one phase-separated metadata
+command receive a turn before draining resumes. Stable intervals are:
+
+- DAB RF status 1000 ms; signal/Q UI 500 ms;
+- DAB audio and current-service metadata 10 s, ensemble 30 s, time and current
+  subchannel 60 s;
+- FM RSQ 500 ms; ACF 1000 ms; signal/multipath UI 250 ms;
+- FM RDS remains IRQ-driven with an 80 ms polling fallback.
+
+The signal display has two stages: each new RF sample updates the radio filter
+once, while the faster UI timer only interpolates toward that filtered target.
+The `DEBUG` command uses throttled MOT milestones. `DEBUG SLSV` (or
+`DEBUG VERBOSE`) explicitly toggles per-segment tracing; low-priority segment
+lines are dropped and counted when the UART TX buffer is full.
 
 The current build loads Skyworks-provided proprietary application images into the Si4684 with `LOAD_INIT` / `HOST_LOAD` / `BOOT` when changing the active radio firmware:
 
@@ -795,7 +812,7 @@ The IR receiver/capture runtime is implemented locally and therefore does not re
 
 ## Universal Si468x driver
 
-Firmware v2.2 uses the universal **Si468x** library/driver layer. The same driver handles low-level Si468x command transport for both FM and DAB operation and supports two radio-control methods:
+Firmware v2.2.1 uses the universal **Si468x** library/driver layer. The same driver handles low-level Si468x command transport for both FM and DAB operation and supports two radio-control methods:
 
 - **POLL** — bounded CTS/status polling;
 - **INTB** — hardware interrupt/event handling on GPIO12, with polling retained as a safety fallback.
@@ -829,7 +846,7 @@ Original project information and build material remain linked in the resources s
 2. Confirm the ESP32 module type and flash voltage.
 3. **If GPIO12 will be connected to Si4684 INTB or an IR receiver, burn the ESP32-WROOM-32D VDD_SDIO eFuse to fixed 3.3 V before normal use.**
 4. Verify the burn with `espefuse ... summary`.
-5. Build and flash firmware v2.2.
+5. Build and flash firmware v2.2.1.
 6. Start with `GPIO12 = AUTO` if no IR receiver is fitted.
 7. For a known INTB-wired board, select `GPIO12 = INTB` if desired.
 8. For IR hardware, select `GPIO12 = IR`, leave Settings and allow the automatic restart.

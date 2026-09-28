@@ -249,7 +249,15 @@ void processCommandLine(char* line) {
     if (strcmp(input, "DEBUG") == 0) {
       diagnosticDebug = !diagnosticDebug;
       radio.SlideShowDebug = diagnosticDebug;
+      if (!diagnosticDebug) radio.SlideShowVerbose = false;
       Serial.printf("[DEBUG] diagnostics %s\n", diagnosticDebug ? "ON" : "OFF");
+    } else if (strcmp(input, "DEBUG VERBOSE") == 0 ||
+               strcmp(input, "DEBUG SLSV") == 0) {
+      diagnosticDebug = true;
+      radio.SlideShowDebug = true;
+      radio.SlideShowVerbose = !radio.SlideShowVerbose;
+      Serial.printf("[DEBUG] SLS per-segment verbose %s\n",
+                    radio.SlideShowVerbose ? "ON" : "OFF");
     } else {
       DataPrint("#2\n");
     }

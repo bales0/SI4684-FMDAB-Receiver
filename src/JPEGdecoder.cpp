@@ -1281,7 +1281,8 @@ static int pjSkipEntropy(MemoryFile& f) {
 static bool pjProcessFileForRow(MemoryFile& f, PJDecoder* d, int16_t* rowCoefs,
                                 int targetRow, uint8_t* nzBitmap,
                                 JPEGRowCallback progressCallback,
-                                void* progressContext) {
+                                void* progressContext,
+                                bool verboseScanDiagnostics) {
   if (!f.seek(0)) return false;
   memset(d, 0, sizeof(*d));
   memset(d->coefficientBits, -1, sizeof(d->coefficientBits));
@@ -1346,7 +1347,7 @@ static bool pjProcessFileForRow(MemoryFile& f, PJDecoder* d, int16_t* rowCoefs,
                       static_cast<unsigned>(f.position()));
           return false;
         }
-        if (targetRow == d->mcuCntY - 1) {
+        if (verboseScanDiagnostics && targetRow == d->mcuCntY - 1) {
           DIAG_PRINTF("[SLS/JPEG] scan=%u Ss=%u Se=%u Ah=%u Al=%u "
                       "components=%u entropyOffset=%u\n",
                       static_cast<unsigned>(d->scanCount),
@@ -1550,7 +1551,8 @@ static bool pjDecodeProgressivePass(MemoryFile& f, PJDecoder* d,
                                     uint8_t* workspace, size_t workspaceSize,
                                     JPEGImageInfo* info,
                                     JPEGRowCallback progressCallback,
-                                    void* progressContext) {
+                                    void* progressContext,
+                                    bool verboseScanDiagnostics) {
   const uint16_t expectedWidth = d->width;
   const uint16_t expectedHeight = d->height;
   const uint8_t expectedComponents = d->nComp;
@@ -1581,7 +1583,8 @@ static bool pjDecodeProgressivePass(MemoryFile& f, PJDecoder* d,
     memset(rowCoefficients, 0, coefficientBytes);
     memset(nonZeroBitmap, 0, bitmapBytes);
     if (!pjProcessFileForRow(f, d, rowCoefficients, row, nonZeroBitmap,
-                             progressCallback, progressContext)) return false;
+                             progressCallback, progressContext,
+                             verboseScanDiagnostics)) return false;
     if (d->width != expectedWidth || d->height != expectedHeight ||
         d->nComp != expectedComponents) return false;
 
@@ -1604,7 +1607,8 @@ static bool JPEGdecodePass(const uint8_t* data, size_t size, TFT_eSPI* tft,
                            uint8_t* workspace, size_t workspaceSize,
                            JPEGImageInfo* callerInfo,
                            JPEGRowCallback rowCallback,
-                           void* rowContext) {
+                           void* rowContext,
+                           bool verboseScanDiagnostics) {
   JPEGImageInfo localInfo;
   JPEGImageInfo& info = callerInfo ? *callerInfo : localInfo;
   const JPEGPreflightResult preflight =
@@ -1671,7 +1675,8 @@ static bool JPEGdecodePass(const uint8_t* data, size_t size, TFT_eSPI* tft,
   const bool result = preflight == JPEGPreflightResult::SupportedProgressive
       ? pjDecodeProgressivePass(f, d, tft, offsetX, offsetY,
                                 workspace, workspaceSize, &info,
-                                rowCallback, rowContext)
+                                rowCallback, rowContext,
+                                verboseScanDiagnostics)
       : pjDecodeBaselinePass(f, d, tft, offsetX, offsetY,
                              workspace, workspaceSize, &info,
                              rowCallback, rowContext);
@@ -1684,10 +1689,11 @@ bool JPEGvalidate(const uint8_t* data, size_t size,
                   uint8_t* workspace, size_t workspaceSize,
                   JPEGImageInfo* info,
                   JPEGRowCallback rowCallback,
-                  void* rowContext) {
+                  void* rowContext,
+                  bool verboseScanDiagnostics) {
   return JPEGdecodePass(data, size, nullptr, displayWidth, displayHeight,
                         workspace, workspaceSize, info,
-                        rowCallback, rowContext);
+                        rowCallback, rowContext, verboseScanDiagnostics);
 }
 
 bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
@@ -1695,8 +1701,9 @@ bool JPEGdecoder(const uint8_t* data, size_t size, TFT_eSPI& tft,
                  uint8_t* workspace, size_t workspaceSize,
                  JPEGImageInfo* info,
                  JPEGRowCallback rowCallback,
-                 void* rowContext) {
+                 void* rowContext,
+                 bool verboseScanDiagnostics) {
   return JPEGdecodePass(data, size, &tft, displayWidth, displayHeight,
                         workspace, workspaceSize, info,
-                        rowCallback, rowContext);
+                        rowCallback, rowContext, verboseScanDiagnostics);
 }

@@ -6,6 +6,7 @@
 
 #include "gui.h"
 #include "ir_remote.h"
+#include "dab_scheduler_policy.h"
 #include <esp_efuse.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
@@ -1245,7 +1246,7 @@ void ShowRT(void) {
       FullLineSprite.setTextDatum(TC_DATUM);
       FullLineSprite.drawString(value, 154, rtTextY);
       FullLineSprite.pushSprite(6, rtStripY);
-    } else if (millis() - rtticker >= 20) {
+    } else if (millis() - rtticker >= 50) {
       --xPos;
       rttickerhold = millis();
 
@@ -1724,9 +1725,9 @@ void ShowVolume(void) {
 }
 
 
-// Signal meters are refreshed at 10 Hz. Keep raw driver values separate from
-// the displayed IIR average; feeding an already averaged CNR back into the
-// filter on every fast loop pass made the two modes drift differently.
+// RF samples and display animation are deliberately separate. The radio-side
+// IIR accepts each driver sample generation once; the UI then approaches that
+// target at 500 ms (DAB) or 250 ms (FM) without re-filtering stale RF input.
 void ShowSignalLevel(void) {
   // ProcessDAB() already calls ShowSignalLevel() while System info is open.
   // Reuse that existing call as the lightweight refresh hook and do not draw
@@ -1736,23 +1737,34 @@ void ShowSignalLevel(void) {
     return;
   }
 
-  if (!displayreset && millis() - rssiTimer < 100UL) return;
-  rssiTimer = millis();
-
+  const bool fm = radio.isFm();
   const int16_t rawSignal = radio.getRSSI();
   const int16_t rawCnr = radio.cnr;
-  if (displayreset) {
-    // A mode/tune redraw must not inherit the previous mode's filter history.
-    SAvg = rawSignal;
-    SAvg2 = rawCnr;
-  } else {
-    SAvg = static_cast<int16_t>((static_cast<int32_t>(SAvg) * 7 +
-                                static_cast<int32_t>(rawSignal) * 3) / 10);
-    SAvg2 = static_cast<int16_t>((static_cast<int32_t>(SAvg2) * 7 +
-                                 static_cast<int32_t>(rawCnr) * 3) / 10);
+  uint8_t rawQuality = radio.fic > 100U ? 100U : radio.fic;
+  if (!fm) {
+    const uint8_t cnrQuality =
+        radio.cnr >= 20U ? 100U : static_cast<uint8_t>(radio.cnr * 5U);
+    if (cnrQuality < rawQuality) rawQuality = cnrQuality;
+    if (!radio.signallock) rawQuality = 0;
   }
+
+  static dab_scheduler::SignalDisplayFilter signalFilter;
+  signalFilter.acceptSample(radio.signalSampleGeneration(), fm, rawSignal,
+                            rawCnr, rawQuality);
+
+  const uint32_t uiInterval = fm
+      ? dab_scheduler::FM_SIGNAL_UI_INTERVAL_MS
+      : dab_scheduler::DAB_SIGNAL_UI_INTERVAL_MS;
+  if (!displayreset && millis() - rssiTimer < uiInterval) return;
+  rssiTimer = millis();
+  signalFilter.stepDisplay(displayreset);
+
+  SAvg = signalFilter.displayedSignal10;
+  SAvg2 = static_cast<int16_t>((signalFilter.displayedCnr10 + 5) / 10);
   SignalLevel = SAvg;
   CNR = static_cast<int8_t>(SAvg2 < 0 ? 0 : (SAvg2 > 127 ? 127 : SAvg2));
+  const uint8_t qualityValue = static_cast<uint8_t>(
+      (signalFilter.displayedQuality10 + 5U) / 10U);
 
   int SignalLevelprint = 0;
   if (unit == 0) SignalLevelprint = SignalLevel;
@@ -1815,35 +1827,6 @@ void ShowSignalLevel(void) {
       CNRold = CNR;
     }
 
-    uint8_t rawQuality = radio.fic > 100U ? 100U : radio.fic;
-    if (!radio.isFm()) {
-      // FIC quality is commonly pinned at 100 whenever all FIBs are error-free,
-      // even while reception margin changes considerably. Q is therefore the
-      // conservative combination of FIC integrity and CNR margin. Preserve
-      // radio.fic itself for serial/API diagnostics.
-      const uint8_t cnrQuality =
-          radio.cnr >= 20U ? 100U : static_cast<uint8_t>(radio.cnr * 5U);
-      if (cnrQuality < rawQuality) rawQuality = cnrQuality;
-      if (!radio.signallock) rawQuality = 0;
-    }
-
-    // Smooth Q/M independently from RSSI/CNR. This also suppresses display
-    // flashes if one RF-quality sample is anomalously full scale.
-    static uint16_t qualityAverage10 = 0;
-    static bool qualityAverageValid = false;
-    static bool qualityWasFm = false;
-    const bool qualityIsFm = radio.isFm();
-    if (displayreset || !qualityAverageValid || qualityWasFm != qualityIsFm) {
-      qualityAverage10 = static_cast<uint16_t>(rawQuality) * 10U;
-      qualityAverageValid = true;
-      qualityWasFm = qualityIsFm;
-    } else {
-      qualityAverage10 = static_cast<uint16_t>(
-          (static_cast<uint32_t>(qualityAverage10) * 7U +
-           static_cast<uint32_t>(rawQuality) * 30U + 5U) / 10U);
-    }
-    const uint8_t qualityValue = static_cast<uint8_t>(
-        (qualityAverage10 + 5U) / 10U);
     if (ficold != qualityValue || displayreset) {
       const int filledWidth = map(qualityValue, 0, 100, 0, 139);
       // Build the final frame in RAM. Drawing the full gradient directly to TFT
@@ -1908,7 +1891,15 @@ void ShowBitrate(void) {
 }
 
 void ShowClock(void) {
-  if (!radio.isFm() && radio.signallock) setTime(radio.Hours, radio.Minutes, radio.Seconds, radio.Days, radio.Months, radio.Year);
+  static uint32_t appliedDabTimeGeneration = 0;
+  const uint32_t timeGeneration = radio.timeSampleGeneration();
+  if (!radio.isFm() && radio.signallock &&
+      dab_scheduler::takeGeneration(timeGeneration,
+                                    appliedDabTimeGeneration)) {
+    setTime(radio.Hours, radio.Minutes, radio.Seconds,
+            radio.Days, radio.Months, radio.Year);
+    appliedDabTimeGeneration = timeGeneration;
+  }
 
   // This function runs in the normal UI loop. Keep the two displayed strings in
   // fixed buffers so checking an unchanged clock/date never allocates on heap.

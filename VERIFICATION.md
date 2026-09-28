@@ -1,4 +1,4 @@
-# Verification status — v2.1.1
+# Verification status — v2.2.1
 
 ## Automated checks performed
 
@@ -6,8 +6,10 @@
   `b671d372a4fe5bb4df493ea6147c215577b25dc2`.
 - Vendor `Si468x.h` raw SHA-256:
   `A894CF940CBD143D9C0917BF68C3F335370AF28FC06E9D074F0EEA91545FBF6E`.
-- Host scheduler policy test: generation rollover/matching, three bounded
-  retries, linear backoff, cancellation reset and `millis()` wraparound.
+- Host scheduler policy test: generation rollover/matching, bounded retries,
+  phased periodic deadlines, continuous-DSRV fairness, FM tune/RDS/RSQ
+  priority, DAB/FM sample/display separation, one-shot time application,
+  debug throttling and `millis()` wraparound.
 - Host JPEG tests with GCC C++11, `-Wall -Wextra -Werror -pedantic`:
   baseline grayscale, YCbCr 4:4:4/4:2:2/4:2:0, a complete 320×240 baseline
   4:2:0 decode, and progressive grayscale/4:4:4/4:2:2/4:2:0 decodes including
@@ -21,8 +23,8 @@
   pixel-identical to the matching baseline fixture. It is not the unavailable
   station object with hash `47083CD0`.
 - PlatformIO release build with `espressif32@6.9.0`: success for `esp32dev`
-  without PSRAM. Reported static usage: 48,696 bytes RAM (14.9%) and
-  3,409,393 bytes flash (82.6%). The persistent 50 KiB MOT buffer and 76,800
+  without PSRAM. Reported static usage: 48,808 bytes RAM (14.9%) and
+  3,413,257 bytes flash (82.7%). The persistent 50 KiB MOT buffer and 76,800
   byte shared decoder arena are allocated at runtime and therefore are not
   included in that static RAM number.
 - Clang is not installed in this environment: **NOT VERIFIED**.
@@ -30,8 +32,8 @@
   **NOT VERIFIED**.
 
 The generated `.pio/build/esp32dev/firmware.bin` is a successful development
-build of 3,410,016 bytes with SHA-256
-`6FAA2FD85991D70B490BFED53FED10E364B42C3FB66C293BC161E43444F81584`.
+build of 3,413,872 bytes with SHA-256
+`D8D230CD860EDA93CFF5EEFDBE62F32F8F6FAD6FB84678D27052694723D5C0BC`.
 It is not copied into `Release/` or represented as a hardware-validated release.
 `Release/firmware_v2_0.bin` remains an unchanged historical image.
 
@@ -55,6 +57,13 @@ It is not copied into `Release/` or represented as a hardware-validated release.
    responsiveness during validation/render.
 6. Repeat FM/RDS, DAB service restore, FM↔DAB switch, presets, light sleep/wake
    and cold boot regression checks.
+7. On DAB with continuous MOT, confirm RF status near 1 Hz, signal/Q UI near
+   2 Hz, no DSRV regression/overflow, and responsive encoders/buttons.
+8. On idle FM, confirm RSQ near 2 Hz, ACF near 1 Hz and signal/multipath UI near
+   4 Hz while seek remains fast and the RDS FIFO remains responsive.
+9. With `DEBUG` enabled, confirm milestone-only MOT logging and usable UI; use
+   `DEBUG SLSV` separately to verify explicit verbose tracing and UART-drop
+   summaries. Confirm that repeated NOT_AVAILABLE replies are aggregated.
 
 ## Expected diagnostic sequence examples
 

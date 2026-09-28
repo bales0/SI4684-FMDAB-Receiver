@@ -30,7 +30,6 @@ bool once = false;
 
 static uint32_t slideshowFirstSegmentMs = 0;
 
-unsigned long DataUpdate = 0;       // millis() of last EnsembleInfo/ServiceInfo refresh (500 ms throttle)
 bool EnsembleInfoSet;
 // FM PTY value 0 is a valid RDS value ("Unknown"), so validity must be
 // tracked separately from fmPty itself. Cleared on every tune/seek and set
@@ -127,7 +126,6 @@ static constexpr uint32_t RADIO_INTB_CTS_SAFETY_US = 2000UL;
 static constexpr uint32_t RADIO_FM_DIAG_INTERVAL_MS = 30000UL;
 static constexpr uint32_t RADIO_DAB_DIAG_INTERVAL_MS = 30000UL;
 static constexpr uint32_t RADIO_DAB_TUNE_TIMEOUT_MS = 5000UL;
-static constexpr uint8_t RADIO_DAB_MAX_DSRV_BURST = 4U;
 static constexpr uint32_t RADIO_DAB_SERVICE_SETTLE_MS = 200UL;
 static constexpr uint8_t RADIO_DAB_STALL_TIMEOUT_COUNT = 16U;
 static constexpr uint8_t RADIO_DAB_MAX_DATA_SERVICE_RETRIES = 3U;
@@ -620,6 +618,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   resetSlideshowCollector();
   dabRssi10 = 0;
   dabSignalTimer = 0;
+  SlideShowVerbose = false;
   dabCommand = DabCommand::None;
   dabCommandRequestId = 0;
   dabGeneration = dab_scheduler::nextGeneration(dabGeneration);
@@ -646,6 +645,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   dabCurrentSubchannelRefreshPending = false;
   dabCurrentServiceRefreshPending = false;
   dabServiceTypeScanIndex = 0;
+  resetDabPeriodicDeadlines(millis());
   dabDataServicePending = false;
   dabDataServiceId = 0;
   dabDataComponentId = 0;
@@ -1294,10 +1294,52 @@ void DAB::onHardwareResetComplete(void) {
                 static_cast<unsigned>(dabGeneration));
 }
 
-// Queue a cooperative DAB metadata refresh. The scheduler starts the actual
-// commands one by one after the generic transport becomes idle.
+void DAB::resetDabPeriodicDeadlines(uint32_t now) {
+  dabSignalNextDueMs = now + dab_scheduler::DAB_SIGNAL_INTERVAL_MS;
+  dabEnsembleNextDueMs = now + dab_scheduler::DAB_ENSEMBLE_INITIAL_PHASE_MS;
+  dabTimeNextDueMs = now + dab_scheduler::DAB_TIME_INITIAL_PHASE_MS;
+  resetDabServiceDeadlines(now);
+  dabLastLowPriorityCommandMs = now - dab_scheduler::DAB_LOW_PRIORITY_GAP_MS;
+}
+
+void DAB::resetDabServiceDeadlines(uint32_t now) {
+  dabAudioNextDueMs = now + dab_scheduler::DAB_AUDIO_INITIAL_PHASE_MS;
+  dabCurrentServiceNextDueMs = now + dab_scheduler::DAB_SERVICE_INITIAL_PHASE_MS;
+  dabCurrentSubchannelNextDueMs =
+      now + dab_scheduler::DAB_SUBCHANNEL_INITIAL_PHASE_MS;
+}
+
+void DAB::updateDabPeriodicRequests(uint32_t now) {
+  if (dab_scheduler::takePeriodicDeadline(
+          now, dabSignalNextDueMs,
+          dab_scheduler::DAB_SIGNAL_INTERVAL_MS))
+    dabSignalRefreshPending = true;
+  if (signallock && dab_scheduler::takePeriodicDeadline(
+                        now, dabEnsembleNextDueMs,
+                        dab_scheduler::DAB_ENSEMBLE_INTERVAL_MS))
+    dabEnsembleRefreshPending = true;
+  if (signallock && dab_scheduler::takePeriodicDeadline(
+                        now, dabTimeNextDueMs,
+                        dab_scheduler::DAB_TIME_INTERVAL_MS))
+    dabTimeRefreshPending = true;
+  if (dabActiveServiceValid && dab_scheduler::takePeriodicDeadline(
+                                   now, dabAudioNextDueMs,
+                                   dab_scheduler::DAB_AUDIO_INTERVAL_MS))
+    dabAudioRefreshPending = true;
+  if (dabActiveServiceValid && dab_scheduler::takePeriodicDeadline(
+                                   now, dabCurrentServiceNextDueMs,
+                                   dab_scheduler::DAB_SERVICE_INTERVAL_MS))
+    dabCurrentServiceRefreshPending = true;
+  if (dabActiveServiceValid && dab_scheduler::takePeriodicDeadline(
+                                   now, dabCurrentSubchannelNextDueMs,
+                                   dab_scheduler::DAB_SUBCHANNEL_INTERVAL_MS))
+    dabCurrentSubchannelRefreshPending = true;
+}
+
+// Queue a cooperative ensemble refresh. The scheduler starts the actual
+// command after higher-priority transport and RF work.
 void DAB::EnsembleInfo(void) {
-  dabSignalRefreshPending = true;
+  dabEnsembleRefreshPending = true;
 }
 
 void DAB::parseDabServiceListReply(uint16_t replyLength) {
@@ -1394,6 +1436,20 @@ void DAB::parseDabServiceListReply(uint16_t replyLength) {
 // Called on every Update() while the receiver has signal lock.
 void DAB::getServiceData(void) {
   uint32_t byte_count = 0;
+  static dab_scheduler::RepeatedEventThrottle repeatedCompletedMotLog;
+  const auto logRepeatedCompletedMot = [this](uint16_t transportId) {
+    if (!SlideShowDebug || Serial.availableForWrite() < 80) return;
+    uint16_t suppressed = 0;
+    if (!dab_scheduler::shouldLogRepeatedEvent(
+            repeatedCompletedMotLog, transportId, millis(), SlideShowVerbose,
+            5000U, suppressed))
+      return;
+    if (suppressed != 0U)
+      DIAG_PRINTF("[SLS] Ignore repeated completed TID=%u suppressed=%u\n",
+                  transportId, static_cast<unsigned>(suppressed));
+    else
+      DIAG_PRINTF("[SLS] Ignore repeated completed TID=%u\n", transportId);
+  };
 
   // finishDabCommand() has already fetched and parsed the fixed 24-byte DSRV
   // header into SPIbuffer[1..24]. Re-read the preserved reply at full length
@@ -1459,9 +1515,7 @@ void DAB::getServiceData(void) {
                             transportID, newLength);
           } else if (lastCompletedTransportIdValid &&
                      transportID == lastCompletedTransportId) {
-            if (SlideShowDebug)
-              DIAG_PRINTF("[SLS] Ignore repeated completed header TID=%u\n",
-                            transportID);
+            logRepeatedCompletedMot(transportID);
           } else if (slideshowPublishedPending || SlideShowUpdate) {
             // The only image-sized buffer is still owned by the UI. DSRV is
             // deliberately drained, but no new object may claim the buffer.
@@ -1526,9 +1580,7 @@ void DAB::getServiceData(void) {
 
           if (lastCompletedTransportIdValid &&
               transportID == lastCompletedTransportId) {
-            if (SlideShowDebug && segmentNumber == 0U)
-              DIAG_PRINTF("[SLS] Ignore repeated completed TID=%u\n",
-                            transportID);
+            if (segmentNumber == 0U) logRepeatedCompletedMot(transportID);
           } else if (slideshowPublishedPending || SlideShowUpdate) {
             // Preserve the complete image until acknowledgeSlideshow().
             if (SlideShowDebug && segmentNumber == 0U)
@@ -1606,11 +1658,27 @@ void DAB::getServiceData(void) {
 
                     SlideShowInit = true;
                     SlideShowLastActivity = millis();
-                    if (SlideShowDebug)
-                      DIAG_PRINTF("[SLS] Saved TID=%u seg=%u len=%u bytes=%u/%u%s\n",
-                                    transportID, segmentNumber, dataLen,
-                                    SlideShowByteCounter, SlideShowLength,
-                                    lastSegment ? " LAST" : "");
+                    static uint32_t lastSegmentLogMs = 0;
+                    static uint16_t droppedSegmentLogs = 0;
+                    const uint32_t segmentLogNow = millis();
+                    if (SlideShowDebug &&
+                        dab_scheduler::shouldLogMotSegment(
+                            SlideShowVerbose, segmentNumber, lastSegment,
+                            segmentLogNow, lastSegmentLogMs)) {
+                      if (Serial.availableForWrite() >= 96) {
+                        if (droppedSegmentLogs != 0U) {
+                          DIAG_PRINTF("[SLS] UART suppressed=%u segment logs\n",
+                                      static_cast<unsigned>(droppedSegmentLogs));
+                          droppedSegmentLogs = 0;
+                        }
+                        DIAG_PRINTF("[SLS] Saved TID=%u seg=%u len=%u bytes=%u/%u%s\n",
+                                      transportID, segmentNumber, dataLen,
+                                      SlideShowByteCounter, SlideShowLength,
+                                      lastSegment ? " LAST" : "");
+                      } else if (droppedSegmentLogs != 0xFFFFU) {
+                        ++droppedSegmentLogs;
+                      }
+                    }
 
                     if (SlideShowLength != 0U &&
                         SlideShowByteCounter > SlideShowLength) {
@@ -1834,7 +1902,6 @@ void DAB::clearData(void) {
 // no multi-second polling loop here.
 void DAB::setFreq(uint8_t freq) {
   if (isFm()) return;
-  DataUpdate -= 1000;
   numberofservices = 0;
   clearData();
 
@@ -1894,7 +1961,7 @@ void DAB::setFreq(uint8_t freq) {
   dabDeviceEventPending = false;
   if (!dabActiveDataServiceValid) dataServiceCheck = 0;
   tunePending = true;
-  DataUpdate = millis() - 500U;
+  resetDabPeriodicDeadlines(millis());
   if (diagnosticDebug)
     DIAG_PRINTF("[DAB/ASYNC] queued tune index=%u request=%u\n",
                   freq, static_cast<unsigned>(dabTuneRequestId));
@@ -2169,8 +2236,20 @@ void DAB::updateFm(void) {
 
   const bool stc = (lastStatus0 & si468x::INTERRUPT_STC) != 0;
   const bool timedOut = tunePending && static_cast<int32_t>(now - tuneDeadline) >= 0;
-  if ((tunePending && (stc || now - fmRsqTimer >= 100U)) ||
-      (!tunePending && now - fmRsqTimer >= 250U)) {
+  const bool tuneRsqDue = tunePending && (stc || now - fmRsqTimer >= 100U);
+  const bool idleRsqDue = !tunePending &&
+      now - fmRsqTimer >= dab_scheduler::FM_RSQ_INTERVAL_MS;
+  const bool rdsDue = !tunePending &&
+      (lastStatus0 & si468x::INTERRUPT_RDS ||
+       now - fmRdsTimer >= dab_scheduler::FM_RDS_POLL_INTERVAL_MS);
+  const bool acfDue = !tunePending &&
+      now - fmAcfTimer >= dab_scheduler::FM_ACF_INTERVAL_MS;
+  const dab_scheduler::FmWork work = dab_scheduler::chooseFmWork(
+      tunePending, tuneRsqDue, rdsDue, idleRsqDue, acfDue);
+
+  // Tune/seek status stays on the fast 100 ms path. In idle mode RDS retains
+  // priority over periodic metrics so its FIFO is not slowed to UI cadence.
+  if (work == dab_scheduler::FmWork::TuneRsq) {
     si468x::FmRsqStatus rsq;
     ++diagFmRsqStatusCount;
     const si468x::Result rsqResult =
@@ -2201,6 +2280,7 @@ void DAB::updateFm(void) {
       fmValid = rsq.valid;
       fmAfcRail = rsq.afcRail;
       signallock = rsq.valid;
+      rfSampleGeneration = dab_scheduler::nextGeneration(rfSampleGeneration);
       if (stc || timedOut) {
         tunePending = false;
         seekPending = false;
@@ -2210,7 +2290,42 @@ void DAB::updateFm(void) {
     fmRsqTimer = now;
   }
 
-  if (!tunePending && now - fmAcfTimer >= 500U) {
+  if (work == dab_scheduler::FmWork::Rds) {
+    processFmRds();
+    lastStatus0 &= static_cast<uint8_t>(~si468x::INTERRUPT_RDS);
+    fmRdsTimer = now;
+  }
+
+  if (work == dab_scheduler::FmWork::IdleRsq) {
+    si468x::FmRsqStatus rsq;
+    ++diagFmRsqStatusCount;
+    const si468x::Result rsqResult =
+        chip.fmRsqStatus(rsq, true, false, false, false, 100000UL);
+    finishCommandDiagnostics(rsqResult);
+    if (rsqResult == si468x::Result::Ok) {
+      if (isFmFrequencyValid(rsq.frequency10kHz, activeFmRegion))
+        fmFrequency10kHz = rsq.frequency10kHz;
+      if (rsq.valid) {
+        fmRssi = rsq.rssi;
+        fmSnr = rsq.snr;
+        const uint8_t rawMultipath = rsq.multipath > 100U ? 100U : rsq.multipath;
+        if (!fmValid)
+          fmMultipath = rawMultipath;
+        else
+          fmMultipath = static_cast<uint8_t>(
+              (static_cast<uint16_t>(fmMultipath) * 3U + rawMultipath + 2U) / 4U);
+        cnr = rsq.snr < 0 ? 0 : static_cast<uint8_t>(rsq.snr);
+        fic = fmMultipath;
+      }
+      fmValid = rsq.valid;
+      fmAfcRail = rsq.afcRail;
+      signallock = rsq.valid;
+      rfSampleGeneration = dab_scheduler::nextGeneration(rfSampleGeneration);
+    }
+    fmRsqTimer = now;
+  }
+
+  if (work == dab_scheduler::FmWork::Acf) {
     si468x::FmAcfStatus acf;
     const si468x::Result acfResult = chip.fmAcfStatus(acf, true, 100000UL);
     finishCommandDiagnostics(acfResult);
@@ -2220,12 +2335,6 @@ void DAB::updateFm(void) {
       audiomode = acf.pilot ? 2 : 1;
     }
     fmAcfTimer = now;
-  }
-
-  if (!tunePending && (lastStatus0 & si468x::INTERRUPT_RDS || now - fmRdsTimer >= 80U)) {
-    processFmRds();
-    lastStatus0 &= static_cast<uint8_t>(~si468x::INTERRUPT_RDS);
-    fmRdsTimer = now;
   }
 
   if (reportDiagnostics) {
@@ -2367,13 +2476,31 @@ void DAB::finishDabCommand(void) {
     // the newly started service has published it. Keep it observable without
     // flooding UART; all other command failures are reported immediately.
     static uint32_t lastNotAvailableLogMs = 0;
+    static uint16_t suppressedNotAvailable = 0;
+    static uint8_t lastNotAvailableOperation = 0xFFU;
     const uint32_t errorNow = millis();
-    if (deviceReason != 0x03U || lastNotAvailableLogMs == 0U ||
-        static_cast<uint32_t>(errorNow - lastNotAvailableLogMs) >= 30000UL) {
+    const uint8_t completedOperation = static_cast<uint8_t>(completed);
+    const bool newNotAvailableGroup =
+        lastNotAvailableOperation != completedOperation;
+    const bool printNotAvailable = deviceReason == 0x03U &&
+        (newNotAvailableGroup || lastNotAvailableLogMs == 0U ||
+         static_cast<uint32_t>(errorNow - lastNotAvailableLogMs) >= 5000UL);
+    if (deviceReason != 0x03U || printNotAvailable) {
+      if (suppressedNotAvailable != 0U) {
+        DIAG_PRINTF("[DAB/ASYNC] NOT_AVAILABLE op=%u suppressed=%u\n",
+                      static_cast<unsigned>(lastNotAvailableOperation),
+                      static_cast<unsigned>(suppressedNotAvailable));
+        suppressedNotAvailable = 0;
+      }
       DIAG_PRINTF("[DAB/ASYNC] command failed op=%u result=%d reason=0x%02X\n",
                     static_cast<unsigned>(completed), static_cast<int>(result),
                     static_cast<unsigned>(deviceReason));
-      if (deviceReason == 0x03U) lastNotAvailableLogMs = errorNow;
+      if (deviceReason == 0x03U) {
+        lastNotAvailableLogMs = errorNow;
+        lastNotAvailableOperation = completedOperation;
+      }
+    } else if (suppressedNotAvailable != 0xFFFFU) {
+      ++suppressedNotAvailable;
     }
     if (completed == DabCommand::StopDataService ||
         completed == DabCommand::StopService) {
@@ -2471,6 +2598,7 @@ void DAB::finishDabCommand(void) {
       fic = status.ficQuality > 100U ? 100U : status.ficQuality;
       cnr = status.cnr;
       signallock = status.valid && status.acquired;
+      rfSampleGeneration = dab_scheduler::nextGeneration(rfSampleGeneration);
 
       if (completed == DabCommand::TuneStatus &&
           dabCommandRequestId == dabTuneRequestId) {
@@ -2480,15 +2608,21 @@ void DAB::finishDabCommand(void) {
           dabServiceListRefreshPending = true;
           dabEnsembleRefreshPending = true;
           dabTimeRefreshPending = true;
+          resetDabPeriodicDeadlines(millis());
         }
         DIAG_PRINTF("[DAB/ASYNC] tune complete request=%u lock=%u index=%u\n",
                       static_cast<unsigned>(dabCommandRequestId), signallock,
                       status.tuneIndex);
-      } else if (completed == DabCommand::SignalStatus && signallock) {
-        if (!wasLocked) dabServiceListRefreshPending = true;
-        dabEnsembleRefreshPending = true;
-        dabTimeRefreshPending = true;
-        ServiceInfo();
+      } else if (completed == DabCommand::SignalStatus &&
+                 signallock != wasLocked) {
+        // SignalStatus only updates RF state. Metadata is event/period driven;
+        // a lock transition is the one allowed trigger for immediate refresh.
+        if (signallock) {
+          dabServiceListRefreshPending = true;
+          dabEnsembleRefreshPending = true;
+          dabTimeRefreshPending = true;
+          resetDabPeriodicDeadlines(millis());
+        }
       }
       break;
     }
@@ -2518,8 +2652,10 @@ void DAB::finishDabCommand(void) {
       }
       dabDeviceEventPending = false;
       if (event.reconfiguration || event.serviceListInterrupt ||
-          event.serviceListAvailable)
+          event.serviceListAvailable) {
         dabServiceListRefreshPending = true;
+        dabEnsembleRefreshPending = true;
+      }
       break;
     }
 
@@ -2593,6 +2729,7 @@ void DAB::finishDabCommand(void) {
       Hours = time.hour;
       Minutes = time.minute;
       Seconds = time.second;
+      dabTimeGeneration = dab_scheduler::nextGeneration(dabTimeGeneration);
       break;
     }
 
@@ -2698,6 +2835,7 @@ void DAB::finishDabCommand(void) {
         dabServiceRequestPending = false;
         ServiceStart = true;
         ServiceInfo();
+        resetDabServiceDeadlines(millis());
         queueDabDataService();
       }
       break;
@@ -2803,18 +2941,6 @@ void DAB::scheduleNextDabCommand(void) {
     return;
   }
 
-  if (dabDsrvPending && dabDsrvBurstCount < RADIO_DAB_MAX_DSRV_BURST) {
-    const uint8_t args[1] = {0x01};
-    if (startDabCommand(DabCommand::DsrvHeader,
-                        static_cast<uint8_t>(si468x::Command::GET_DIGITAL_SERVICE_DATA),
-                        args, sizeof(args), 24)) {
-      ++dabDsrvBurstCount;
-      dabDsrvPending = false;
-    }
-    return;
-  }
-  if (dabDsrvBurstCount >= RADIO_DAB_MAX_DSRV_BURST) dabDsrvBurstCount = 0;
-
   if (dabWaitingForStc &&
       (dabStcPending || static_cast<int32_t>(millis() - dabTuneDeadlineMs) >= 0)) {
     if (!dabStcPending) DIAG_PRINTLN("[DAB/ASYNC] STC timeout; reading final status");
@@ -2827,38 +2953,10 @@ void DAB::scheduleNextDabCommand(void) {
     return;
   }
 
-  if (dabDeviceEventPending) {
-    const uint8_t args[1] = {0x01};
-    if (startDabCommand(DabCommand::EventStatus,
-                        static_cast<uint8_t>(si468x::Command::DAB_GET_EVENT_STATUS),
-                        args, sizeof(args), 8))
-      dabDeviceEventPending = false;
-    return;
-  }
-
-  if (dabServiceListRefreshPending && signallock) {
-    if (startDabCommand(DabCommand::ServiceListHeader,
-                        static_cast<uint8_t>(si468x::Command::GET_DIGITAL_SERVICE_LIST),
-                        &zero, 1, 8))
-      dabServiceListRefreshPending = false;
-    return;
-  }
-
-  if (dabServiceTypeScanIndex < numberofservices) {
-    const uint8_t index = dabServiceTypeScanIndex;
-    uint8_t args[11] = {0};
-    si468x::writeLe32(args + 3, service[index].ServiceID);
-    si468x::writeLe32(args + 7, service[index].CompID);
-    dabCommandRequestId = index;
-    startDabCommand(DabCommand::ServiceType,
-                    static_cast<uint8_t>(si468x::Command::DAB_GET_SUBCHAN_INFO),
-                    args, sizeof(args), 12);
-    return;
-  }
-
-  if (dabDataServicePending) {
-    if (!dab_scheduler::retryReady(millis(), dabDataServiceRetryNotBeforeMs))
-      return;
+  // START/STOP/tune work outranks all background traffic. A retry backoff does
+  // not reserve the bus: DSRV and RF status may continue until it expires.
+  if (dabDataServicePending &&
+      dab_scheduler::retryReady(millis(), dabDataServiceRetryNotBeforeMs)) {
     uint8_t args[11] = {0};
     si468x::writeLe32(args + 3, dabDataServiceId);
     si468x::writeLe32(args + 7, dabDataComponentId);
@@ -2870,28 +2968,101 @@ void DAB::scheduleNextDabCommand(void) {
     return;
   }
 
-  if (dabSignalRefreshPending) {
+  const uint32_t now = millis();
+  const bool lowPriorityReady =
+      static_cast<uint32_t>(now - dabLastLowPriorityCommandMs) >=
+      dab_scheduler::DAB_LOW_PRIORITY_GAP_MS;
+  const bool lowPriorityPending = lowPriorityReady &&
+      (dabDeviceEventPending ||
+       (dabServiceListRefreshPending && signallock) ||
+       dabServiceTypeScanIndex < numberofservices ||
+       (dabEnsembleRefreshPending && signallock) ||
+       (dabTimeRefreshPending && signallock) ||
+       (dabAudioRefreshPending && dabActiveServiceValid) ||
+       (dabCurrentServiceRefreshPending && dabActiveServiceValid) ||
+       (dabCurrentSubchannelRefreshPending && dabActiveServiceValid));
+  const dab_scheduler::BackgroundWork work =
+      dab_scheduler::chooseBackgroundWork(
+          dabDsrvPending, dabDsrvBurstCount, dabSignalRefreshPending,
+          lowPriorityPending);
+
+  if (work == dab_scheduler::BackgroundWork::Dsrv) {
+    if (dabDsrvBurstCount >= dab_scheduler::DAB_MAX_DSRV_BURST)
+      dabDsrvBurstCount = 0;
+    const uint8_t args[1] = {0x01};
+    if (startDabCommand(DabCommand::DsrvHeader,
+                        static_cast<uint8_t>(si468x::Command::GET_DIGITAL_SERVICE_DATA),
+                        args, sizeof(args), 24)) {
+      ++dabDsrvBurstCount;
+      dabDsrvPending = false;
+    }
+    return;
+  }
+
+  if (work == dab_scheduler::BackgroundWork::Signal) {
     const uint8_t args[1] = {0x08};
     if (startDabCommand(DabCommand::SignalStatus,
                         static_cast<uint8_t>(si468x::Command::DAB_DIGRAD_STATUS),
                         args, sizeof(args), 23))
       dabSignalRefreshPending = false;
+    dabDsrvBurstCount = 0;
+    return;
+  }
+
+  if (work != dab_scheduler::BackgroundWork::LowPriority) return;
+  dabDsrvBurstCount = 0;
+
+  if (dabDeviceEventPending) {
+    const uint8_t args[1] = {0x01};
+    if (startDabCommand(DabCommand::EventStatus,
+                        static_cast<uint8_t>(si468x::Command::DAB_GET_EVENT_STATUS),
+                        args, sizeof(args), 8)) {
+      dabDeviceEventPending = false;
+      dabLastLowPriorityCommandMs = now;
+    }
+    return;
+  }
+
+  if (dabServiceListRefreshPending && signallock) {
+    if (startDabCommand(DabCommand::ServiceListHeader,
+                        static_cast<uint8_t>(si468x::Command::GET_DIGITAL_SERVICE_LIST),
+                        &zero, 1, 8)) {
+      dabServiceListRefreshPending = false;
+      dabLastLowPriorityCommandMs = now;
+    }
+    return;
+  }
+
+  if (dabServiceTypeScanIndex < numberofservices) {
+    const uint8_t index = dabServiceTypeScanIndex;
+    uint8_t args[11] = {0};
+    si468x::writeLe32(args + 3, service[index].ServiceID);
+    si468x::writeLe32(args + 7, service[index].CompID);
+    dabCommandRequestId = index;
+    if (startDabCommand(DabCommand::ServiceType,
+                        static_cast<uint8_t>(si468x::Command::DAB_GET_SUBCHAN_INFO),
+                        args, sizeof(args), 12))
+      dabLastLowPriorityCommandMs = now;
     return;
   }
 
   if (dabEnsembleRefreshPending && signallock) {
     if (startDabCommand(DabCommand::EnsembleInfo,
                         static_cast<uint8_t>(si468x::Command::DAB_GET_ENSEMBLE_INFO),
-                        &zero, 1, 26))
+                        &zero, 1, 26)) {
       dabEnsembleRefreshPending = false;
+      dabLastLowPriorityCommandMs = now;
+    }
     return;
   }
 
   if (dabTimeRefreshPending && signallock) {
     if (startDabCommand(DabCommand::Time,
                         static_cast<uint8_t>(si468x::Command::DAB_GET_TIME),
-                        &zero, 1, 11))
+                        &zero, 1, 11)) {
       dabTimeRefreshPending = false;
+      dabLastLowPriorityCommandMs = now;
+    }
     return;
   }
 
@@ -2900,8 +3071,24 @@ void DAB::scheduleNextDabCommand(void) {
     dabCommandComponentId = dabActiveComponentId;
     if (startDabCommand(DabCommand::AudioInfo,
                         static_cast<uint8_t>(si468x::Command::DAB_GET_AUDIO_INFO),
-                        &zero, 1, 10))
+                        &zero, 1, 10)) {
       dabAudioRefreshPending = false;
+      dabLastLowPriorityCommandMs = now;
+    }
+    return;
+  }
+
+  if (dabCurrentServiceRefreshPending && dabActiveServiceValid) {
+    uint8_t args[7] = {0};
+    si468x::writeLe32(args + 3, dabActiveServiceId);
+    dabCommandServiceId = dabActiveServiceId;
+    dabCommandComponentId = dabActiveComponentId;
+    if (startDabCommand(DabCommand::CurrentServiceInfo,
+                        static_cast<uint8_t>(si468x::Command::DAB_GET_SERVICE_INFO),
+                        args, sizeof(args), 26)) {
+      dabCurrentServiceRefreshPending = false;
+      dabLastLowPriorityCommandMs = now;
+    }
     return;
   }
 
@@ -2913,33 +3100,11 @@ void DAB::scheduleNextDabCommand(void) {
     dabCommandComponentId = dabActiveComponentId;
     if (startDabCommand(DabCommand::CurrentSubchannelInfo,
                         static_cast<uint8_t>(si468x::Command::DAB_GET_SUBCHAN_INFO),
-                        args, sizeof(args), 12))
+                        args, sizeof(args), 12)) {
       dabCurrentSubchannelRefreshPending = false;
-    return;
-  }
-
-  if (dabCurrentServiceRefreshPending && dabActiveServiceValid) {
-    uint8_t args[7] = {0};
-    si468x::writeLe32(args + 3, dabActiveServiceId);
-    dabCommandServiceId = dabActiveServiceId;
-    dabCommandComponentId = dabActiveComponentId;
-    if (startDabCommand(DabCommand::CurrentServiceInfo,
-                        static_cast<uint8_t>(si468x::Command::DAB_GET_SERVICE_INFO),
-                        args, sizeof(args), 26))
-      dabCurrentServiceRefreshPending = false;
-    return;
-  }
-
-  // If DSRV consumed its fairness budget but no control/metadata operation was
-  // ready, resume draining immediately.
-  if (dabDsrvPending) {
-    const uint8_t args[1] = {0x01};
-    if (startDabCommand(DabCommand::DsrvHeader,
-                        static_cast<uint8_t>(si468x::Command::GET_DIGITAL_SERVICE_DATA),
-                        args, sizeof(args), 24)) {
-      ++dabDsrvBurstCount;
-      dabDsrvPending = false;
+      dabLastLowPriorityCommandMs = now;
     }
+    return;
   }
 }
 
@@ -2989,10 +3154,7 @@ void DAB::Update(bool allowNewWork) {
                   static_cast<int>(serviceResult));
   if (dabCommand != DabCommand::None && !chip.busy()) finishDabCommand();
 
-  if (allowNewWork && now - DataUpdate >= 500U) {
-    dabSignalRefreshPending = true;
-    DataUpdate = now;
-  }
+  if (allowNewWork) updateDabPeriodicRequests(now);
 
   if (chip.busy()) {
     ++diagDabBusySkipCount;

@@ -180,7 +180,8 @@ bool ShowSlideShow(void) {
     if (!JPEGvalidate(image, fileSize, SLS_PROFILE_MAX_WIDTH,
                       SLS_PROFILE_MAX_HEIGHT, decoderWorkspace,
                       SLS_DECODER_WORKSPACE_BYTES, &info,
-                      pumpRadioDuringImageDecode, nullptr)) {
+                      pumpRadioDuringImageDecode, nullptr,
+                      radio.SlideShowVerbose)) {
       DIAG_PRINTF("[SLS/JPEG] validation=FAIL tid=%u size=%u hash=%08X lastMCURow=%d\n",
                     static_cast<unsigned>(radio.slideshowTransportId()),
                     static_cast<unsigned>(fileSize),
