@@ -2,7 +2,7 @@
 // GPIO12 is initialized here only when Settings -> GPIO12 is explicitly IR.
 // AUTO never tries to autodetect an IR receiver.
 
-#include <EEPROM.h>
+#include "nvs_storage.h"
 #include <cstring>
 #include "ir_remote.h"
 #include "ir_decode.h"
@@ -255,25 +255,25 @@ bool IrRemotePrepare(void) {
 }
 
 static uint16_t read16(int offset) {
-  return static_cast<uint16_t>(EEPROM.readByte(offset)) |
-         (static_cast<uint16_t>(EEPROM.readByte(offset + 1)) << 8);
+  return static_cast<uint16_t>(Storage.readByte(offset)) |
+         (static_cast<uint16_t>(Storage.readByte(offset + 1)) << 8);
 }
 
 static uint64_t read64(int offset) {
   uint64_t value = 0;
   for (uint8_t i = 0; i < 8; ++i)
-    value |= static_cast<uint64_t>(EEPROM.readByte(offset + i)) << (8U * i);
+    value |= static_cast<uint64_t>(Storage.readByte(offset + i)) << (8U * i);
   return value;
 }
 
 static void write16(int offset, uint16_t value) {
-  EEPROM.writeByte(offset, static_cast<uint8_t>(value));
-  EEPROM.writeByte(offset + 1, static_cast<uint8_t>(value >> 8));
+  Storage.writeByte(offset, static_cast<uint8_t>(value));
+  Storage.writeByte(offset + 1, static_cast<uint8_t>(value >> 8));
 }
 
 static void write64(int offset, uint64_t value) {
   for (uint8_t i = 0; i < 8; ++i)
-    EEPROM.writeByte(offset + i, static_cast<uint8_t>(value >> (8U * i)));
+    Storage.writeByte(offset + i, static_cast<uint8_t>(value >> (8U * i)));
 }
 
 static uint16_t crc16Update(uint16_t crc, uint8_t data) {
@@ -287,7 +287,7 @@ static uint16_t crc16Update(uint16_t crc, uint8_t data) {
 static uint16_t storedProfileCrc(void) {
   uint16_t crc = 0xFFFFU;
   for (int i = 0; i < EE_IR_CONFIG_SIZE - 2; ++i)
-    crc = crc16Update(crc, EEPROM.readByte(EE_IR_CONFIG_START + i));
+    crc = crc16Update(crc, Storage.readByte(EE_IR_CONFIG_START + i));
   return crc;
 }
 
@@ -296,9 +296,9 @@ static uint16_t storedProfileCrc(void) {
 // INTB without introducing a late runtime allocation.
 static bool storedProfileValid(void) {
   for (uint8_t i = 0; i < 4; ++i)
-    if (EEPROM.readByte(EE_IR_CONFIG_START + i) != kMagic[i]) return false;
-  if (EEPROM.readByte(EE_IR_CONFIG_START + 4) != IR_PROFILE_VERSION) return false;
-  if (EEPROM.readByte(EE_IR_CONFIG_START + 5) != EE_IR_KEY_COUNT) return false;
+    if (Storage.readByte(EE_IR_CONFIG_START + i) != kMagic[i]) return false;
+  if (Storage.readByte(EE_IR_CONFIG_START + 4) != IR_PROFILE_VERSION) return false;
+  if (Storage.readByte(EE_IR_CONFIG_START + 5) != EE_IR_KEY_COUNT) return false;
   return storedProfileCrc() ==
          read16(EE_IR_CONFIG_START + EE_IR_CONFIG_SIZE - 2);
 }
@@ -321,13 +321,13 @@ static void loadProfile(void) {
   if (!IrRemotePrepare()) return;
   profileLoaded = true;
   if (!storedProfileValid()) {
-    DIAG_PRINTLN("[IR] EEPROM profile empty or invalid");
+    DIAG_PRINTLN("[IR] NVS profile empty or invalid");
     return;
   }
 
   int p = EE_IR_CONFIG_START + 6;
   for (uint8_t i = 0; i < EE_IR_KEY_COUNT; ++i) {
-    learned[i].protocol = EEPROM.readByte(p++);
+    learned[i].protocol = Storage.readByte(p++);
     learned[i].address = read16(p); p += 2;
     learned[i].command = read16(p); p += 2;
     learned[i].extra = read16(p); p += 2;
@@ -341,17 +341,17 @@ static void loadProfile(void) {
 static void saveProfile(const LearnedCode* codes) {
   if (!IrRemotePrepare()) return;
   if (profileValid && profilesEqual(codes, learned)) {
-    DIAG_PRINTLN("[IR] learned profile unchanged; EEPROM not written");
+    DIAG_PRINTLN("[IR] learned profile unchanged; NVS not written");
     return;
   }
 
   int p = EE_IR_CONFIG_START;
-  for (uint8_t i = 0; i < 4; ++i) EEPROM.writeByte(p++, kMagic[i]);
-  EEPROM.writeByte(p++, IR_PROFILE_VERSION);
-  EEPROM.writeByte(p++, EE_IR_KEY_COUNT);
+  for (uint8_t i = 0; i < 4; ++i) Storage.writeByte(p++, kMagic[i]);
+  Storage.writeByte(p++, IR_PROFILE_VERSION);
+  Storage.writeByte(p++, EE_IR_KEY_COUNT);
 
   for (uint8_t i = 0; i < EE_IR_KEY_COUNT; ++i) {
-    EEPROM.writeByte(p++, codes[i].protocol);
+    Storage.writeByte(p++, codes[i].protocol);
     write16(p, codes[i].address); p += 2;
     write16(p, codes[i].command); p += 2;
     write16(p, codes[i].extra); p += 2;
@@ -361,11 +361,11 @@ static void saveProfile(const LearnedCode* codes) {
 
   // Two bytes at the end are CRC; bytes between records and CRC are reserved.
   while (p < EE_IR_CONFIG_START + EE_IR_CONFIG_SIZE - 2)
-    EEPROM.writeByte(p++, 0);
+    Storage.writeByte(p++, 0);
 
   uint16_t crc = 0xFFFFU;
   for (int i = 0; i < EE_IR_CONFIG_SIZE - 2; ++i)
-    crc = crc16Update(crc, EEPROM.readByte(EE_IR_CONFIG_START + i));
+    crc = crc16Update(crc, Storage.readByte(EE_IR_CONFIG_START + i));
   write16(EE_IR_CONFIG_START + EE_IR_CONFIG_SIZE - 2, crc);
 
   memcpy(learned, codes, IR_CODE_TABLE_BYTES);
@@ -383,7 +383,7 @@ static void clearProfile(void) {
     return;
   }
   for (int i = 0; i < EE_IR_CONFIG_SIZE; ++i)
-    EEPROM.writeByte(EE_IR_CONFIG_START + i, 0);
+    Storage.writeByte(EE_IR_CONFIG_START + i, 0);
   memset(learned, 0, IR_CODE_TABLE_BYTES);
   profileValid = false;
   lastRuntimeAction = IR_ACTION_NONE;

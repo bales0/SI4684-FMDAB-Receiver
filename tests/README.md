@@ -15,6 +15,10 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
 ./test_scheduler.exe
 
 g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
+  tests/test_fm_features.cpp -o test_fm_features.exe
+./test_fm_features.exe
+
+g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
   -I tests/stubs -I src tests/test_jpeg.cpp src/JPEGdecoder.cpp `
   -o test_jpeg.exe
 ./test_jpeg.exe
@@ -23,6 +27,11 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
 `test_scheduler.cpp` exercises the actual generation, retry/backoff, phased
 deadline, continuous-DSRV fairness, FM work-priority, RF/display-filter,
 one-shot time-sample and debug-throttling helpers used by the firmware.
+`test_fm_features.cpp` covers regional FM wrapping, AF validation and
+deduplication, RDS CT/MJD parsing, RDS versus RBDS PTY lookup, PI/frequency
+station identity, DAB audio-service boundary selection, 38-channel wrap and
+short/long Rotary 1 press suppression. It also locks down Rotary 2 routing:
+FM AUTO scan-list/no-list behavior and DAB global-list/current-mux fallback.
 `test_jpeg.cpp` runs the application JPEG parser and
 decoder against baseline grayscale, 4:4:4, 4:2:2, 4:2:0 and restart-marker
 fixtures, including a complete 320×240 baseline 4:2:0 decode. Progressive

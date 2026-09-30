@@ -1,7 +1,7 @@
 #ifndef FM_REGION_H
 #define FM_REGION_H
 
-#include <Arduino.h>
+#include <stdint.h>
 
 enum class FmRegion : uint8_t {
   Europe = 0,

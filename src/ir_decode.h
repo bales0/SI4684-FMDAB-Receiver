@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 // Stable protocol IDs intentionally match Arduino-IRremote 4.7.1 decode_type_t.
-// The EEPROM profile written by firmware schema 5 can therefore be reused
+// The persisted IR profile can therefore be reused
 // without migration even though Arduino-IRremote is no longer a dependency.
 enum IrProtocolId : uint8_t {
   IR_PROTO_UNKNOWN = 0,

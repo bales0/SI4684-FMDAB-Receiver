@@ -496,15 +496,24 @@ const char* DAB::intbHardwareName(void) const {
 
 void DAB::applyFmRegionProperties(void) {
   const FmRegionProfile& profile = fmProfile();
+  static const uint8_t seekRssi[] = {12, 18, 28};
+  static const uint8_t seekSnr[] = {2, 4, 8};
   Set_Property(0x3100, profile.minFrequency10kHz);
   Set_Property(0x3101, profile.maxFrequency10kHz);
   Set_Property(0x3102, profile.seekSpacing10kHz);
   Set_Property(0x3900, profile.deEmphasis);
+  Set_Property(0x3202, seekRssi[activeFmSeekSensitivity]);
+  Set_Property(0x3204, seekSnr[activeFmSeekSensitivity]);
   DIAG_PRINTF("[FM/REGION] %s band=%u-%u spacing=%u de-emphasis=%u us data=%s\n",
                 profile.menuName, profile.minFrequency10kHz,
                 profile.maxFrequency10kHz, profile.seekSpacing10kHz,
                 profile.deEmphasis == 0 ? 75U : 50U,
                 profile.rbds ? "RBDS" : "RDS");
+}
+
+void DAB::setFmSeekSensitivity(uint8_t profile, bool applyNow) {
+  activeFmSeekSensitivity = profile <= 2U ? profile : 1U;
+  if (applyNow && isFm()) applyFmRegionProperties();
 }
 
 void DAB::setFmRegion(uint8_t region, bool applyNow) {
@@ -1217,8 +1226,6 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
     DIAG_PRINTLN("[RADIO] FM band/RDS properties");
     applyFmRegionProperties();
     Set_Property(0x3200, 20);    // max tune error
-    Set_Property(0x3202, 18);    // seek RSSI threshold (dBuV)
-    Set_Property(0x3204, 4);     // seek SNR threshold (dB)
     Set_Property(0x3C00, 0x001B);
     Set_Property(0x3C01, 1);
     Set_Property(0x3C02, 0x0051); // RDS enabled, conservative BLE thresholds
@@ -1396,7 +1403,9 @@ void DAB::parseDabServiceListReply(uint16_t replyLength) {
     }
     service[i].ServiceID = serviceID;
     service[i].CompID = componentID;
-    service[i].ServiceType = 0;
+    // Unknown until the cooperative DAB_GET_SUBCHAN_INFO pass classifies it.
+    // Zero is a valid audio mode and must never be used as an "unknown" value.
+    service[i].ServiceType = 8;
     // Service Info 3 low nibble is SlCharset for this specific service.
     // Remember the pre-sort ServiceID so the charset can be realigned after
     // qsort() without growing the DABService structure or static DRAM.
@@ -1419,9 +1428,14 @@ void DAB::parseDabServiceListReply(uint16_t replyLength) {
     }
   }
   if (ServiceIndex >= numberofservices) ServiceIndex = 0;
-  if (CurrentServiceID != service[ServiceIndex].ServiceID) {
+  const bool componentKnown = dabServiceRequestPending || dabActiveServiceValid;
+  const uint32_t currentComponent = dabServiceRequestPending
+      ? dabRequestedComponentId : dabActiveComponentId;
+  if (CurrentServiceID != service[ServiceIndex].ServiceID ||
+      (componentKnown && currentComponent != service[ServiceIndex].CompID)) {
     for (uint8_t i = 0; i < numberofservices; ++i) {
-      if (CurrentServiceID == service[i].ServiceID) {
+      if (CurrentServiceID == service[i].ServiceID &&
+          (!componentKnown || currentComponent == service[i].CompID)) {
         ServiceIndex = i;
         break;
       }
@@ -1887,7 +1901,7 @@ void DAB::clearData(void) {
   for (byte x = 0; x < 32; x++) {
     service[x].ServiceID = 0;
     service[x].CompID = 0;
-    service[x].ServiceType = 0;
+    service[x].ServiceType = 8;
     dabServiceCharsetValue[x] = 0;
     for (byte y = 0; y < 16; y++) service[x].Label[y] = '\0';
   }
@@ -1896,6 +1910,12 @@ void DAB::clearData(void) {
   for (byte x = 0; x < 128; x++) ServiceData[x] = '\0';
   ServiceLabelCharset = 0;
   EnsembleLabelCharset = 0;
+}
+
+bool DAB::isDabServiceMetadataReady(void) const {
+  return !isFm() && dabServiceListReady &&
+         dabServiceTypeScanIndex >= numberofservices &&
+         dabCommand != DabCommand::ServiceType;
 }
 
 // Start a DAB tune. Completion is handled cooperatively by Update(); there is
@@ -1977,7 +1997,14 @@ void DAB::clearFmData(void) {
   fmMultipath = 0;
   fmPi = 0;
   fmPty = 0;
+  fmTp = false;
+  fmTa = false;
   fmPtyValid = false;
+  fmAf.clear();
+  fmCtValid = false;
+  fmCt = fm_features::ClockTime{};
+  fmCtCandidate = fm_features::ClockTime{};
+  fmCtCandidateConfirmations = 0;
   fmPsSeenMask = 0;
   fmPsConfirmedMask = 0;
   fmRtMask = 0;
@@ -2048,7 +2075,31 @@ void DAB::processFmRds(void) {
     const uint8_t groupType = static_cast<uint8_t>((blockB >> 12) & 0x0F);
     const bool versionB = (blockB & 0x0800U) != 0;
 
-    if (groupType == 0 && group.ble[3] <= 1U) {
+    if (groupType == 0) {
+      const bool newTa = (blockB & 0x0010U) != 0;
+      if (fmTa != newTa) {
+        fmTa = newTa;
+        DIAG_PRINTF("[FM/TA] TP=%u TA=%u\n", fmTp ? 1U : 0U,
+                    fmTa ? 1U : 0U);
+      }
+
+      if (!versionB && group.ble[2] <= 1U && fmPi != 0U) {
+        const uint8_t af1 = static_cast<uint8_t>(group.block[2] >> 8);
+        const uint8_t af2 = static_cast<uint8_t>(group.block[2] & 0xFFU);
+        const bool changed = fmAf.addCode(af1) | fmAf.addCode(af2);
+        if (changed) {
+          DIAG_PRINTF("[FM/AF] PI=%04X count=%u last=%u.%02u\n",
+                      static_cast<unsigned>(fmPi),
+                      static_cast<unsigned>(fmAf.count),
+                      static_cast<unsigned>(
+                          fmAf.frequency10kHz[fmAf.count - 1U] / 100U),
+                      static_cast<unsigned>(
+                          fmAf.frequency10kHz[fmAf.count - 1U] % 100U));
+        }
+      }
+
+      if (group.ble[3] > 1U) return;
+
       const uint8_t segment = blockB & 0x03U;
       const uint8_t segmentBit = static_cast<uint8_t>(1U << segment);
       const uint8_t pos = static_cast<uint8_t>(segment * 2U);
@@ -2098,6 +2149,44 @@ void DAB::processFmRds(void) {
           DIAG_PRINTF("[FM/RDS] PS %s='%s' confirmedMask=0x%02X\n",
                         firstAcquisition ? "acquired" : "updated",
                         fmPs, fmPsConfirmedMask);
+        }
+      }
+      return;
+    }
+
+    if (groupType == 4U && !versionB && group.ble[2] <= 1U &&
+        group.ble[3] <= 1U) {
+      fm_features::ClockTime decoded;
+      if (!fm_features::decodeClockTime(blockB, group.block[2],
+                                        group.block[3], decoded))
+        return;
+      const bool same = decoded.year == fmCtCandidate.year &&
+                        decoded.month == fmCtCandidate.month &&
+                        decoded.day == fmCtCandidate.day &&
+                        decoded.hour == fmCtCandidate.hour &&
+                        decoded.minute == fmCtCandidate.minute &&
+                        decoded.localOffsetHalfHours ==
+                            fmCtCandidate.localOffsetHalfHours;
+      if (same) {
+        if (fmCtCandidateConfirmations < 2U) ++fmCtCandidateConfirmations;
+      } else {
+        fmCtCandidate = decoded;
+        fmCtCandidateConfirmations = 1U;
+      }
+      if (fmCtCandidateConfirmations >= 2U) {
+        const bool changed = !fmCtValid || decoded.year != fmCt.year ||
+                             decoded.month != fmCt.month ||
+                             decoded.day != fmCt.day ||
+                             decoded.hour != fmCt.hour ||
+                             decoded.minute != fmCt.minute ||
+                             decoded.localOffsetHalfHours !=
+                                 fmCt.localOffsetHalfHours;
+        if (changed) {
+          fmCt = decoded;
+          fmCtValid = true;
+          DIAG_PRINTF("[FM/CT] %04u-%02u-%02u %02u:%02u UTC offset=%d/2h\n",
+                      fmCt.year, fmCt.month, fmCt.day, fmCt.hour, fmCt.minute,
+                      static_cast<int>(fmCt.localOffsetHalfHours));
         }
       }
       return;
@@ -2199,8 +2288,32 @@ void DAB::processFmRds(void) {
     }
 
     // PI and TP/PTY are status fields and are useful even with an empty FIFO.
-    if (group.piValid) fmPi = group.pi;
+    if (group.piValid && group.pi != fmPi) {
+      fmPi = group.pi;
+      fmAf.clear(fmPi);
+      fmTa = false;
+      // PS/RT segments collected before a PI transition belong to a different
+      // programme. Reset both working and published text so a scan can never
+      // combine an old name with the newly tuned station.
+      fmPsSeenMask = 0;
+      fmPsConfirmedMask = 0;
+      memset(fmPsWork, ' ', 8); fmPsWork[8] = '\0';
+      memset(fmPs, 0, sizeof(fmPs));
+      memset(PStext, 0, sizeof(PStext));
+      fmRtMask = 0;
+      fmRtSeenMask = 0;
+      memset(fmRtWork, ' ', 64); fmRtWork[64] = '\0';
+      memset(fmRadioText, 0, sizeof(fmRadioText));
+      memset(ServiceData, 0, sizeof(ServiceData));
+      DIAG_PRINTF("[FM/AF] PI changed=%04X; list cleared\n",
+                  static_cast<unsigned>(fmPi));
+    }
     if (group.tpPtyValid) {
+      if (fmTp != group.tp) {
+        fmTp = group.tp;
+        DIAG_PRINTF("[FM/TA] TP=%u TA=%u\n", fmTp ? 1U : 0U,
+                    fmTa ? 1U : 0U);
+      }
       fmPty = group.pty;
       fmPtyValid = true;
       pty = fmPty;

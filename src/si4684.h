@@ -22,6 +22,7 @@
 #include <cstring>
 #include <climits>
 #include "FmRegion.h"
+#include "fm_features.h"
 
 struct DABFrequencyLabel_DAB {
   uint32_t frequency;
@@ -88,6 +89,8 @@ typedef struct _Services {
   char      Label[17];
   byte    ServiceType;
 } DABService;
+
+uint8_t DabServiceLabelCharset(uint8_t serviceIndex);
 
 enum RadioMode : uint8_t {
   RADIO_MODE_DAB = 0,
@@ -163,18 +166,24 @@ class DAB {
     uint8_t fmMultipath;
     uint16_t fmPi;
     uint8_t fmPty;
+    bool fmTp;
+    bool fmTa;
     bool fmValid;
     bool fmAfcRail;
     bool fmPilot;
     uint8_t fmStereoBlend;
     char fmPs[9];
     char fmRadioText[65];
+    fm_features::AfList fmAf;
+    bool fmCtValid;
+    fm_features::ClockTime fmCt;
     void clearData(void);
     void EnsembleInfo(void);
     void getServiceData(void);
     void ServiceInfo(void);
     void setFreq(uint8_t freq_index);
     void setFmRegion(uint8_t region, bool applyNow = true);
+    void setFmSeekSensitivity(uint8_t profile, bool applyNow = true);
     void setFmFrequency(uint16_t frequency10kHz);
     bool startFmSeek(bool up);
     void setService(uint8_t index);
@@ -191,6 +200,9 @@ class DAB {
     const char* controlModeName(void) const;
     const char* intbHardwareName(void) const;
     bool isTunePending(void) const { return tunePending; }
+    bool isFmPsStable(void) const {
+      return isFm() && fmPsSeenMask == 0x0FU && fmPsConfirmedMask == 0x0FU;
+    }
     // Set only after repeated command CTS timeouts. Signal/ensemble lock state
     // never participates in this decision.
     bool transportStalled(void) const { return dabTransportStalled; }
@@ -198,6 +210,7 @@ class DAB {
     // has been parsed for the currently tuned ensemble. This lets the UI make
     // one-shot restore decisions without guessing from numberofservices.
     bool isDabServiceListReady(void) const { return !isFm() && dabServiceListReady; }
+    bool isDabServiceMetadataReady(void) const;
     const uint8_t* slideshowData(void) const { return slideshowSegBuf; }
     uint32_t slideshowSize(void) const { return SlideShowAvailable ? slideshowRamSize : 0; }
     size_t slideshowCapacity(void) const { return SLS_BUFFER_BYTES; }
@@ -235,6 +248,7 @@ class DAB {
     bool SlideShowInit;
     RadioMode activeMode;
     uint8_t activeFmRegion = static_cast<uint8_t>(FmRegion::Europe);
+    uint8_t activeFmSeekSensitivity = 1;
     bool tunePending;
     bool seekPending;
     uint32_t tuneDeadline;
@@ -254,6 +268,8 @@ class DAB {
     bool fmRtVersionKnown;
     char fmPsWork[9];
     char fmRtWork[65];
+    fm_features::ClockTime fmCtCandidate;
+    uint8_t fmCtCandidateConfirmations = 0;
     char ChipType[7];
     char FirmwVersion[6];
     uint32_t componentID;

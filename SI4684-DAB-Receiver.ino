@@ -27,7 +27,7 @@
 //   * TPA6130A2 headphone amp (I2C)
 //   * Dual rotary encoders + four buttons
 //   * RAM-only MOT slideshow buffer
-//   * EEPROM settings and presets
+//   * direct NVS settings, presets, IR profile and FM scan list
 //
 // setup() initialises everything in a hardware-safe order. loop() is the
 // cooperative scheduler for radio, UI, communication and controls.
@@ -44,7 +44,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include <EEPROM.h>
+#include "src/nvs_storage.h"
 #include <cstdlib>
 #include <Wire.h>
 #include "src/font.h"
@@ -57,6 +57,9 @@
 #include "src/si4684.h"
 #include "src/TPA6130A2.h"
 #include "src/ir_remote.h"
+#include "src/fm_features.h"
+#include "src/fm_station_list.h"
+#include "src/dab_station_list.h"
 
 TPA6130A2 Headphones;
 DAB radio;
@@ -66,6 +69,9 @@ TFT_eSPI tft = TFT_eSPI(240, 320);
 
 bool autoslideshow;
 bool ChannelListView;
+bool DabGlobalListView;
+bool fmScanCompleted;
+bool dabScanCompleted;
 bool direction;
 bool displayreset;
 bool memorystore;
@@ -80,6 +86,8 @@ bool SlideShowView;
 bool store;
 bool trysetservice;
 uint8_t trysetserviceFreq = 0xFF;
+uint32_t trysetserviceComponentId;
+bool trysetserviceComponentValid;
 bool tuned;
 bool tuning;
 bool eepromDirty;
@@ -87,6 +95,35 @@ bool dabSeekStarted;
 bool fmSeekStarted;
 bool radioSwitchMuted;
 bool dabServiceSelectionPending;
+enum class DabAutoState : uint8_t {
+  Idle, WaitCurrentServiceTypes, TuneMux, WaitTune, WaitServiceList,
+  WaitServiceTypes
+};
+static DabAutoState dabAutoState = DabAutoState::Idle;
+static bool dabAutoForward = true;
+static uint8_t dabAutoChannelsTried = 0;
+static uint32_t dabAutoDeadlineMs = 0;
+enum class FmScanState : uint8_t {
+  Idle, WaitBandStart, StartSeek, WaitSeek, RdsDwell
+};
+static FmScanState fmScanState = FmScanState::Idle;
+static uint16_t fmScanFirstFrequency = 0;
+static uint16_t fmScanCandidateFrequency = 0;
+static uint16_t fmScanSeekCount = 0;
+static uint32_t fmScanDeadlineMs = 0;
+static uint32_t fmScanOverlayUntilMs = 0;
+static bool fmScanNeedsMainRedraw = false;
+enum class DabFullScanState : uint8_t {
+  Idle, TuneChannel, WaitTune, WaitServiceList, WaitServiceTypes
+};
+static DabFullScanState dabFullScanState = DabFullScanState::Idle;
+static uint8_t dabScanChannel = 0;
+static uint8_t dabScanChannelsTried = 0;
+static uint8_t dabScanRestoreChannel = 0;
+static uint32_t dabScanRestoreServiceId = 0;
+static uint32_t dabScanDeadlineMs = 0;
+static uint32_t dabScanOverlayUntilMs = 0;
+static bool dabScanNeedsMainRedraw = false;
 byte audiomodeold;
 byte ContrastSet;
 byte CurrentTheme;
@@ -111,10 +148,12 @@ RadioMode radioMode = RADIO_MODE_DAB;
 RadioMode requestedRadioMode = RADIO_MODE_DAB;
 uint8_t fmRegion = static_cast<uint8_t>(FmRegion::Europe);
 uint8_t requestedFmRegion = static_cast<uint8_t>(FmRegion::Europe);
+uint8_t fmSeekSensitivity = 1;
 uint8_t gpio12Mode = GPIO12_AUTO;
 uint8_t requestedGpio12Mode = GPIO12_AUTO;
 uint16_t fmfreq = 8750;
 char _serviceName[17];
+uint8_t _serviceNameCharset;
 const uint8_t* currentFont = nullptr;
 int ActiveColor;
 int ActiveColorSmooth;
@@ -191,6 +230,7 @@ struct SettingsSnapshot {
   uint8_t theme;
   RadioMode radioMode;
   uint8_t fmRegion;
+  uint8_t fmSeekSensitivity;
   uint8_t gpio12Mode;
 };
 
@@ -229,6 +269,16 @@ void read_encoder2(void);
 void DoMemoryPosTune(void);
 void ProcessDAB(void);
 void Seek(bool mode);
+void StartDabAuto(bool forward);
+void ProcessDabAuto(void);
+void CancelDabAuto(void);
+void StartFmFullScan(void);
+void ProcessFmFullScan(void);
+void CancelFmFullScan(void);
+void StartDabFullScan(void);
+void ProcessDabFullScan(void);
+void CancelDabFullScan(void);
+void Rotary1ButtonProcess(void);
 void deepSleep(void);
 bool StoreFrequency(void);
 void closeVolume(void);
@@ -245,6 +295,9 @@ void Button2Press(void);
 void doRecovery(void);
 void doStandby(void);
 bool ActivateCurrentService(void);
+uint8_t ChannelListCount(void);
+uint8_t ChannelListIndex(void);
+void MoveChannelList(bool forward);
 void DABSelectService(bool dir);
 bool IsStationEmpty(void);
 void LoadPresets(void);
@@ -547,7 +600,7 @@ void MarkEepromDirty(void) {
 }
 
 static bool CommitEepromNow(const char* reason) {
-  if (EEPROM.commit()) {
+  if (Storage.commit()) {
     eepromDirty = false;
     return true;
   }
@@ -556,7 +609,7 @@ static bool CommitEepromNow(const char* reason) {
   // callers (restart/standby/IR learn) also receive the failure immediately.
   eepromDirty = true;
   EepromDirtyTimer = millis();
-  DIAG_PRINTF("[EEPROM] ERROR: commit failed (%s); dirty retained\n",
+  DIAG_PRINTF("[NVS] ERROR: commit failed (%s); dirty retained\n",
                 reason ? reason : "unspecified");
   return false;
 }
@@ -568,107 +621,37 @@ bool FlushEeprom(void) {
 
 static void ClearIrProfileStorage(void) {
   for (int i = EE_IR_CONFIG_START; i < EE_IR_CONFIG_END; ++i)
-    EEPROM.writeByte(i, 0);
+    Storage.writeByte(i, 0);
 }
 
 static void WriteEmptyFmPresetsV4(void) {
   for (int i = 0; i < EE_PRESETS_CNT; ++i) {
-    EEPROM.put(EE_FM_PRESETS_FREQ_START + i * 2,
+    Storage.put(EE_FM_PRESETS_FREQ_START + i * 2,
                static_cast<uint16_t>(EE_FM_PRESET_EMPTY_FREQUENCY));
-    EEPROM.put(EE_FM_PRESETS_PI_START + i * 2, static_cast<uint16_t>(0));
+    Storage.put(EE_FM_PRESETS_PI_START + i * 2, static_cast<uint16_t>(0));
     for (int y = 0; y < EE_FM_PRESET_NAME_LENGTH; ++y)
-      EEPROM.writeByte(EE_FM_PRESETS_NAME_START +
+      Storage.writeByte(EE_FM_PRESETS_NAME_START +
                            i * EE_FM_PRESET_NAME_LENGTH + y,
                        '\0');
   }
-}
-
-static bool MigrateSchema2ToCurrent(void) {
-  DIAG_PRINTLN("[EEPROM] migrate schema 2 -> 5");
-  // Schema 2 has no FM records. Preserve every DAB byte and initialise only
-  // the newly allocated FM settings/tail.
-  EEPROM.writeByte(EE_BYTE_RADIO_MODE, RADIO_MODE_DAB);
-  EEPROM.put(EE_UINT16_FM_FREQUENCY, static_cast<uint16_t>(8750));
-  EEPROM.writeByte(EE_BYTE_FM_REGION, static_cast<uint8_t>(FmRegion::Europe));
-  EEPROM.writeByte(EE_BYTE_GPIO12_MODE, GPIO12_AUTO);
-  WriteEmptyFmPresetsV4();
-  ClearIrProfileStorage();
-  EEPROM.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
-  return CommitEepromNow("schema 2 -> 5");
-}
-
-static bool MigrateSchema3ToCurrent(void) {
-  struct LegacyFmPreset {
-    uint8_t frequencyIndex;
-    uint32_t pi;
-    char label[EE_FM_PRESET_NAME_LENGTH];
-  };
-  LegacyFmPreset snapshot[EE_PRESETS_CNT];
-
-  DIAG_PRINTLN("[EEPROM] migrate schema 3 -> 5");
-  // The v4 frequency and PI arrays overlap all three v3 arrays. Snapshot all
-  // 99 source records before writing even the first destination byte.
-  for (int i = 0; i < EE_PRESETS_CNT; ++i) {
-    snapshot[i].frequencyIndex =
-        EEPROM.readByte(EE_V3_FM_PRESETS_FREQ_START + i);
-    EEPROM.get(EE_V3_FM_PRESETS_PI_START + i * 4, snapshot[i].pi);
-    for (int y = 0; y < EE_FM_PRESET_NAME_LENGTH; ++y)
-      snapshot[i].label[y] = EEPROM.readByte(
-          EE_V3_FM_PRESETS_NAME_START + i * EE_FM_PRESET_NAME_LENGTH + y);
-    snapshot[i].label[EE_FM_PRESET_NAME_LENGTH - 1] = '\0';
-  }
-
-  uint16_t migrated = 0;
-  for (int i = 0; i < EE_PRESETS_CNT; ++i) {
-    uint16_t frequency10kHz = EE_FM_PRESET_EMPTY_FREQUENCY;
-    if (snapshot[i].frequencyIndex != EE_PRESETS_FREQUENCY) {
-      frequency10kHz = 8750U +
-                       static_cast<uint16_t>(snapshot[i].frequencyIndex) * 10U;
-      ++migrated;
-    }
-    EEPROM.put(EE_FM_PRESETS_FREQ_START + i * 2, frequency10kHz);
-    EEPROM.put(EE_FM_PRESETS_PI_START + i * 2,
-               static_cast<uint16_t>(snapshot[i].pi & 0xFFFFU));
-    for (int y = 0; y < EE_FM_PRESET_NAME_LENGTH; ++y)
-      EEPROM.writeByte(EE_FM_PRESETS_NAME_START +
-                           i * EE_FM_PRESET_NAME_LENGTH + y,
-                       snapshot[i].label[y]);
-  }
-  EEPROM.writeByte(EE_BYTE_FM_REGION, static_cast<uint8_t>(FmRegion::Europe));
-  EEPROM.writeByte(EE_BYTE_GPIO12_MODE, GPIO12_AUTO);
-  ClearIrProfileStorage();
-  EEPROM.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
-  const bool committed = CommitEepromNow("schema 3 -> 5");
-  DIAG_PRINTF("[EEPROM] migrated %u FM presets\n", migrated);
-  return committed;
-}
-
-static bool MigrateSchema4ToCurrent(void) {
-  DIAG_PRINTLN("[EEPROM] migrate schema 4 -> 5 (GPIO12/IR metadata only)");
-  // Schema 4 already has the final DAB/FM layout. Preserve every existing
-  // setting and preset; initialize only bytes that were reserved in schema 4.
-  EEPROM.writeByte(EE_BYTE_GPIO12_MODE, GPIO12_AUTO);
-  ClearIrProfileStorage();
-  EEPROM.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
-  return CommitEepromNow("schema 4 -> 5");
 }
 
 // DAB records keep their byte-for-byte schema. FM records are loaded
 // separately because schema 4+ stores an absolute uint16_t frequency and PI.
 void LoadPresets(void) {
   for (int i = 0; i < EE_PRESETS_CNT; ++i) {    if (radioMode == RADIO_MODE_FM) {
-      EEPROM.get(EE_FM_PRESETS_FREQ_START + i * 2,
+      Storage.get(EE_FM_PRESETS_FREQ_START + i * 2,
                  fmMemory[i].Frequency10kHz);
-      EEPROM.get(EE_FM_PRESETS_PI_START + i * 2, fmMemory[i].ProgramId);
+      Storage.get(EE_FM_PRESETS_PI_START + i * 2, fmMemory[i].ProgramId);
       for (int y = 0; y < EE_FM_PRESET_NAME_LENGTH; ++y)
-        fmMemory[i].Label[y] = EEPROM.readByte(
+        fmMemory[i].Label[y] = Storage.readByte(
             EE_FM_PRESETS_NAME_START + i * EE_FM_PRESET_NAME_LENGTH + y);
       fmMemory[i].Label[EE_FM_PRESET_NAME_LENGTH - 1] = '\0';
     } else {
       memset(memory[i].Label, 0, sizeof(memory[i].Label));
-      memory[i].Channel = EEPROM.readByte(EE_PRESETS_FREQ_START + i);
-      EEPROM.get(EE_PRESETS_SERVICEID_START + i * 8, memory[i].ServiceID);
-      for (int y = 0; y < 16; ++y) memory[i].Label[y] = EEPROM.readByte(EE_PRESETS_NAME_START + i * 17 + y);
+      memory[i].Channel = Storage.readByte(EE_PRESETS_FREQ_START + i);
+      Storage.get(EE_PRESETS_SERVICEID_START + i * 8, memory[i].ServiceID);
+      for (int y = 0; y < 16; ++y) memory[i].Label[y] = Storage.readByte(EE_PRESETS_NAME_START + i * 17 + y);
     }
   }
 
@@ -810,7 +793,25 @@ static void ShowStatusOverlay(const char* text) {
            ActiveColor, BackgroundColor3, 16);
 }
 
+static void ShowScanProgressOverlay(const char* text, uint8_t percent) {
+  ShowStatusOverlay(text);
+  if (percent > 100U) percent = 100U;
+  static constexpr int16_t x = 45;
+  static constexpr int16_t y = 84;
+  static constexpr int16_t width = 230;
+  static constexpr int16_t height = 6;
+  tft.drawRect(x, y, width, height, ActiveColor);
+  tft.fillRect(x + 1, y + 1, width - 2, height - 2, GreyoutColor);
+  const int16_t fill = static_cast<int16_t>(
+      (static_cast<uint32_t>(width - 2) * percent) / 100U);
+  if (fill > 0)
+    tft.fillRect(x + 1, y + 1, fill, height - 2, PrimaryColor);
+}
+
 bool SwitchRadioMode(RadioMode newMode, bool force) {
+  CancelFmFullScan();
+  CancelDabFullScan();
+  CancelDabAuto();
   const uint32_t switchStartMs = millis();
   DIAG_PRINTF("[SWITCH] request %s -> %s force=%u\n",
                 radioMode == RADIO_MODE_FM ? "FM" : "DAB",
@@ -881,7 +882,7 @@ bool SwitchRadioMode(RadioMode newMode, bool force) {
   radioMode = newMode;
 
   if (modeChanged) {
-    EEPROM.writeByte(EE_BYTE_RADIO_MODE, static_cast<uint8_t>(radioMode));
+    Storage.writeByte(EE_BYTE_RADIO_MODE, static_cast<uint8_t>(radioMode));
     MarkEepromDirty();
   }
   LoadPresets();
@@ -893,22 +894,25 @@ bool SwitchRadioMode(RadioMode newMode, bool force) {
   dabServiceSelectionPending = false;
   trysetservice = false;
   trysetserviceFreq = 0xFF;
+  trysetserviceComponentValid = false;
   SlideShowView = false;
   if (radioMode == RADIO_MODE_FM) {
     fmfreq = normalizeFmFrequency(fmfreq, fmRegion);
     uint16_t storedFmFrequency = 0;
-    EEPROM.get(EE_UINT16_FM_FREQUENCY, storedFmFrequency);
+    Storage.get(EE_UINT16_FM_FREQUENCY, storedFmFrequency);
     if (storedFmFrequency != fmfreq) {
-      EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
+      Storage.put(EE_UINT16_FM_FREQUENCY, fmfreq);
       MarkEepromDirty();
     }
     radio.setFmFrequency(fmfreq);
   } else {
     radio.setFreq(dabfreq);
-    EEPROM.get(EE_UINT32_SERVICEID, _serviceID);
+    Storage.get(EE_UINT32_SERVICEID, _serviceID);
     memset(_serviceName, 0, sizeof(_serviceName));
+    _serviceNameCharset = 0;
     trysetservice = _serviceID != 0;
     trysetserviceFreq = trysetservice ? dabfreq : 0xFF;
+    trysetserviceComponentValid = false;
   }
   BuildDisplay();
   DIAG_PRINTF("[RADIO/BOOT] total mode switch=%u ms mode=%s control=%s\n",
@@ -930,6 +934,7 @@ void CaptureSettingsSnapshot(void) {
   settingsOriginal.theme = CurrentTheme;
   settingsOriginal.radioMode = radioMode;
   settingsOriginal.fmRegion = fmRegion;
+  settingsOriginal.fmSeekSensitivity = fmSeekSensitivity;
   settingsOriginal.gpio12Mode = gpio12Mode;
   requestedRadioMode = radioMode;
   requestedFmRegion = fmRegion;
@@ -947,11 +952,13 @@ void ExitSettingsMenu(void) {
   const bool gpio12Changed = selectedGpio12 != settingsOriginal.gpio12Mode;
   const bool radioModeChanged = requestedRadioMode != settingsOriginal.radioMode;
   const bool fmRegionChanged = selectedRegion != settingsOriginal.fmRegion;
+  const bool fmSeekSensitivityChanged =
+      fmSeekSensitivity != settingsOriginal.fmSeekSensitivity;
   bool settingsChanged = false;
 
   auto writeByteChanged = [&](int address, uint8_t current, uint8_t original) {
     if (current == original) return;
-    EEPROM.writeByte(address, current);
+    Storage.writeByte(address, current);
     settingsChanged = true;
   };
 
@@ -962,23 +969,26 @@ void ExitSettingsMenu(void) {
   writeByteChanged(EE_BYTE_UNIT, unit, settingsOriginal.unit);
   writeByteChanged(EE_BYTE_TOT, tot, settingsOriginal.tot);
   writeByteChanged(EE_BYTE_THEME, CurrentTheme, settingsOriginal.theme);
+  writeByteChanged(EE_BYTE_FM_SEEK_SENSITIVITY, fmSeekSensitivity,
+                   settingsOriginal.fmSeekSensitivity);
 
   if (fmRegionChanged) {
-    EEPROM.writeByte(EE_BYTE_FM_REGION, selectedRegion);
+    Storage.writeByte(EE_BYTE_FM_REGION, selectedRegion);
     settingsChanged = true;
     const uint16_t previousFrequency = fmfreq;
     fmfreq = normalizeFmFrequency(fmfreq, selectedRegion);
-    if (fmfreq != previousFrequency) EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
+    if (fmfreq != previousFrequency) Storage.put(EE_UINT16_FM_FREQUENCY, fmfreq);
     fmRegion = selectedRegion;
   }
 
   if (gpio12Changed) {
-    EEPROM.writeByte(EE_BYTE_GPIO12_MODE, selectedGpio12);
+    Storage.writeByte(EE_BYTE_GPIO12_MODE, selectedGpio12);
     settingsChanged = true;
-    if (radioModeChanged) {
-      EEPROM.writeByte(EE_BYTE_RADIO_MODE, static_cast<uint8_t>(requestedRadioMode));
-      settingsChanged = true;
-    }
+  }
+  if (radioModeChanged) {
+    Storage.writeByte(EE_BYTE_RADIO_MODE,
+                      static_cast<uint8_t>(requestedRadioMode));
+    settingsChanged = true;
   }
 
   if (settingsChanged) MarkEepromDirty();
@@ -988,8 +998,8 @@ void ExitSettingsMenu(void) {
 
   if (gpio12Changed) {
     if (!FlushEeprom()) {
-      DIAG_PRINTLN("[EEPROM] GPIO12 setting not committed; restart cancelled");
-      ShowStatusOverlay("EEPROM ERROR");
+      DIAG_PRINTLN("[NVS] GPIO12 setting not committed; restart cancelled");
+      ShowStatusOverlay("NVS ERROR");
       delay(1200);
       BuildDisplay();
       return;
@@ -1008,12 +1018,19 @@ void ExitSettingsMenu(void) {
     const bool stayingInFm = radioMode == RADIO_MODE_FM &&
                              requestedRadioMode == RADIO_MODE_FM;
     radio.setFmRegion(fmRegion, stayingInFm);
+    FmStations.load(fmRegion);
+    fmScanCompleted = Storage.fmScanCompleted(fmRegion);
     if (stayingInFm) {
       LoadPresets();
       radio.setFmFrequency(fmfreq);
     }
     DIAG_PRINTF("[FM/REGION] selected %s normalized=%u\n",
                   fmRegionProfile(fmRegion).menuName, fmfreq);
+  }
+  if (fmSeekSensitivityChanged) {
+    const bool stayingInFm = radioMode == RADIO_MODE_FM &&
+                             requestedRadioMode == RADIO_MODE_FM;
+    radio.setFmSeekSensitivity(fmSeekSensitivity, stayingInFm);
   }
 
   if (requestedRadioMode != radioMode) {
@@ -1024,11 +1041,14 @@ void ExitSettingsMenu(void) {
 }
 
 void CycleTuneMode(void) {
+  CancelDabAuto();
+  CancelFmFullScan();
+  CancelDabFullScan();
   const byte previous = tunemode;
   tunemode++;
   if (tunemode > TUNE_MEM) tunemode = TUNE_MAN;
   if (tunemode != previous) {
-    EEPROM.writeByte(EE_BYTE_TUNEMODE, tunemode);
+    Storage.writeByte(EE_BYTE_TUNEMODE, tunemode);
     MarkEepromDirty();
   }
   ShowTuneModeCurrent();
@@ -1074,7 +1094,7 @@ void RemoteVolumeStep(int8_t delta) {
   const int next = constrain(static_cast<int>(volume) + delta, 0, 62);
   if (next != volume) {
     volume = static_cast<byte>(next);
-    EEPROM.writeByte(EE_BYTE_VOLUME, volume);
+    Storage.writeByte(EE_BYTE_VOLUME, volume);
     MarkEepromDirty();
   }
   ShowVolume();
@@ -1119,6 +1139,7 @@ void RemoteTuneAction(int8_t direction, bool repeat) {
     radio.ServiceIndex = 0;
     radio.ServiceStart = false;
     memset(_serviceName, 0, sizeof(_serviceName));
+    _serviceNameCharset = 0;
     ShowFreq();
     DIAG_PRINTF("[FM/UI] IR MAN %s -> %c%u kHz, %.1f MHz\n",
                   up ? "UP" : "DOWN", up ? '+' : '-',
@@ -1179,10 +1200,10 @@ static bool buttonEdge(uint8_t pin, bool& armed) {
 }
 
 // One-shot initialisation called by the Arduino framework after boot.
-// Order matters: Serial → GPIO drive → EEPROM → audio → display → radio →
+// Order matters: Serial → GPIO drive → NVS → audio → display → radio →
 // menu state → encoders.
 void setup(void) {
-  // Establish safe external-peripheral levels before Serial, EEPROM or heap
+  // Establish safe external-peripheral levels before Serial, NVS or heap
   // setup. On a cold power ramp the ESP32 bootloader leaves these GPIOs
   // uncontrolled long enough for some ILI9341 modules to leave reset too soon.
   // Holding the shared reset LOW throughout early setup gives both the LCD and
@@ -1234,61 +1255,109 @@ void setup(void) {
   DIAG_PRINTF("[BOOT] FM preset cache static .bss=%u bytes; heap=%u\n",
                 static_cast<unsigned>(sizeof(fmMemory)), ESP.getFreeHeap());
 
-  // EEPROM check byte acts as a schema version. Known schemas are migrated
-  // without changing the DAB layout; only unknown/corrupt values use defaults.
-  DIAG_PRINTLN("[BOOT] EEPROM.begin");
-  if (!EEPROM.begin(EE_TOTAL_CNT)) {
-    Serial.printf("[BOOT] FATAL: EEPROM.begin(%u) failed\n",
-                  static_cast<unsigned>(EE_TOTAL_CNT));
+  // Direct NVS records are loaded first. Missing or malformed records are
+  // replaced with complete safe defaults; legacy EEPROM is not imported.
+  DIAG_PRINTLN("[BOOT] NVS begin");
+  if (!Storage.begin()) {
+    Serial.println("[BOOT] FATAL: NVS begin failed");
     while (true) delay(1000);
   }
-  const uint8_t storedSchema = EEPROM.readByte(EE_BYTE_CHECKBYTE);
-  DIAG_PRINTF("[BOOT] EEPROM OK schema=%u\n", storedSchema);
+  const uint8_t storedSchema = Storage.readByte(EE_BYTE_CHECKBYTE);
+  DIAG_PRINTF("[BOOT] NVS ready marker=%u\n", storedSchema);
   bool schemaCommitOk = true;
-  if (storedSchema == EE_CHECKBYTE_DAB_ONLY) {
-    schemaCommitOk = MigrateSchema2ToCurrent();
-  } else if (storedSchema == EE_CHECKBYTE_FM_INDEXED) {
-    schemaCommitOk = MigrateSchema3ToCurrent();
-  } else if (storedSchema == EE_CHECKBYTE_FM_ABSOLUTE) {
-    schemaCommitOk = MigrateSchema4ToCurrent();
-  } else if (storedSchema != EE_CHECKBYTE_VALUE) {
+  if (storedSchema != EE_CHECKBYTE_VALUE) {
     schemaCommitOk = DefaultSettings();
+  } else {
+    // Writes any optional record that was absent and defaulted by begin().
+    schemaCommitOk = Storage.commit();
   }
   if (!schemaCommitOk) {
-    Serial.println("[BOOT] FATAL: EEPROM schema/default commit failed");
+    Serial.println("[BOOT] FATAL: NVS defaults write failed");
     while (true) delay(1000);
   }
-  ContrastSet = EEPROM.readByte(EE_BYTE_CONTRASTSET);
-  language = EEPROM.readByte(EE_BYTE_LANGUAGE);
-  displayflip = EEPROM.readByte(EE_BYTE_DISPLAYFLIP);
-  rotarymode = EEPROM.readByte(EE_BYTE_ROTARYMODE);
-  tunemode = EEPROM.readByte(EE_BYTE_TUNEMODE);
+  ContrastSet = Storage.readByte(EE_BYTE_CONTRASTSET);
+  language = Storage.readByte(EE_BYTE_LANGUAGE);
+  displayflip = Storage.readByte(EE_BYTE_DISPLAYFLIP);
+  rotarymode = Storage.readByte(EE_BYTE_ROTARYMODE);
+  tunemode = Storage.readByte(EE_BYTE_TUNEMODE);
   if (tunemode > TUNE_MEM) {
     tunemode = TUNE_MAN;
-    EEPROM.writeByte(EE_BYTE_TUNEMODE, tunemode);
+    Storage.writeByte(EE_BYTE_TUNEMODE, tunemode);
     MarkEepromDirty();
   }
-  unit = EEPROM.readByte(EE_BYTE_UNIT);
-  dabfreq = EEPROM.readByte(EE_BYTE_DABFREQ);
-  volume = EEPROM.readByte(EE_BYTE_VOLUME);
-  memorypos = EEPROM.readByte(EE_BYTE_MEMORYPOS);
-  autoslideshow = EEPROM.readByte(EE_BYTE_AUTOSLIDESHOW);
-  tot = EEPROM.readByte(EE_BYTE_TOT);
-  CurrentTheme = EEPROM.readByte(EE_BYTE_THEME);
-  radioMode = EEPROM.readByte(EE_BYTE_RADIO_MODE) == RADIO_MODE_FM ? RADIO_MODE_FM : RADIO_MODE_DAB;
+  unit = Storage.readByte(EE_BYTE_UNIT);
+  dabfreq = Storage.readByte(EE_BYTE_DABFREQ);
+  volume = Storage.readByte(EE_BYTE_VOLUME);
+  memorypos = Storage.readByte(EE_BYTE_MEMORYPOS);
+  autoslideshow = Storage.readByte(EE_BYTE_AUTOSLIDESHOW);
+  tot = Storage.readByte(EE_BYTE_TOT);
+  CurrentTheme = Storage.readByte(EE_BYTE_THEME);
+  const uint8_t storedRadioMode = Storage.readByte(EE_BYTE_RADIO_MODE);
+  radioMode = storedRadioMode == RADIO_MODE_FM ? RADIO_MODE_FM : RADIO_MODE_DAB;
   requestedRadioMode = radioMode;
-  fmRegion = sanitizeFmRegion(EEPROM.readByte(EE_BYTE_FM_REGION));
+  const uint8_t storedFmRegion = Storage.readByte(EE_BYTE_FM_REGION);
+  fmRegion = sanitizeFmRegion(storedFmRegion);
   requestedFmRegion = fmRegion;
-  const uint8_t storedGpio12Mode = EEPROM.readByte(EE_BYTE_GPIO12_MODE);
+  const uint8_t storedGpio12Mode = Storage.readByte(EE_BYTE_GPIO12_MODE);
   gpio12Mode = sanitizeGpio12Mode(storedGpio12Mode);
   requestedGpio12Mode = gpio12Mode;
+  fmSeekSensitivity = Storage.readByte(EE_BYTE_FM_SEEK_SENSITIVITY);
   if (storedGpio12Mode != gpio12Mode) {
-    EEPROM.writeByte(EE_BYTE_GPIO12_MODE, gpio12Mode);
+    Storage.writeByte(EE_BYTE_GPIO12_MODE, gpio12Mode);
     MarkEepromDirty();
   }
-  EEPROM.get(EE_UINT16_FM_FREQUENCY, fmfreq);
+  bool correctedSetting = false;
+  auto correctByte = [&](int address, byte& value, byte fallback,
+                         bool valid) {
+    if (valid) return;
+    value = fallback;
+    Storage.writeByte(address, value);
+    correctedSetting = true;
+  };
+  correctByte(EE_BYTE_LANGUAGE, language, 0, language < 8U);
+  correctByte(EE_BYTE_CONTRASTSET, ContrastSet, 100,
+              ContrastSet >= 1U && ContrastSet <= 100U);
+  correctByte(EE_BYTE_DISPLAYFLIP, displayflip, 0, displayflip <= 1U);
+  correctByte(EE_BYTE_ROTARYMODE, rotarymode, 0, rotarymode <= 1U);
+  correctByte(EE_BYTE_TUNEMODE, tunemode, TUNE_MAN, tunemode <= TUNE_MEM);
+  correctByte(EE_BYTE_UNIT, unit, 0, unit < 3U);
+  correctByte(EE_BYTE_DABFREQ, dabfreq, 0, dabfreq < 38U);
+  correctByte(EE_BYTE_VOLUME, volume, 62, volume <= 62U);
+  correctByte(EE_BYTE_MEMORYPOS, memorypos, 0, memorypos < EE_PRESETS_CNT);
+  if (Storage.readByte(EE_BYTE_AUTOSLIDESHOW) > 1U) {
+    autoslideshow = false;
+    Storage.writeByte(EE_BYTE_AUTOSLIDESHOW, 0);
+    correctedSetting = true;
+  }
+  const bool validTot = tot == 0U || tot == 15U || tot == 30U ||
+                        tot == 60U || tot == 90U;
+  correctByte(EE_BYTE_TOT, tot, 0, validTot);
+  correctByte(EE_BYTE_THEME, CurrentTheme, 0,
+              CurrentTheme < sizeof(Theme) / sizeof(Theme[0]));
+  correctByte(EE_BYTE_FM_SEEK_SENSITIVITY, fmSeekSensitivity, 1,
+              fmSeekSensitivity <= 2U);
+  if (storedRadioMode > RADIO_MODE_FM) {
+    Storage.writeByte(EE_BYTE_RADIO_MODE, RADIO_MODE_DAB);
+    correctedSetting = true;
+  }
+  if (storedFmRegion != fmRegion) {
+    Storage.writeByte(EE_BYTE_FM_REGION, fmRegion);
+    correctedSetting = true;
+  }
+  if (correctedSetting) MarkEepromDirty();
+  Storage.get(EE_UINT16_FM_FREQUENCY, fmfreq);
+  const uint16_t storedFmFrequency = fmfreq;
   fmfreq = normalizeFmFrequency(fmfreq, fmRegion);
+  if (fmfreq != storedFmFrequency) {
+    Storage.put(EE_UINT16_FM_FREQUENCY, fmfreq);
+    MarkEepromDirty();
+  }
   radio.setFmRegion(fmRegion, false);
+  radio.setFmSeekSensitivity(fmSeekSensitivity, false);
+  FmStations.load(fmRegion);
+  DabStations.load();
+  fmScanCompleted = Storage.fmScanCompleted(fmRegion);
+  dabScanCompleted = Storage.dabScanCompleted();
   DIAG_PRINTF("[BOOT] settings loaded: mode=%s DAB=%u FM=%u region=%s GPIO12=%s volume=%u theme=%u\n",
                 radioMode == RADIO_MODE_FM ? "FM" : "DAB",
                 dabfreq, fmfreq, fmRegionProfile(fmRegion).menuName,
@@ -1463,7 +1532,7 @@ void setup(void) {
   //   SL + ROTARY        → reset all settings (DefaultSettings) and restart
   if (digitalRead(SLBUTTON) == LOW && digitalRead(ROTARY_BUTTON) == HIGH) {
     if (rotarymode == 0) rotarymode = 1; else rotarymode = 0;
-    EEPROM.writeByte(EE_BYTE_ROTARYMODE, rotarymode);
+    Storage.writeByte(EE_BYTE_ROTARYMODE, rotarymode);
     MarkEepromDirty();
 
     analogWrite(CONTRASTPIN, ContrastSet * 2 + 27);
@@ -1480,7 +1549,7 @@ void setup(void) {
       displayflip = 0;
       tft.setRotation(3);
     }
-    EEPROM.writeByte(EE_BYTE_DISPLAYFLIP, displayflip);
+    Storage.writeByte(EE_BYTE_DISPLAYFLIP, displayflip);
     MarkEepromDirty();
 
     analogWrite(CONTRASTPIN, ContrastSet * 2 + 27);
@@ -1497,7 +1566,7 @@ void setup(void) {
       tftPrint(0, myLanguage[language][10], 155, 70, ActiveColor, ActiveColorSmooth, 28);
       tftPrint(0, myLanguage[language][2], 155, 130, ActiveColor, ActiveColorSmooth, 28);
     } else {
-      tftPrint(0, "EEPROM ERROR", 155, 100, TFT_RED, TFT_DARKGREY, 28);
+      tftPrint(0, "NVS ERROR", 155, 100, TFT_RED, TFT_DARKGREY, 28);
     }
     while (digitalRead(ROTARY_BUTTON) == LOW && digitalRead(SLBUTTON) == LOW);
     if (defaultsSaved) ESP.restart();
@@ -1565,18 +1634,18 @@ void setup(void) {
   } else if (radioMode == RADIO_MODE_FM) {
     if (tunemode == TUNE_MEM) {
       tunemode = TUNE_MAN;
-      EEPROM.writeByte(EE_BYTE_TUNEMODE, tunemode);
+      Storage.writeByte(EE_BYTE_TUNEMODE, tunemode);
       MarkEepromDirty();
     }
     radio.setFmFrequency(fmfreq);
   } else {
     if (tunemode == TUNE_MEM) {
       tunemode = TUNE_MAN;
-      EEPROM.writeByte(EE_BYTE_TUNEMODE, tunemode);
+      Storage.writeByte(EE_BYTE_TUNEMODE, tunemode);
       MarkEepromDirty();
     }
     radio.setFreq(dabfreq);
-    EEPROM.get(EE_UINT32_SERVICEID, _serviceID);
+    Storage.get(EE_UINT32_SERVICEID, _serviceID);
     // Ignore the stored label because it may be stale. SID plus the freshly
     // received service list are authoritative for restoring the station name.
     memset(_serviceName, 0, sizeof(_serviceName));
@@ -1584,9 +1653,11 @@ void setup(void) {
   if (radioMode == RADIO_MODE_DAB && _serviceID != 0) {
     trysetservice = true;
     trysetserviceFreq = dabfreq;
+    trysetserviceComponentValid = false;
   } else {
     trysetservice = false;
     trysetserviceFreq = 0xFF;
+    trysetserviceComponentValid = false;
   }
 
   // GPIO12 role is selected at boot. AUTO never initializes IR.
@@ -1610,6 +1681,8 @@ void setup(void) {
 // Everything else is timer-gated or input-driven and must stay non-blocking.
 void loop(void) {
   ProcessDAB();
+  ProcessFmFullScan();
+  ProcessDabFullScan();
   Communication();
   if (displayreset) ShowTuneModeCurrent();
   displayreset = false;
@@ -1638,7 +1711,7 @@ void loop(void) {
 
   // Manual FM and DAB tuning are both finalised after 250 ms so both modes
   // feel equally responsive. Preset-store commits use a 500 ms debounce.
-  // Encoder interrupts are detached around the EEPROM write below.
+  // Encoder interrupts are detached around the deferred NVS write below.
   const uint32_t tuningDebounceMs =
       (tuning && !store) ? 250UL : 500UL;
   if (millis() - TuningTimer >= tuningDebounceMs) {
@@ -1657,7 +1730,7 @@ void loop(void) {
     } else if (tuning) {
       if (radioMode == RADIO_MODE_FM) {
         radio.setFmFrequency(fmfreq);
-        EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
+        Storage.put(EE_UINT16_FM_FREQUENCY, fmfreq);
         MarkEepromDirty();
       } else {
         radio.setFreq(dabfreq);
@@ -1666,6 +1739,7 @@ void loop(void) {
       if (tunemode == TUNE_MEM) {
         trysetservice = _serviceID != 0;
         trysetserviceFreq = trysetservice ? dabfreq : 0xFF;
+        trysetserviceComponentValid = false;
       }
     }
   }
@@ -1674,7 +1748,7 @@ void loop(void) {
   // after 300 ms without another detent, avoiding a STOP/START pair per step.
   if (dabServiceSelectionPending) {
     if (radioMode != RADIO_MODE_DAB || tuning || seek ||
-        radio.numberofservices == 0) {
+        (!DabGlobalListView && radio.numberofservices == 0)) {
       dabServiceSelectionPending = false;
     } else if (millis() - DabServiceSelectionTimer >=
                DAB_SERVICE_SELECTION_DEBOUNCE_MS) {
@@ -1698,11 +1772,11 @@ void loop(void) {
   // Buttons: Mode and Standby are long-press capable (1 s) and self-check
   // their own pin every iteration. The three other buttons act on the press
   // edge only and use the buttonEdge() helper to one-shot the action.
-  static bool slArmed = true, rotArmed = true, rot2Armed = true;
+  static bool slArmed = true, rot2Armed = true;
   ModeButtonPress();                                                            // self-checks pin (long-press)
   if (!menu && buttonEdge(SLBUTTON, slArmed)) SlideShowButtonPress();
   if (!menu) StandbyButtonPress();                                              // self-checks pin (long-press)
-  if (buttonEdge(ROTARY_BUTTON, rotArmed)) ButtonPress();
+  Rotary1ButtonProcess();
   if (!menu && buttonEdge(ROTARY_BUTTON2, rot2Armed)) Button2Press();
 
   // IR is an input source just like the encoders/buttons. Process it after
@@ -1741,7 +1815,7 @@ void ProcessDAB(void) {
         isFmFrequencyValid(radio.fmFrequency10kHz, fmRegion) &&
         fmfreq != radio.fmFrequency10kHz) {
       fmfreq = radio.fmFrequency10kHz;
-      ShowFreq();
+      if (fmScanState == FmScanState::Idle) ShowFreq();
     } else if (radioMode == RADIO_MODE_DAB &&
                seek && dabfreq != dabfreqold) {
       // DAB AUTO advances one Band-III channel after the previous asynchronous
@@ -1765,6 +1839,7 @@ void ProcessDAB(void) {
                   static_cast<unsigned>(dabfreq));
     trysetservice = false;
     trysetserviceFreq = 0xFF;
+    trysetserviceComponentValid = false;
     memset(_serviceName, 0, sizeof(_serviceName));
   }
 
@@ -1775,13 +1850,16 @@ void ProcessDAB(void) {
     // The frequency-mismatch case was consumed above, so this list belongs to
     // the exact tune request for which the restore was armed.
     for (byte x = 0; x < radio.numberofservices; ++x) {
-      if (_serviceID == radio.service[x].ServiceID) {
+      if (_serviceID == radio.service[x].ServiceID &&
+          (!trysetserviceComponentValid ||
+           trysetserviceComponentId == radio.service[x].CompID)) {
         // Use only the label from the current, validated service list.
         strncpy(_serviceName, radio.service[x].Label, sizeof(_serviceName));
         _serviceName[sizeof(_serviceName) - 1] = '\0';
+        _serviceNameCharset = DabServiceLabelCharset(x);
         radio.setService(x);
         // Startup/MEM restore is already represented by the stored SID/frequency.
-        // Do not schedule a redundant EEPROM write after a successful restore.
+        // Do not schedule a redundant NVS write after a successful restore.
         restored = true;
         DIAG_PRINTF("[DAB/RESTORE] SID=%08X matched service=%u freq=%u\n",
                       static_cast<unsigned>(_serviceID),
@@ -1799,6 +1877,25 @@ void ProcessDAB(void) {
     }
     trysetservice = false;
     trysetserviceFreq = 0xFF;
+    trysetserviceComponentValid = false;
+  }
+
+  // Keep the compact scan progress panel intact while the radio scheduler and
+  // RDS parser continue running underneath it. After completion/cancellation,
+  // restore the normal screen once (immediately or after the result dwell).
+  if (fmScanState != FmScanState::Idle ||
+      dabFullScanState != DabFullScanState::Idle) return;
+  if (fmScanNeedsMainRedraw) {
+    if (static_cast<int32_t>(millis() - fmScanOverlayUntilMs) < 0) return;
+    fmScanNeedsMainRedraw = false;
+    BuildDisplay();
+    return;
+  }
+  if (dabScanNeedsMainRedraw) {
+    if (static_cast<int32_t>(millis() - dabScanOverlayUntilMs) < 0) return;
+    dabScanNeedsMainRedraw = false;
+    BuildDisplay();
+    return;
   }
 
   // A manually armed waiting overlay is not a full-screen slideshow. Keep the
@@ -1941,22 +2038,71 @@ void doRecovery(void) {
 // cursor. This is also used after DABSelectService() moves the cursor, so
 // movement and OK-confirmation share exactly the same start/tune path.
 bool ActivateCurrentService(void) {
-  if (radio.numberofservices == 0 ||
-      radio.ServiceIndex >= radio.numberofservices) {
-    return false;
-  }
-
   if (radioMode == RADIO_MODE_FM) {
-    fmfreq = static_cast<uint16_t>(radio.service[radio.ServiceIndex].CompID);
+    if (FmStations.count() == 0U || FmStationListIndex >= FmStations.count())
+      return false;
+    fmfreq = FmStations[FmStationListIndex].frequency10kHz;
     radio.setFmFrequency(fmfreq);
 
     uint16_t storedFmFrequency = 0;
-    EEPROM.get(EE_UINT16_FM_FREQUENCY, storedFmFrequency);
+    Storage.get(EE_UINT16_FM_FREQUENCY, storedFmFrequency);
     if (storedFmFrequency != fmfreq) {
-      EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
+      Storage.put(EE_UINT16_FM_FREQUENCY, fmfreq);
       MarkEepromDirty();
     }
     return true;
+  }
+
+  if (DabGlobalListView) {
+    if (DabStations.count() == 0U ||
+        DabStationListIndex >= DabStations.count()) return false;
+    const DabStationRecord& station = DabStations[DabStationListIndex];
+    const bool sameChannel = dabfreq == station.channelIndex;
+    dabfreq = station.channelIndex;
+    _serviceID = station.serviceId;
+    strncpy(_serviceName, station.label, sizeof(_serviceName) - 1U);
+    _serviceName[sizeof(_serviceName) - 1U] = '\0';
+    _serviceNameCharset = station.charset;
+
+    // Do not retune the multiplex when the exact scanned component is already
+    // present in the live list. This makes adjacent stations in one mux switch
+    // like normal services and avoids throwing away a valid list unnecessarily.
+    if (sameChannel && radio.isDabServiceListReady()) {
+      for (uint8_t i = 0; i < radio.numberofservices; ++i) {
+        if (radio.service[i].ServiceID == station.serviceId &&
+            radio.service[i].CompID == station.componentId) {
+          radio.ServiceIndex = i;
+          strncpy(_serviceName, radio.service[i].Label,
+                  sizeof(_serviceName) - 1U);
+          _serviceName[sizeof(_serviceName) - 1U] = '\0';
+          _serviceNameCharset = DabServiceLabelCharset(i);
+          trysetservice = false;
+          trysetserviceFreq = 0xFF;
+          trysetserviceComponentValid = false;
+          radio.setService(i);
+          Storage.writeByte(EE_BYTE_DABFREQ, dabfreq);
+          Storage.put(EE_UINT32_SERVICEID, _serviceID);
+          MarkEepromDirty();
+          return true;
+        }
+      }
+    }
+
+    radio.ServiceStart = false;
+    trysetservice = true;
+    trysetserviceFreq = dabfreq;
+    trysetserviceComponentId = station.componentId;
+    trysetserviceComponentValid = true;
+    radio.setFreq(dabfreq);
+    Storage.writeByte(EE_BYTE_DABFREQ, dabfreq);
+    Storage.put(EE_UINT32_SERVICEID, _serviceID);
+    MarkEepromDirty();
+    return true;
+  }
+
+  if (radio.numberofservices == 0 ||
+      radio.ServiceIndex >= radio.numberofservices) {
+    return false;
   }
 
   const uint8_t serviceType = radio.service[radio.ServiceIndex].ServiceType;
@@ -1969,9 +2115,41 @@ bool ActivateCurrentService(void) {
   strncpy(_serviceName, radio.service[radio.ServiceIndex].Label,
           sizeof(_serviceName));
   _serviceName[sizeof(_serviceName) - 1] = '\0';
+  _serviceNameCharset = DabServiceLabelCharset(radio.ServiceIndex);
+  trysetserviceComponentValid = false;
   radio.setService(radio.ServiceIndex);
   store = true;
   return true;
+}
+
+uint8_t ChannelListCount(void) {
+  if (radioMode == RADIO_MODE_FM) return FmStations.count();
+  return DabGlobalListView ? DabStations.count() : radio.numberofservices;
+}
+
+uint8_t ChannelListIndex(void) {
+  if (radioMode == RADIO_MODE_FM) return FmStationListIndex;
+  return DabGlobalListView ? DabStationListIndex : radio.ServiceIndex;
+}
+
+void MoveChannelList(bool forward) {
+  const uint8_t count = ChannelListCount();
+  if (count == 0U) return;
+  if (radioMode == RADIO_MODE_FM) {
+    FmStationListIndex = forward
+        ? static_cast<uint8_t>((FmStationListIndex + 1U) % count)
+        : static_cast<uint8_t>(FmStationListIndex == 0U
+                                   ? count - 1U : FmStationListIndex - 1U);
+    return;
+  }
+  if (DabGlobalListView) {
+    DabStationListIndex = forward
+        ? static_cast<uint8_t>((DabStationListIndex + 1U) % count)
+        : static_cast<uint8_t>(DabStationListIndex == 0U
+                                   ? count - 1U : DabStationListIndex - 1U);
+    return;
+  }
+  DABSelectService(forward);
 }
 
 // Step through the ensemble's services, skipping anything that isn't a
@@ -2013,6 +2191,14 @@ void DABSelectService(bool dir) {
            radio.service[radio.ServiceIndex].ServiceType != 0x04 &&
            radio.service[radio.ServiceIndex].ServiceType != 0x05);
 
+  // Publish the target label immediately. setService() is deliberately
+  // debounced, but the UI must not fall back to a permanent "Select service"
+  // while the selected row is already known.
+  strncpy(_serviceName, radio.service[radio.ServiceIndex].Label,
+          sizeof(_serviceName) - 1U);
+  _serviceName[sizeof(_serviceName) - 1U] = '\0';
+  _serviceNameCharset = DabServiceLabelCharset(radio.ServiceIndex);
+  trysetserviceComponentValid = false;
   dabServiceSelectionPending = true;
   DabServiceSelectionTimer = millis();
 }
@@ -2065,9 +2251,9 @@ bool StoreFrequency(void) {
   if (radioMode == RADIO_MODE_FM) {
     fmfreq = radio.fmFrequency10kHz;
     uint16_t storedFmFrequency = 0;
-    EEPROM.get(EE_UINT16_FM_FREQUENCY, storedFmFrequency);
+    Storage.get(EE_UINT16_FM_FREQUENCY, storedFmFrequency);
     if (storedFmFrequency != fmfreq) {
-      EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
+      Storage.put(EE_UINT16_FM_FREQUENCY, fmfreq);
       MarkEepromDirty();
     }
     return true;
@@ -2079,7 +2265,7 @@ bool StoreFrequency(void) {
   if (!radio.ServiceStart || !radio.isDabServiceListReady() ||
       radio.numberofservices == 0 ||
       radio.ServiceIndex >= radio.numberofservices) {
-    DIAG_PRINTF("[EEPROM] DAB store skipped: started=%u list=%u count=%u index=%u\n",
+    DIAG_PRINTF("[NVS] DAB store skipped: started=%u list=%u count=%u index=%u\n",
                   radio.ServiceStart ? 1U : 0U,
                   radio.isDabServiceListReady() ? 1U : 0U,
                   static_cast<unsigned>(radio.numberofservices),
@@ -2089,19 +2275,19 @@ bool StoreFrequency(void) {
 
   const uint32_t serviceId = radio.service[radio.ServiceIndex].ServiceID;
   if (serviceId == 0U) {
-    DIAG_PRINTLN("[EEPROM] DAB store skipped: invalid service ID 0");
+    DIAG_PRINTLN("[NVS] DAB store skipped: invalid service ID 0");
     return false;
   }
 
   bool changed = false;
   uint32_t storedServiceId = 0;
-  EEPROM.get(EE_UINT32_SERVICEID, storedServiceId);
+  Storage.get(EE_UINT32_SERVICEID, storedServiceId);
   if (storedServiceId != serviceId) {
-    EEPROM.put(EE_UINT32_SERVICEID, serviceId);
+    Storage.put(EE_UINT32_SERVICEID, serviceId);
     changed = true;
   }
-  if (EEPROM.readByte(EE_BYTE_DABFREQ) != dabfreq) {
-    EEPROM.writeByte(EE_BYTE_DABFREQ, dabfreq);
+  if (Storage.readByte(EE_BYTE_DABFREQ) != dabfreq) {
+    Storage.writeByte(EE_BYTE_DABFREQ, dabfreq);
     changed = true;
   }
 
@@ -2113,10 +2299,335 @@ bool StoreFrequency(void) {
   return true;
 }
 
+void CancelFmFullScan(void) {
+  if (fmScanState == FmScanState::Idle) return;
+  fmScanState = FmScanState::Idle;
+  fmScanSeekCount = 0;
+  // The previous completed list remains in NVS until a new scan finishes.
+  // Restore it after cancellation instead of keeping a second 1.2 KiB RAM copy.
+  FmStations.load(fmRegion);
+  FmStationListIndex = 0;
+  fmScanOverlayUntilMs = 0;
+  fmScanNeedsMainRedraw = true;
+  DIAG_PRINTLN("[FM/SCAN] cancelled");
+}
+
+void StartFmFullScan(void) {
+  if (radioMode != RADIO_MODE_FM || fmScanState != FmScanState::Idle) return;
+  seek = false;
+  fmSeekStarted = false;
+  tuning = false;
+  FmStations.clear(fmRegion);
+  fmScanFirstFrequency = 0;
+  fmScanCandidateFrequency = 0;
+  fmScanSeekCount = 0;
+  fmScanNeedsMainRedraw = false;
+  // Start at the upper edge so the first wrapped upward seek includes the
+  // complete band, including a possible station at the lower edge.
+  fmfreq = radio.fmProfile().maxFrequency10kHz;
+  radio.setFmFrequency(fmfreq);
+  fmScanDeadlineMs = millis() + 4000UL;
+  fmScanState = FmScanState::WaitBandStart;
+  char initialStatus[24];
+  snprintf(initialStatus, sizeof(initialStatus), "%s 0", fmScanText[language]);
+  ShowScanProgressOverlay(initialStatus, 0);
+  DIAG_PRINTF("[FM/SCAN] start region=%s range=%u..%u\n",
+              radio.fmProfile().menuName,
+              static_cast<unsigned>(radio.fmProfile().minFrequency10kHz),
+              static_cast<unsigned>(radio.fmProfile().maxFrequency10kHz));
+}
+
+static void FinishFmFullScan(void) {
+  FmStationListIndex = 0;
+  const bool saved = FmStations.save();
+  if (!saved) FmStations.load(fmRegion);
+  fmScanCompleted = Storage.fmScanCompleted(fmRegion);
+  fmScanState = FmScanState::Idle;
+  fmfreq = radio.fmFrequency10kHz;
+  char status[32];
+  snprintf(status, sizeof(status), "%s %u %s", fmScanText[language],
+           static_cast<unsigned>(FmStations.count()), saved ? "OK" : "NVS ERR");
+  ShowScanProgressOverlay(status, 100);
+  fmScanOverlayUntilMs = millis() + 1500UL;
+  fmScanNeedsMainRedraw = true;
+  DIAG_PRINTF("[FM/SCAN] complete count=%u saved=%u\n",
+              static_cast<unsigned>(FmStations.count()), saved ? 1U : 0U);
+}
+
+void ProcessFmFullScan(void) {
+  if (fmScanState == FmScanState::Idle) return;
+  if (radioMode != RADIO_MODE_FM) {
+    CancelFmFullScan();
+    return;
+  }
+  const uint32_t now = millis();
+  switch (fmScanState) {
+    case FmScanState::Idle:
+      return;
+    case FmScanState::WaitBandStart:
+      if (radio.isTunePending() &&
+          static_cast<int32_t>(now - fmScanDeadlineMs) < 0) return;
+      fmScanState = FmScanState::StartSeek;
+      return;
+    case FmScanState::StartSeek:
+      if (radio.startFmSeek(true)) {
+        ++fmScanSeekCount;
+        fmScanDeadlineMs = now + 13000UL;
+        fmScanState = FmScanState::WaitSeek;
+      } else if (fmScanSeekCount > 220U) {
+        FinishFmFullScan();
+      }
+      return;
+    case FmScanState::WaitSeek:
+      if (radio.isTunePending() &&
+          static_cast<int32_t>(now - fmScanDeadlineMs) < 0) return;
+      if (!radio.fmValid || !radio.signallock ||
+          !isFmFrequencyValid(radio.fmFrequency10kHz, fmRegion)) {
+        // A wrapped hardware seek already examined the whole configured band.
+        FinishFmFullScan();
+        return;
+      }
+      fmScanCandidateFrequency = radio.fmFrequency10kHz;
+      if (fmScanFirstFrequency == 0U) {
+        fmScanFirstFrequency = fmScanCandidateFrequency;
+      } else if (fmScanCandidateFrequency == fmScanFirstFrequency) {
+        FinishFmFullScan();
+        return;
+      }
+      fmScanDeadlineMs = now + 2200UL;
+      fmScanState = FmScanState::RdsDwell;
+      {
+        const FmRegionProfile& profile = radio.fmProfile();
+        const uint32_t span = profile.maxFrequency10kHz -
+                              profile.minFrequency10kHz;
+        const uint8_t percent = span == 0U ? 0U : static_cast<uint8_t>(
+            (static_cast<uint32_t>(fmScanCandidateFrequency -
+                                   profile.minFrequency10kHz) * 100U) / span);
+        char progress[28];
+        snprintf(progress, sizeof(progress), "%s %u RDS", fmScanText[language],
+                 static_cast<unsigned>(FmStations.count()));
+        ShowScanProgressOverlay(progress, percent);
+      }
+      return;
+    case FmScanState::RdsDwell:
+      if (static_cast<int32_t>(now - fmScanDeadlineMs) < 0 &&
+          !radio.isFmPsStable()) return;
+      {
+        FmStationRecord station{};
+        station.frequency10kHz = fmScanCandidateFrequency;
+        station.pi = radio.fmPi;
+        if (radio.isFmPsStable())
+          strncpy(station.ps, radio.fmPs, sizeof(station.ps) - 1U);
+        station.rssi = radio.fmRssi;
+        station.snr = radio.fmSnr;
+        station.multipath = radio.fmMultipath;
+        station.pty = radio.fmPty;
+        const bool added = FmStations.add(station);
+        DIAG_PRINTF("[FM/SCAN] found freq=%u PI=%04X PS='%s' RSSI=%d SNR=%d add=%u\n",
+                    static_cast<unsigned>(station.frequency10kHz),
+                    static_cast<unsigned>(station.pi), station.ps,
+                    static_cast<int>(station.rssi), static_cast<int>(station.snr),
+                    added ? 1U : 0U);
+        char progress[24];
+        snprintf(progress, sizeof(progress), "%s %u", fmScanText[language],
+                 static_cast<unsigned>(FmStations.count()));
+        const FmRegionProfile& profile = radio.fmProfile();
+        const uint32_t span = profile.maxFrequency10kHz -
+                              profile.minFrequency10kHz;
+        const uint8_t percent = span == 0U ? 0U : static_cast<uint8_t>(
+            (static_cast<uint32_t>(fmScanCandidateFrequency -
+                                   profile.minFrequency10kHz) * 100U) / span);
+        ShowScanProgressOverlay(progress, percent);
+      }
+      if (fmScanSeekCount >= 220U) FinishFmFullScan();
+      else fmScanState = FmScanState::StartSeek;
+      return;
+  }
+}
+
+static void RestoreAfterDabFullScan(void) {
+  dabfreq = dabScanRestoreChannel;
+  _serviceID = dabScanRestoreServiceId;
+  memset(_serviceName, 0, sizeof(_serviceName));
+  trysetservice = _serviceID != 0U;
+  trysetserviceFreq = trysetservice ? dabfreq : 0xFF;
+  trysetserviceComponentValid = false;
+  radio.setFreq(dabfreq);
+}
+
+static void FinishDabFullScan(void) {
+  DabStationListIndex = 0;
+  const bool saved = DabStations.save();
+  if (!saved) DabStations.load();
+  dabScanCompleted = Storage.dabScanCompleted();
+  dabFullScanState = DabFullScanState::Idle;
+  RestoreAfterDabFullScan();
+  char status[32];
+  snprintf(status, sizeof(status), "%s %u %s", dabScanText[language],
+           static_cast<unsigned>(DabStations.count()),
+           saved ? "OK" : "NVS ERR");
+  ShowScanProgressOverlay(status, 100);
+  dabScanOverlayUntilMs = millis() + 1500UL;
+  dabScanNeedsMainRedraw = true;
+  DIAG_PRINTF("[DAB/SCAN] complete count=%u saved=%u\n",
+              static_cast<unsigned>(DabStations.count()), saved ? 1U : 0U);
+}
+
+void CancelDabFullScan(void) {
+  if (dabFullScanState == DabFullScanState::Idle) return;
+  dabFullScanState = DabFullScanState::Idle;
+  dabScanChannelsTried = 0;
+  // As with FM, NVS is the rollback copy while scanning. This avoids a second
+  // 1.8 KiB list in static RAM during boot and font allocation.
+  DabStations.load();
+  DabStationListIndex = 0;
+  RestoreAfterDabFullScan();
+  dabScanOverlayUntilMs = 0;
+  dabScanNeedsMainRedraw = true;
+  DIAG_PRINTLN("[DAB/SCAN] cancelled; previous service restored");
+}
+
+void StartDabFullScan(void) {
+  if (radioMode != RADIO_MODE_DAB ||
+      dabFullScanState != DabFullScanState::Idle) return;
+  seek = false;
+  CancelDabAuto();
+  tuning = false;
+  dabServiceSelectionPending = false;
+  dabScanRestoreChannel = dabfreq;
+  dabScanRestoreServiceId = radio.ServiceStart &&
+      radio.ServiceIndex < radio.numberofservices
+      ? radio.service[radio.ServiceIndex].ServiceID : _serviceID;
+  trysetservice = false;
+  trysetserviceFreq = 0xFF;
+  trysetserviceComponentValid = false;
+  DabStations.clear();
+  dabScanChannel = 0;
+  dabScanChannelsTried = 0;
+  dabScanNeedsMainRedraw = false;
+  dabFullScanState = DabFullScanState::TuneChannel;
+  ShowScanProgressOverlay(dabScanText[language], 0);
+  DIAG_PRINTLN("[DAB/SCAN] start Band III 5A..13F");
+}
+
+void ProcessDabFullScan(void) {
+  if (dabFullScanState == DabFullScanState::Idle) return;
+  if (radioMode != RADIO_MODE_DAB) {
+    CancelDabFullScan();
+    return;
+  }
+  const uint32_t now = millis();
+  switch (dabFullScanState) {
+    case DabFullScanState::Idle:
+      return;
+
+    case DabFullScanState::TuneChannel: {
+      if (dabScanChannelsTried >= 38U) {
+        FinishDabFullScan();
+        return;
+      }
+      dabfreq = dabScanChannel;
+      radio.ServiceIndex = 0;
+      radio.ServiceStart = false;
+      memset(_serviceName, 0, sizeof(_serviceName));
+      radio.setFreq(dabfreq);
+      ++dabScanChannelsTried;
+      dabScanDeadlineMs = now + 6000UL;
+      dabFullScanState = DabFullScanState::WaitTune;
+      char progress[32];
+      snprintf(progress, sizeof(progress), "%s %u/38 %s",
+               dabScanText[language],
+               static_cast<unsigned>(dabScanChannelsTried),
+               radio.getChannel(dabfreq));
+      ShowScanProgressOverlay(
+          progress,
+          static_cast<uint8_t>((dabScanChannelsTried * 100U) / 38U));
+      return;
+    }
+
+    case DabFullScanState::WaitTune:
+      if (radio.isTunePending() &&
+          static_cast<int32_t>(now - dabScanDeadlineMs) < 0) return;
+      if (!radio.signallock) {
+        dabScanChannel = fm_features::nextDabChannel(dabScanChannel, true);
+        dabFullScanState = DabFullScanState::TuneChannel;
+        return;
+      }
+      dabScanDeadlineMs = now + 8000UL;
+      dabFullScanState = DabFullScanState::WaitServiceList;
+      return;
+
+    case DabFullScanState::WaitServiceList:
+      if (!radio.signallock ||
+          static_cast<int32_t>(now - dabScanDeadlineMs) >= 0) {
+        dabScanChannel = fm_features::nextDabChannel(dabScanChannel, true);
+        dabFullScanState = DabFullScanState::TuneChannel;
+        return;
+      }
+      if (!radio.isDabServiceListReady()) return;
+      dabScanDeadlineMs = now + 12000UL;
+      dabFullScanState = DabFullScanState::WaitServiceTypes;
+      return;
+
+    case DabFullScanState::WaitServiceTypes:
+      if (!radio.signallock ||
+          static_cast<int32_t>(now - dabScanDeadlineMs) >= 0) {
+        dabScanChannel = fm_features::nextDabChannel(dabScanChannel, true);
+        dabFullScanState = DabFullScanState::TuneChannel;
+        return;
+      }
+      if (!radio.isDabServiceMetadataReady()) return;
+      for (uint8_t i = 0; i < radio.numberofservices; ++i) {
+        if (!fm_features::isAudioServiceType(radio.service[i].ServiceType))
+          continue;
+        DabStationRecord station{};
+        station.channelIndex = dabfreq;
+        station.serviceId = radio.service[i].ServiceID;
+        station.componentId = radio.service[i].CompID;
+        strncpy(station.label, radio.service[i].Label,
+                sizeof(station.label) - 1U);
+        station.charset = DabServiceLabelCharset(i);
+        station.serviceType = radio.service[i].ServiceType;
+        DabStations.add(station);
+      }
+      dabScanChannel = fm_features::nextDabChannel(dabScanChannel, true);
+      dabFullScanState = DabFullScanState::TuneChannel;
+      return;
+  }
+}
+
+void Rotary1ButtonProcess(void) {
+  static fm_features::PressTracker tracker;
+  const uint8_t action = tracker.update(
+      digitalRead(ROTARY_BUTTON) == LOW, millis(), 1000UL);
+  if (action == 1U) {
+    ButtonPress();
+    return;
+  }
+  if (action != 2U) return;
+  tottimer = millis();
+  if (menu || ChannelListView || SlideShowView || ShowServiceInformation ||
+      fmScanState != FmScanState::Idle ||
+      dabFullScanState != DabFullScanState::Idle) return;
+  if (radioMode == RADIO_MODE_FM) {
+    StartFmFullScan();
+  } else {
+    StartDabFullScan();
+  }
+}
+
 // Rotary 1 click: stores/recalls a memory preset when in TUNE_MEM, toggles
 // the channel-list view otherwise, or routes to DoMenu() when the menu is open.
 void ButtonPress(void) {
   tottimer = millis();
+  if (fmScanState != FmScanState::Idle) {
+    CancelFmFullScan();
+    return;
+  }
+  if (dabFullScanState != DabFullScanState::Idle) {
+    CancelDabFullScan();
+    return;
+  }
   if (!menu) {
     if (tunemode == TUNE_MEM) {
       if (!memorystore) {
@@ -2135,30 +2646,30 @@ void ButtonPress(void) {
           if (fmMemory[memorypos].Label[0] == '\0')
             snprintf(fmMemory[memorypos].Label,
                      sizeof(fmMemory[memorypos].Label), "%.1f", fmfreq / 100.0f);
-          EEPROM.put(EE_FM_PRESETS_FREQ_START + memorypos * 2,
+          Storage.put(EE_FM_PRESETS_FREQ_START + memorypos * 2,
                      fmMemory[memorypos].Frequency10kHz);
-          EEPROM.put(EE_FM_PRESETS_PI_START + memorypos * 2,
+          Storage.put(EE_FM_PRESETS_PI_START + memorypos * 2,
                      fmMemory[memorypos].ProgramId);
           for (int x = 0; x < EE_FM_PRESET_NAME_LENGTH; ++x)
-            EEPROM.writeByte(EE_FM_PRESETS_NAME_START +
+            Storage.writeByte(EE_FM_PRESETS_NAME_START +
                                  memorypos * EE_FM_PRESET_NAME_LENGTH + x,
                              fmMemory[memorypos].Label[x]);
           LoadPresets();
         } else {
-          EEPROM.writeByte(memorypos + EE_PRESETS_FREQ_START, dabfreq);
-          EEPROM.put((memorypos * 8) + EE_PRESETS_SERVICEID_START, radio.service[radio.ServiceIndex].ServiceID);
+          Storage.writeByte(memorypos + EE_PRESETS_FREQ_START, dabfreq);
+          Storage.put((memorypos * 8) + EE_PRESETS_SERVICEID_START, radio.service[radio.ServiceIndex].ServiceID);
           for (int x = 0; x < 16; x++) {
             char character = radio.service[radio.ServiceIndex].Label[x];
-            EEPROM.writeByte((memorypos * 17) + x + EE_PRESETS_NAME_START, character);
+            Storage.writeByte((memorypos * 17) + x + EE_PRESETS_NAME_START, character);
             memory[memorypos].Label[x] = character;
           }
-          EEPROM.writeByte((memorypos * 17) + 16 + EE_PRESETS_NAME_START, '\0');
+          Storage.writeByte((memorypos * 17) + 16 + EE_PRESETS_NAME_START, '\0');
           memory[memorypos].Label[16] = '\0';
           memory[memorypos].Channel = dabfreq;
           memory[memorypos].ServiceID = radio.service[radio.ServiceIndex].ServiceID;
         }
-        if (EEPROM.readByte(EE_BYTE_MEMORYPOS) != memorypos)
-          EEPROM.writeByte(EE_BYTE_MEMORYPOS, memorypos);
+        if (Storage.readByte(EE_BYTE_MEMORYPOS) != memorypos)
+          Storage.writeByte(EE_BYTE_MEMORYPOS, memorypos);
         MarkEepromDirty();
 
         ShowTuneModeCurrent();
@@ -2169,6 +2680,15 @@ void ButtonPress(void) {
       }
     } else {
       if (ChannelListView) {
+        // An empty global list doubles as the scan offer. A second OK starts
+        // the appropriate non-blocking scan; MODE still returns without it.
+        if (ChannelListCount() == 0U) {
+          ChannelListView = false;
+          DabGlobalListView = false;
+          if (radioMode == RADIO_MODE_FM) StartFmFullScan();
+          else StartDabFullScan();
+          return;
+        }
         // OK confirms the row that is already highlighted. Previously OK only
         // closed the list, so the initial highlighted row was not started until
         // the user moved away and back (movement calls DABSelectService()).
@@ -2178,6 +2698,10 @@ void ButtonPress(void) {
       } else if (SlideShowView || ShowServiceInformation) {
         BuildDisplay();
       } else {
+        // DAB Channel List is always the global scan database. Local mux
+        // services remain live and selectable with Rotary 2, but are never
+        // silently substituted for a not-yet-created global list.
+        DabGlobalListView = radioMode == RADIO_MODE_DAB;
         ChannelListView = true;
         BuildChannelList();
       }
@@ -2263,6 +2787,9 @@ void ModeButtonPress(void) {
     actionDone = false;
     tottimer = pressStart;
     seek = false;
+    CancelFmFullScan();
+    CancelDabFullScan();
+    CancelDabAuto();
     dabSeekStarted = false;
     fmSeekStarted = false;
 
@@ -2333,15 +2860,15 @@ void StandbyButtonPress(void) {
 
       if (memorystore) {
       if (radioMode == RADIO_MODE_FM) {
-        EEPROM.put(EE_FM_PRESETS_FREQ_START + memorypos * 2,
+        Storage.put(EE_FM_PRESETS_FREQ_START + memorypos * 2,
                    static_cast<uint16_t>(EE_FM_PRESET_EMPTY_FREQUENCY));
-        EEPROM.put(EE_FM_PRESETS_PI_START + memorypos * 2,
+        Storage.put(EE_FM_PRESETS_PI_START + memorypos * 2,
                    static_cast<uint16_t>(0));
-        for (int x = 0; x < EE_FM_PRESET_NAME_LENGTH; ++x) EEPROM.writeByte(EE_FM_PRESETS_NAME_START + memorypos * EE_FM_PRESET_NAME_LENGTH + x, '\0');
+        for (int x = 0; x < EE_FM_PRESET_NAME_LENGTH; ++x) Storage.writeByte(EE_FM_PRESETS_NAME_START + memorypos * EE_FM_PRESET_NAME_LENGTH + x, '\0');
       } else {
-        EEPROM.writeByte(memorypos + EE_PRESETS_FREQ_START, EE_PRESETS_FREQUENCY);
-        EEPROM.put((memorypos * 8) + EE_PRESETS_SERVICEID_START, 0);
-        for (int x = 0; x < 17; x++) EEPROM.writeByte((memorypos * 17) + x + EE_PRESETS_NAME_START, '\0');
+        Storage.writeByte(memorypos + EE_PRESETS_FREQ_START, EE_PRESETS_FREQUENCY);
+        Storage.put((memorypos * 8) + EE_PRESETS_SERVICEID_START, 0);
+        for (int x = 0; x < 17; x++) Storage.writeByte((memorypos * 17) + x + EE_PRESETS_NAME_START, '\0');
       }
       if (radioMode == RADIO_MODE_FM) {
         memset(fmMemory[memorypos].Label, 0, sizeof(fmMemory[memorypos].Label));
@@ -2378,6 +2905,8 @@ void StandbyButtonPress(void) {
 //   TUNE_MAN/AUTO  → next frequency
 //   TUNE_MEM       → next preset
 void KeyUp(void) {
+  if (fmScanState != FmScanState::Idle) CancelFmFullScan();
+  if (dabFullScanState != DabFullScanState::Idle) CancelDabFullScan();
   if (setvolume) closeVolume();
   tottimer = millis();
   rotary = 0;
@@ -2413,15 +2942,7 @@ void KeyUp(void) {
           break;
 
         case TUNE_AUTO:
-          radio.ServiceIndex = 0;
-          radio.ServiceStart = false;
-          if (radioMode == RADIO_MODE_DAB) {
-            radio.clearData();
-            // Do not let the previous service label survive a new AUTO scan.
-            // ProcessDAB also cancels any restore whose armed frequency no
-            // longer matches this newly selected channel.
-            memset(_serviceName, 0, sizeof(_serviceName));
-          }
+          if (radioMode == RADIO_MODE_DAB) CancelDabAuto();
           direction = true;
           seek = true;
           break;
@@ -2450,30 +2971,30 @@ void KeyUp(void) {
     } else {
       byte y = 0;
       byte y_old = 0;
-      if (radio.ServiceIndex > 8 && radio.ServiceIndex < 17) {
+      const uint8_t oldIndex = ChannelListIndex();
+      if (oldIndex > 8 && oldIndex < 17) {
         y_old = 9;
-      } else if (radio.ServiceIndex > 16 && radio.ServiceIndex < 25) {
-        y_old = 17;
-      } else if (radio.ServiceIndex > 24) {
-        y_old = 25;
+      } else if (oldIndex > 16) {
+        y_old = static_cast<uint8_t>(17 + ((oldIndex - 17) / 8) * 8);
       }
 
-      ShowOneLine(20 * (radio.ServiceIndex - y_old), radio.ServiceIndex, false);
+      if (ChannelListCount() > 0)
+        ShowOneLine(20 * (oldIndex - y_old), oldIndex, false);
 
-      if (radio.numberofservices > 0) DABSelectService(1);
+      MoveChannelList(true);
 
-      if (radio.ServiceIndex > 8 && radio.ServiceIndex < 17) {
+      const uint8_t newIndex = ChannelListIndex();
+      if (newIndex > 8 && newIndex < 17) {
         y = 9;
-      } else if (radio.ServiceIndex > 16 && radio.ServiceIndex < 25) {
-        y = 17;
-      } else if (radio.ServiceIndex > 24) {
-        y = 25;
+      } else if (newIndex > 16) {
+        y = static_cast<uint8_t>(17 + ((newIndex - 17) / 8) * 8);
       }
 
       if (y_old != y) {
         BuildChannelList();
       } else {
-        ShowOneLine(20 * (radio.ServiceIndex - y), radio.ServiceIndex, true);
+        if (ChannelListCount() > 0)
+          ShowOneLine(20 * (newIndex - y), newIndex, true);
       }
     }
   } else {
@@ -2483,6 +3004,8 @@ void KeyUp(void) {
 
 // Rotary 1 turn downwards. Mirror of KeyUp() — see that function for context map.
 void KeyDown(void) {
+  if (fmScanState != FmScanState::Idle) CancelFmFullScan();
+  if (dabFullScanState != DabFullScanState::Idle) CancelDabFullScan();
   if (setvolume) closeVolume();
   tottimer = millis();
   rotary = 0;
@@ -2517,14 +3040,7 @@ void KeyDown(void) {
           break;
 
         case TUNE_AUTO:
-          radio.ServiceIndex = 0;
-          radio.ServiceStart = false;
-          if (radioMode == RADIO_MODE_DAB) {
-            radio.clearData();
-            // Mirror KeyUp(): clear the stale visible label; ProcessDAB cancels
-            // a restore as soon as the selected DAB frequency changes.
-            memset(_serviceName, 0, sizeof(_serviceName));
-          }
+          if (radioMode == RADIO_MODE_DAB) CancelDabAuto();
           direction = false;
           seek = true;
           break;
@@ -2553,30 +3069,30 @@ void KeyDown(void) {
     } else {
       byte y = 0;
       byte y_old = 0;
-      if (radio.ServiceIndex > 8 && radio.ServiceIndex < 17) {
+      const uint8_t oldIndex = ChannelListIndex();
+      if (oldIndex > 8 && oldIndex < 17) {
         y_old = 9;
-      } else if (radio.ServiceIndex > 16 && radio.ServiceIndex < 25) {
-        y_old = 17;
-      } else if (radio.ServiceIndex > 24) {
-        y_old = 25;
+      } else if (oldIndex > 16) {
+        y_old = static_cast<uint8_t>(17 + ((oldIndex - 17) / 8) * 8);
       }
 
-      ShowOneLine(20 * (radio.ServiceIndex - y_old), radio.ServiceIndex, false);
+      if (ChannelListCount() > 0)
+        ShowOneLine(20 * (oldIndex - y_old), oldIndex, false);
 
-      if (radio.numberofservices > 0) DABSelectService(0);
+      MoveChannelList(false);
 
-      if (radio.ServiceIndex > 8 && radio.ServiceIndex < 17) {
+      const uint8_t newIndex = ChannelListIndex();
+      if (newIndex > 8 && newIndex < 17) {
         y = 9;
-      } else if (radio.ServiceIndex > 16 && radio.ServiceIndex < 25) {
-        y = 17;
-      } else if (radio.ServiceIndex > 24) {
-        y = 25;
+      } else if (newIndex > 16) {
+        y = static_cast<uint8_t>(17 + ((newIndex - 17) / 8) * 8);
       }
 
       if (y_old != y) {
         BuildChannelList();
       } else {
-        ShowOneLine(20 * (radio.ServiceIndex - y), radio.ServiceIndex, true);
+        if (ChannelListCount() > 0)
+          ShowOneLine(20 * (newIndex - y), newIndex, true);
       }
     }
   } else {
@@ -2584,9 +3100,86 @@ void KeyDown(void) {
   }
 }
 
+static void SelectAdjacentFmScanStation(bool forward) {
+  const uint8_t count = FmStations.count();
+  if (count == 0U) return;
+
+  bool exact = false;
+  for (uint8_t i = 0; i < count; ++i) {
+    if (FmStations[i].frequency10kHz == fmfreq) {
+      FmStationListIndex = i;
+      exact = true;
+      break;
+    }
+  }
+
+  if (exact) {
+    FmStationListIndex = forward
+        ? static_cast<uint8_t>((FmStationListIndex + 1U) % count)
+        : static_cast<uint8_t>(FmStationListIndex == 0U
+                                   ? count - 1U : FmStationListIndex - 1U);
+  } else if (forward) {
+    FmStationListIndex = 0;
+    for (uint8_t i = 0; i < count; ++i) {
+      if (FmStations[i].frequency10kHz > fmfreq) {
+        FmStationListIndex = i;
+        break;
+      }
+    }
+  } else {
+    FmStationListIndex = static_cast<uint8_t>(count - 1U);
+    for (uint8_t i = count; i > 0U; --i) {
+      if (FmStations[i - 1U].frequency10kHz < fmfreq) {
+        FmStationListIndex = static_cast<uint8_t>(i - 1U);
+        break;
+      }
+    }
+  }
+
+  ActivateCurrentService();
+  ShowFreq();
+}
+
+static void SelectAdjacentDabGlobalStation(bool forward) {
+  const uint8_t count = DabStations.count();
+  if (count == 0U) return;
+
+  bool exact = DabGlobalListView &&
+      (dabServiceSelectionPending || trysetservice || !radio.ServiceStart);
+  if (!exact && radio.ServiceStart &&
+      radio.ServiceIndex < radio.numberofservices) {
+    const uint32_t currentSid = radio.service[radio.ServiceIndex].ServiceID;
+    const uint32_t currentComponent = radio.service[radio.ServiceIndex].CompID;
+    for (uint8_t i = 0; i < count; ++i) {
+      const DabStationRecord& station = DabStations[i];
+      if (station.channelIndex == dabfreq && station.serviceId == currentSid &&
+          station.componentId == currentComponent) {
+        DabStationListIndex = i;
+        exact = true;
+        break;
+      }
+    }
+  }
+
+  if (exact) {
+    DabStationListIndex = forward
+        ? static_cast<uint8_t>((DabStationListIndex + 1U) % count)
+        : static_cast<uint8_t>(DabStationListIndex == 0U
+                                   ? count - 1U : DabStationListIndex - 1U);
+  } else {
+    DabStationListIndex = forward ? 0U : static_cast<uint8_t>(count - 1U);
+  }
+
+  DabGlobalListView = true;
+  dabServiceSelectionPending = true;
+  DabServiceSelectionTimer = millis();
+}
+
 // Rotary 2 up:
-// - DAB normal view (MAN/AUTO/MEM): select next service.
-// - FM normal view: +100 kHz.
+// - DAB normal view: next global-scan station, or current-mux service when the
+//   global database does not exist.
+// - FM AUTO: next full-scan station; no action when that list is empty.
+// - FM MAN/MEM: existing regional fine step.
 // - After pressing rotary 2: volume mode; rotation adjusts volume.
 void KeyUp2(void) {
   tottimer = millis();
@@ -2596,30 +3189,46 @@ void KeyUp2(void) {
     RemoteVolumeStep(+2);
   } else if (ShowServiceInformation) {
     // Never use rotary 2 as an FM fine-tune control while System info is open.
-  } else if (radioMode == RADIO_MODE_FM) {
-    const uint8_t spacing = fmRegionProfile(fmRegion).seekSpacing10kHz;
-    fmfreq = stepFmFrequency(fmfreq, spacing, fmRegion);
-    tuning = true;
-    TuningTimer = millis();
-    radio.ServiceIndex = 0;
-    radio.ServiceStart = false;
-    for (byte x = 0; x < 17; x++) _serviceName[x] = '\0';
-    ShowFreq();
-    DIAG_PRINTF("[FM/UI] rotary2 UP -> +%u kHz, %.1f MHz\n",
-                  spacing * 10U, fmfreq / 100.0f);
   } else if (SlideShowView || ChannelListView) {
     // Full-screen overlays do not assign an implicit rotary-2 action. Volume
     // remains available only after explicitly pressing the rotary-2 button.
+  } else if (radioMode == RADIO_MODE_FM) {
+    const fm_features::Rotary2Target target = fm_features::rotary2Target(
+        true, tunemode == TUNE_AUTO, FmStations.count() != 0U, false);
+    if (target == fm_features::Rotary2Target::FmScanList) {
+      SelectAdjacentFmScanStation(true);
+    } else if (target == fm_features::Rotary2Target::FmFineTune) {
+      const uint8_t spacing = fmRegionProfile(fmRegion).seekSpacing10kHz;
+      fmfreq = stepFmFrequency(fmfreq, spacing, fmRegion);
+      tuning = true;
+      TuningTimer = millis();
+      radio.ServiceIndex = 0;
+      radio.ServiceStart = false;
+      for (byte x = 0; x < 17; x++) _serviceName[x] = '\0';
+      ShowFreq();
+      DIAG_PRINTF("[FM/UI] rotary2 UP -> +%u kHz, %.1f MHz\n",
+                    spacing * 10U, fmfreq / 100.0f);
+    }
   } else {
-    if (radio.numberofservices > 0) DABSelectService(1);
-    TuningTimer = millis();
+    seek = false;
+    CancelDabAuto();
+    const fm_features::Rotary2Target target = fm_features::rotary2Target(
+        false, tunemode == TUNE_AUTO, DabStations.count() != 0U,
+        radio.numberofservices > 0U);
+    if (target == fm_features::Rotary2Target::DabGlobalList) {
+      SelectAdjacentDabGlobalStation(true);
+    } else if (target == fm_features::Rotary2Target::DabCurrentMux) {
+      DabGlobalListView = false;
+      DABSelectService(true);
+    }
   }
   rotary2 = 0;
 }
 
 // Rotary 2 down:
-// - DAB normal view (MAN/AUTO/MEM): previous service.
-// - FM normal view: -100 kHz.
+// - DAB normal view: previous global-scan station, or current-mux fallback.
+// - FM AUTO: previous full-scan station; no action when that list is empty.
+// - FM MAN/MEM: existing regional fine step.
 // - After pressing rotary 2: volume mode; rotation adjusts volume.
 void KeyDown2(void) {
   tottimer = millis();
@@ -2631,22 +3240,37 @@ void KeyDown2(void) {
     RemoteVolumeStep(-2);
   } else if (ShowServiceInformation) {
     // Never use rotary 2 as an FM fine-tune control while System info is open.
-  } else if (radioMode == RADIO_MODE_FM) {
-    const uint8_t spacing = fmRegionProfile(fmRegion).seekSpacing10kHz;
-    fmfreq = stepFmFrequency(fmfreq, -static_cast<int16_t>(spacing), fmRegion);
-    tuning = true;
-    TuningTimer = millis();
-    radio.ServiceIndex = 0;
-    radio.ServiceStart = false;
-    for (byte x = 0; x < 17; x++) _serviceName[x] = '\0';
-    ShowFreq();
-    DIAG_PRINTF("[FM/UI] rotary2 DOWN -> -%u kHz, %.1f MHz\n",
-                  spacing * 10U, fmfreq / 100.0f);
   } else if (SlideShowView || ChannelListView) {
     // See KeyUp2(): do not enter volume mode from rotation alone.
+  } else if (radioMode == RADIO_MODE_FM) {
+    const fm_features::Rotary2Target target = fm_features::rotary2Target(
+        true, tunemode == TUNE_AUTO, FmStations.count() != 0U, false);
+    if (target == fm_features::Rotary2Target::FmScanList) {
+      SelectAdjacentFmScanStation(false);
+    } else if (target == fm_features::Rotary2Target::FmFineTune) {
+      const uint8_t spacing = fmRegionProfile(fmRegion).seekSpacing10kHz;
+      fmfreq = stepFmFrequency(fmfreq, -static_cast<int16_t>(spacing), fmRegion);
+      tuning = true;
+      TuningTimer = millis();
+      radio.ServiceIndex = 0;
+      radio.ServiceStart = false;
+      for (byte x = 0; x < 17; x++) _serviceName[x] = '\0';
+      ShowFreq();
+      DIAG_PRINTF("[FM/UI] rotary2 DOWN -> -%u kHz, %.1f MHz\n",
+                    spacing * 10U, fmfreq / 100.0f);
+    }
   } else {
-    if (radio.numberofservices > 0) DABSelectService(0);
-    TuningTimer = millis();
+    seek = false;
+    CancelDabAuto();
+    const fm_features::Rotary2Target target = fm_features::rotary2Target(
+        false, tunemode == TUNE_AUTO, DabStations.count() != 0U,
+        radio.numberofservices > 0U);
+    if (target == fm_features::Rotary2Target::DabGlobalList) {
+      SelectAdjacentDabGlobalStation(false);
+    } else if (target == fm_features::Rotary2Target::DabCurrentMux) {
+      DabGlobalListView = false;
+      DABSelectService(false);
+    }
   }
 }
 
@@ -2669,8 +3293,8 @@ void DoMemoryPosTune(void) {
         _serviceName[i] = memory[memorypos].Label[i];
     }
 
-    if (EEPROM.readByte(EE_BYTE_MEMORYPOS) != memorypos) {
-      EEPROM.writeByte(EE_BYTE_MEMORYPOS, memorypos);
+    if (Storage.readByte(EE_BYTE_MEMORYPOS) != memorypos) {
+      Storage.writeByte(EE_BYTE_MEMORYPOS, memorypos);
       MarkEepromDirty();
     }
     ShowFreq();
@@ -2929,8 +3553,8 @@ static void EnterLightSleep(bool showStandbyScreen) {
 // reset or firmware reload.
 void doStandby(void) {
   if (!FlushEeprom()) {
-    Serial.println("[EEPROM] standby cancelled: commit failed");
-    ShowStatusOverlay("EEPROM ERROR");
+    Serial.println("[NVS] standby cancelled: commit failed");
+    ShowStatusOverlay("NVS ERROR");
     return;
   }
   EnterLightSleep(true);
@@ -2946,29 +3570,152 @@ void Seek(bool mode) {
       fmSeekStarted = false;
       seek = false;
       fmfreq = radio.fmFrequency10kHz;
-      EEPROM.put(EE_UINT16_FM_FREQUENCY, fmfreq);
+      Storage.put(EE_UINT16_FM_FREQUENCY, fmfreq);
       MarkEepromDirty();
       ShowFreq();
     }
     return;
   }
-  if (!dabSeekStarted) {
-    if (mode) {
-      if (dabfreq >= 37) dabfreq = 0; else dabfreq++;
-    } else {
-      if (dabfreq == 0) dabfreq = 37; else dabfreq--;
-    }
-    radio.setFreq(dabfreq);
-    radio.ServiceIndex = 0;
-    radio.ServiceStart = false;
-    // ProcessDAB publishes the changed DAB channel on the next cooperative
-    // refresh, matching the live-frequency update path used by FM AUTO seek.
-    dabSeekStarted = true;
+  if (dabAutoState == DabAutoState::Idle) StartDabAuto(mode);
+  ProcessDabAuto();
+}
+
+void CancelDabAuto(void) {
+  dabAutoState = DabAutoState::Idle;
+  dabAutoChannelsTried = 0;
+  dabSeekStarted = false;
+}
+
+void StartDabAuto(bool forward) {
+  dabAutoForward = forward;
+  dabAutoChannelsTried = 0;
+
+  if (radio.isDabServiceListReady() && !radio.isDabServiceMetadataReady()) {
+    dabAutoDeadlineMs = millis() + 5000UL;
+    dabAutoState = DabAutoState::WaitCurrentServiceTypes;
     return;
   }
-  if (!radio.isTunePending()) {
-    if (radio.signallock) seek = false;
-    dabSeekStarted = false;
+
+  if (radio.isDabServiceMetadataReady()) {
+    const int16_t adjacent = fm_features::adjacentAudioService(
+        radio.service, radio.numberofservices, radio.ServiceIndex, forward);
+    if (adjacent >= 0) {
+      radio.ServiceIndex = static_cast<uint8_t>(adjacent);
+      dabServiceSelectionPending = false;
+      ActivateCurrentService();
+      seek = false;
+      DIAG_PRINTF("[DAB/AUTO] %s service index=%u SID=%08X\n",
+                  forward ? "next" : "previous",
+                  static_cast<unsigned>(radio.ServiceIndex),
+                  static_cast<unsigned>(radio.service[radio.ServiceIndex].ServiceID));
+      return;
+    }
+  }
+
+  DIAG_PRINTF("[DAB/AUTO] %s of mux; searching %s channel\n",
+              forward ? "end" : "start", forward ? "next" : "previous");
+  dabAutoState = DabAutoState::TuneMux;
+}
+
+void ProcessDabAuto(void) {
+  if (!seek || radioMode != RADIO_MODE_DAB || tunemode != TUNE_AUTO) {
+    CancelDabAuto();
+    return;
+  }
+
+  const uint32_t now = millis();
+  switch (dabAutoState) {
+    case DabAutoState::Idle:
+      return;
+
+    case DabAutoState::WaitCurrentServiceTypes:
+      if (!radio.isDabServiceMetadataReady() &&
+          static_cast<int32_t>(now - dabAutoDeadlineMs) < 0) return;
+      if (radio.isDabServiceMetadataReady()) {
+        const int16_t adjacent = fm_features::adjacentAudioService(
+            radio.service, radio.numberofservices, radio.ServiceIndex,
+            dabAutoForward);
+        if (adjacent >= 0) {
+          radio.ServiceIndex = static_cast<uint8_t>(adjacent);
+          ActivateCurrentService();
+          seek = false;
+          DIAG_PRINTF("[DAB/AUTO] adjacent service after metadata index=%u\n",
+                      static_cast<unsigned>(radio.ServiceIndex));
+          CancelDabAuto();
+          return;
+        }
+      }
+      dabAutoState = DabAutoState::TuneMux;
+      return;
+
+    case DabAutoState::TuneMux:
+      if (dabAutoChannelsTried >= 38U) {
+        DIAG_PRINTLN("[DAB/AUTO] no receivable audio multiplex found");
+        seek = false;
+        CancelDabAuto();
+        ShowStatusOverlay(noDabServiceText[language]);
+        return;
+      }
+      dabfreq = fm_features::nextDabChannel(dabfreq, dabAutoForward);
+      ++dabAutoChannelsTried;
+      radio.ServiceIndex = 0;
+      radio.ServiceStart = false;
+      memset(_serviceName, 0, sizeof(_serviceName));
+      radio.setFreq(dabfreq);
+      dabSeekStarted = true;
+      dabAutoDeadlineMs = now + 6000UL;
+      dabAutoState = DabAutoState::WaitTune;
+      DIAG_PRINTF("[DAB/AUTO] tune %s index=%u try=%u/38\n",
+                  radio.getChannel(dabfreq), static_cast<unsigned>(dabfreq),
+                  static_cast<unsigned>(dabAutoChannelsTried));
+      return;
+
+    case DabAutoState::WaitTune:
+      if (radio.isTunePending() &&
+          static_cast<int32_t>(now - dabAutoDeadlineMs) < 0) return;
+      dabSeekStarted = false;
+      if (!radio.signallock) {
+        dabAutoState = DabAutoState::TuneMux;
+        return;
+      }
+      dabAutoDeadlineMs = now + 8000UL;
+      dabAutoState = DabAutoState::WaitServiceList;
+      return;
+
+    case DabAutoState::WaitServiceList:
+      if (!radio.signallock ||
+          static_cast<int32_t>(now - dabAutoDeadlineMs) >= 0) {
+        dabAutoState = DabAutoState::TuneMux;
+        return;
+      }
+      if (!radio.isDabServiceListReady()) return;
+      dabAutoState = DabAutoState::WaitServiceTypes;
+      return;
+
+    case DabAutoState::WaitServiceTypes:
+      if (!radio.signallock ||
+          static_cast<int32_t>(now - dabAutoDeadlineMs) >= 0) {
+        dabAutoState = DabAutoState::TuneMux;
+        return;
+      }
+      if (!radio.isDabServiceMetadataReady()) return;
+      {
+        const int16_t selected = fm_features::edgeAudioService(
+            radio.service, radio.numberofservices, dabAutoForward);
+        if (selected < 0) {
+          dabAutoState = DabAutoState::TuneMux;
+          return;
+        }
+        radio.ServiceIndex = static_cast<uint8_t>(selected);
+        ActivateCurrentService();
+        seek = false;
+        DIAG_PRINTF("[DAB/AUTO] mux found services=%u; selected %s index=%u\n",
+                    static_cast<unsigned>(radio.numberofservices),
+                    dabAutoForward ? "first" : "last",
+                    static_cast<unsigned>(radio.ServiceIndex));
+        CancelDabAuto();
+      }
+      return;
   }
 }
 
@@ -3014,42 +3761,49 @@ void read_encoder2(void) {
   }
 }
 
-// Factory reset: write known-good defaults to every EEPROM slot, including
-// emptying all preset entries. Also called automatically on first boot or
-// when the schema version byte changes.
+// Factory reset: write known-good defaults to every persistent NVS record,
+// including presets, IR profile and the scanned FM list.
 bool DefaultSettings(void) {
-  EEPROM.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
-  EEPROM.writeByte(EE_BYTE_CONTRASTSET, 100);
-  EEPROM.writeByte(EE_BYTE_LANGUAGE, 0);
-  EEPROM.writeByte(EE_BYTE_DISPLAYFLIP, 0);
-  EEPROM.writeByte(EE_BYTE_ROTARYMODE, 0);
-  EEPROM.writeByte(EE_BYTE_TUNEMODE, 0);
-  EEPROM.writeByte(EE_BYTE_UNIT, 0);
-  EEPROM.writeByte(EE_BYTE_VOLUME, 62);
-  EEPROM.writeByte(EE_BYTE_MEMORYPOS, 0);
-  EEPROM.writeByte(EE_BYTE_AUTOSLIDESHOW, 0);
-  EEPROM.writeByte(EE_BYTE_RADIO_MODE, RADIO_MODE_DAB);
-  EEPROM.writeByte(EE_BYTE_TOT, 0);
-  EEPROM.writeByte(EE_BYTE_THEME, 0);
-  EEPROM.put(EE_UINT32_SERVICEID, (uint32_t)0);
-  EEPROM.writeByte(EE_BYTE_DABFREQ, 0);
-  EEPROM.put(EE_UINT16_FM_FREQUENCY, static_cast<uint16_t>(8750));
-  EEPROM.writeByte(EE_BYTE_FM_REGION, static_cast<uint8_t>(FmRegion::Europe));
-  EEPROM.writeByte(EE_BYTE_GPIO12_MODE, GPIO12_AUTO);
+  Storage.writeByte(EE_BYTE_CHECKBYTE, EE_CHECKBYTE_VALUE);
+  Storage.writeByte(EE_BYTE_CONTRASTSET, 100);
+  Storage.writeByte(EE_BYTE_LANGUAGE, 0);
+  Storage.writeByte(EE_BYTE_DISPLAYFLIP, 0);
+  Storage.writeByte(EE_BYTE_ROTARYMODE, 0);
+  Storage.writeByte(EE_BYTE_TUNEMODE, 0);
+  Storage.writeByte(EE_BYTE_UNIT, 0);
+  Storage.writeByte(EE_BYTE_VOLUME, 62);
+  Storage.writeByte(EE_BYTE_MEMORYPOS, 0);
+  Storage.writeByte(EE_BYTE_AUTOSLIDESHOW, 0);
+  Storage.writeByte(EE_BYTE_RADIO_MODE, RADIO_MODE_DAB);
+  Storage.writeByte(EE_BYTE_TOT, 0);
+  Storage.writeByte(EE_BYTE_THEME, 0);
+  Storage.put(EE_UINT32_SERVICEID, (uint32_t)0);
+  Storage.writeByte(EE_BYTE_DABFREQ, 0);
+  Storage.put(EE_UINT16_FM_FREQUENCY, static_cast<uint16_t>(8750));
+  Storage.writeByte(EE_BYTE_FM_REGION, static_cast<uint8_t>(FmRegion::Europe));
+  Storage.writeByte(EE_BYTE_GPIO12_MODE, GPIO12_AUTO);
   for (int y = 0; y < 17; y++) {
-    EEPROM.writeByte(EE_CHAR17_SERVICENAME + y, '\0');
+    Storage.writeByte(EE_CHAR17_SERVICENAME + y, '\0');
   }
+  Storage.writeByte(EE_BYTE_FM_SEEK_SENSITIVITY, 1);
 
   for (int i = 0; i < EE_PRESETS_CNT; i++) {
-    EEPROM.writeByte(i + EE_PRESETS_FREQ_START, EE_PRESETS_FREQUENCY);
-    EEPROM.put((i * 8) + EE_PRESETS_SERVICEID_START, 0);
+    Storage.writeByte(i + EE_PRESETS_FREQ_START, EE_PRESETS_FREQUENCY);
+    Storage.put((i * 8) + EE_PRESETS_SERVICEID_START, 0);
     for (int y = 0; y < 17; y++) {
-      EEPROM.writeByte((i * 17) + y + EE_PRESETS_NAME_START, '\0');
+      Storage.writeByte((i * 17) + y + EE_PRESETS_NAME_START, '\0');
     }
   }
   WriteEmptyFmPresetsV4();
   ClearIrProfileStorage();
-  return CommitEepromNow("factory defaults");
+  FmStations.clear();
+  DabStations.clear();
+  fmScanCompleted = false;
+  dabScanCompleted = false;
+  const bool recordsSaved = CommitEepromNow("factory defaults");
+  const bool fmScanCleared = Storage.clearScan();
+  const bool dabScanCleared = Storage.clearDabScan();
+  return recordsSaved && fmScanCleared && dabScanCleared;
 }
 
 // Heap-stable variant for already formatted fixed char buffers.
@@ -3130,7 +3884,7 @@ void tftPrint(int8_t offset, const char *text, int16_t x, int16_t y,
 void deepSleep(void) {
   StoreFrequency();
   if (!FlushEeprom()) {
-    Serial.println("[EEPROM] timeout light-sleep cancelled: commit failed");
+    Serial.println("[NVS] timeout light-sleep cancelled: commit failed");
     // Prevent a tight retry loop on every main-loop iteration.
     tottimer = millis();
     return;

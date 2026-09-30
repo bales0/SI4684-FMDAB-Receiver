@@ -738,6 +738,57 @@ static const char* const fmPtyText[8] PROGMEM = {"PTY", "PTY", "PTY", "PTY", "PT
 static const char* const fmRdsText[8] PROGMEM = {"RDS", "RDS", "RDS", "RDS", "RDS", "RDS", "RDS", "RDS"};
 static const char* const fmRbdsText[8] PROGMEM = {"RBDS", "RBDS", "RBDS", "RBDS", "RBDS", "RBDS", "RBDS", "RBDS"};
 static const char* const fmSnrText[8] PROGMEM = {"SNR", "SNR", "SNR", "SNR", "SNR", "SNR", "SNR", "SNR"};
+// Compact scan/status strings use the documented English fallback in every
+// language until native translations are supplied; array indexes stay aligned.
+static const char* const fmNoScanText[8] PROGMEM = {
+  "NO FM SCAN", "NO FM SCAN", "NO FM SCAN", "NO FM SCAN",
+  "NO FM SCAN", "NO FM SCAN", "NO FM SCAN", "NO FM SCAN"};
+static const char* const fmScanText[8] PROGMEM = {
+  "FM SCAN", "FM SCAN", "FM SCAN", "FM SCAN",
+  "FM SCAN", "FM SCAN", "FM SCAN", "FM SCAN"};
+static const char* const fmSeekMenuText[8] PROGMEM = {
+  "FM Seek", "FM Seek", "FM Seek", "FM Seek",
+  "FM Seek", "FM Seek", "FM Seek", "FM Seek"};
+static const char* const fmSeekValueText[8][3] PROGMEM = {
+  {"Weak", "Normal", "Strong"}, {"Weak", "Normal", "Strong"},
+  {"Weak", "Normal", "Strong"}, {"Weak", "Normal", "Strong"},
+  {"Weak", "Normal", "Strong"}, {"Weak", "Normal", "Strong"},
+  {"Weak", "Normal", "Strong"}, {"Weak", "Normal", "Strong"}};
+static const char* const noDabServiceText[8] PROGMEM = {
+  "NO DAB SERVICE", "NO DAB SERVICE", "NO DAB SERVICE", "NO DAB SERVICE",
+  "NO DAB SERVICE", "NO DAB SERVICE", "NO DAB SERVICE", "NO DAB SERVICE"};
+static const char* const dabScanText[8] PROGMEM = {
+  "DAB SCAN", "DAB SCAN", "DAB SCAN", "DAB SCAN",
+  "DAB SCAN", "DAB SCAN", "DAB SCAN", "DAB SCAN"};
+static const char* const fmStationListText[8] PROGMEM = {
+  "FM STATIONS", "FM STATIONS", "FM STATIONS", "FM STATIONS",
+  "FM STATIONS", "FM STATIONS", "FM STATIONS", "FM STATIONS"};
+static const char* const dabStationListText[8] PROGMEM = {
+  "DAB STATIONS", "DAB STATIONS", "DAB STATIONS", "DAB STATIONS",
+  "DAB STATIONS", "DAB STATIONS", "DAB STATIONS", "DAB STATIONS"};
+static const char* const currentMuxListText[8] PROGMEM = {
+  "CURRENT MUX", "CURRENT MUX", "CURRENT MUX", "CURRENT MUX",
+  "CURRENT MUX", "CURRENT MUX", "CURRENT MUX", "CURRENT MUX"};
+static const char* const scanNotRunText[8] PROGMEM = {
+  "SCAN NOT RUN", "SCAN NOT RUN", "SCAN NOT RUN", "SCAN NOT RUN",
+  "SCAN NOT RUN", "SCAN NOT RUN", "SCAN NOT RUN", "SCAN NOT RUN"};
+static const char* const noStationsFoundText[8] PROGMEM = {
+  "NO STATIONS FOUND", "NO STATIONS FOUND", "NO STATIONS FOUND", "NO STATIONS FOUND",
+  "NO STATIONS FOUND", "NO STATIONS FOUND", "NO STATIONS FOUND", "NO STATIONS FOUND"};
+static const char* const pressOkScanText[8] PROGMEM = {
+  "OK = START SCAN", "OK = START SCAN", "OK = START SCAN", "OK = START SCAN",
+  "OK = START SCAN", "OK = START SCAN", "OK = START SCAN", "OK = START SCAN"};
+static const char* const fmAfInfoText[8] PROGMEM =
+  {"AF list", "AF list", "AF list", "AF list", "AF list", "AF list", "AF list", "AF list"};
+static const char* const fmTrafficInfoText[8] PROGMEM =
+  {"TP / TA / PTY", "TP / TA / PTY", "TP / TA / PTY", "TP / TA / PTY",
+   "TP / TA / PTY", "TP / TA / PTY", "TP / TA / PTY", "TP / TA / PTY"};
+static const char* const fmCtInfoText[8] PROGMEM =
+  {"RDS clock", "RDS clock", "RDS clock", "RDS clock",
+   "RDS clock", "RDS clock", "RDS clock", "RDS clock"};
+static const char* const fmQualityInfoText[8] PROGMEM =
+  {"FM quality", "FM quality", "FM quality", "FM quality",
+   "FM quality", "FM quality", "FM quality", "FM quality"};
 static const char* const fmMultipathShortText[8] PROGMEM = {"MP", "MP", "MP", "MP", "MP", "MP", "MP", "MP"};
 static const char* const fmBlendShortText[8] PROGMEM = {"BL", "BL", "BL", "BL", "BL", "BL", "BL", "BL"};
 static const char* const fmAfcRailText[8] PROGMEM = {"AFCRL", "AFCRL", "AFCRL", "AFCRL", "AFCRL", "AFCRL", "AFCRL", "AFCRL"};

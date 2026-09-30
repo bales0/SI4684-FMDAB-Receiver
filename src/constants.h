@@ -1,4 +1,4 @@
-// Project-wide constants: hardware pin assignments, EEPROM layout,
+// Project-wide constants: hardware pin assignments, legacy logical storage layout,
 // UI line-spacing offsets, and the user-facing tune-mode / memory-status enums.
 
 #ifndef CONSTANTS_H
@@ -53,13 +53,12 @@ static inline uint8_t sanitizeGpio12Mode(uint8_t value) {
 
 static const char* const Gpio12ModeText[] = {"AUTO", "INTB", "IR"};
 
-// ---------- EEPROM layout ----------
+// ---------- Logical persistence layout ----------
+// Runtime persistence is stored as compact direct-NVS records. These offsets
+// remain only as an in-RAM compatibility view for existing call sites.
 #define EE_PRESETS_CNT              99
 #define EE_PRESETS_FREQUENCY        255
 #define EE_CHECKBYTE_VALUE          5
-#define EE_CHECKBYTE_DAB_ONLY       2
-#define EE_CHECKBYTE_FM_INDEXED     3
-#define EE_CHECKBYTE_FM_ABSOLUTE    4    // previous schema; migrate GPIO12/IR tail only
 
 #define EE_TOTAL_CNT                4096
 #define EE_BYTE_CHECKBYTE           0
@@ -81,6 +80,7 @@ static const char* const Gpio12ModeText[] = {"AUTO", "INTB", "IR"};
 #define EE_BYTE_FM_REGION           20
 #define EE_BYTE_GPIO12_MODE         21
 #define EE_CHAR17_SERVICENAME       22
+#define EE_BYTE_FM_SEEK_SENSITIVITY 38
 #define EE_PRESETS_FREQ_START       39
 #define EE_PRESETS_SERVICEID_START  138
 #define EE_PRESETS_NAME_START       930
@@ -92,7 +92,7 @@ static const char* const Gpio12ModeText[] = {"AUTO", "INTB", "IR"};
 #define EE_FM_PRESET_EMPTY_FREQUENCY 0xFFFFU
 #define EE_FM_PRESETS_END           3901
 
-// Learned IR profile occupies 160 bytes in the EEPROM tail. The format is
+// Learned IR profile occupies a 160-byte direct-NVS record. The format is
 // explicitly serialized; no compiler struct padding is stored.
 #define EE_IR_CONFIG_START          EE_FM_PRESETS_END
 #define EE_IR_KEY_COUNT             8
@@ -100,10 +100,6 @@ static const char* const Gpio12ModeText[] = {"AUTO", "INTB", "IR"};
 #define EE_IR_CONFIG_SIZE           160
 #define EE_IR_CONFIG_END            (EE_IR_CONFIG_START + EE_IR_CONFIG_SIZE)
 
-// Schema 3 source addresses. Keep solely for overlap-safe v3 -> v4 migration.
-#define EE_V3_FM_PRESETS_FREQ_START 2614
-#define EE_V3_FM_PRESETS_PI_START   2713
-#define EE_V3_FM_PRESETS_NAME_START 3109
 #define EEPROM_COMMIT_DELAY_MS       3000UL
 
 static_assert(EE_PRESETS_NAME_START + EE_PRESETS_CNT * 17 == 2613,
@@ -121,7 +117,7 @@ static_assert(EE_FM_PRESETS_END ==
 static_assert(6 + EE_IR_KEY_COUNT * EE_IR_KEY_RECORD_SIZE + 2 <= EE_IR_CONFIG_SIZE,
               "IR profile serialization exceeds EE_IR_CONFIG_SIZE");
 static_assert(EE_IR_CONFIG_END <= EE_TOTAL_CNT,
-              "IR profile exceeds the 4096-byte EEPROM allocation");
+              "IR profile exceeds the legacy compatibility image");
 
 // ---------- UI strings + enums ----------
 static const char* const unitString[] = {"dBμV", "dBf", "dBm"};

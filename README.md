@@ -58,10 +58,13 @@ Official Espressif references:
 - Manual tuning, automatic seek and memory mode.
 - Up to **99 FM presets**.
 - RDS/RBDS:
-  - PI
-  - PTY
-  - PS, assembled and displayed per received 2-character segment
-  - RadioText (RT)
+  - PI, region-specific PTY text, PS and RadioText;
+  - AF list decoding from group 0A (display/diagnostics only; no automatic retune);
+  - TP and TA indicators;
+  - validated group 4A Clock-Time/date, shown in System Information and used
+    for the displayed local clock after applying the broadcast UTC offset;
+  - bounded full-band station scan with PI/PS/RSSI/SNR list records;
+  - stabilized PS and RadioText assembly.
 - Stereo/mono indication.
 - Stereo blend indication.
 - Multipath indication.
@@ -95,7 +98,7 @@ Official Espressif references:
 - Light-sleep standby with state retained in RAM.
 - Wake by physical STANDBY button.
 - Optional wake by the learned IR STANDBY command when `GPIO12 = IR`.
-- EEPROM-backed settings and presets with delayed/transactional writes.
+- Direct NVS settings, presets, learned IR profile and persistent FM/DAB scan lists.
 - Serial control protocol at 115200 baud.
 - Runtime `DEBUG` command for detailed FM/DAB/RDS/SLS/SPI/RAM diagnostics.
 - Shared ILI9341/SI4684 reset recovery.
@@ -330,7 +333,7 @@ Behavior depends on the selected tune mode:
 | Tune mode | DAB | FM |
 |---|---|---|
 | **MAN** | previous/next DAB channel block | coarse tuning ±1.0 MHz |
-| **AUTO** | start seek/scan down/up | start FM seek down/up |
+| **AUTO** | previous/next live audio service; at a mux boundary search backward/forward for the next receivable mux | live FM seek down/up |
 | **MEM** | previous/next stored preset | previous/next stored preset |
 
 In MEM mode, empty preset positions are skipped during normal recall.
@@ -346,17 +349,25 @@ Moves through menu rows. After a menu item is opened for editing, rotation chang
 ### Push / OK
 
 - **Main screen, MAN/AUTO:** opens Channel List.
-- **Channel List:** starts/confirms the highlighted service/station and returns to the main screen.
+- **Channel List:** starts/confirms the highlighted service/station and returns to the main screen. If the global list is empty, it shows whether a scan has never run or completed without finding a station; OK starts the appropriate full scan.
 - **MEM mode:** first press arms preset storage; second press stores the currently tuned station/service in the selected memory position.
 - **Settings:** opens the highlighted setting; pressing again closes the edit popup/sub-item.
 - **Slideshow/System Info:** returns to the main display where applicable.
+
+### Long push — at least 1 second
+
+- **FM main screen:** performs a non-blocking full-band scan and rebuilds the persistent FM station list. The scan overlay includes a compact band-progress bar. Releasing the encoder does not also perform the short-push action.
+- **DAB main screen:** performs a non-blocking scan of all 38 Band-III channels, shows exact channel progress, stores up to 64 audio services in the persistent global list, then restores the previously playing service. DAB AUTO remains a live RF search and does not depend on this database.
 
 ## Lower rotary encoder — service / fine tune / volume
 
 ### Rotate without volume overlay
 
-- **DAB:** previous/next service in the current multiplex.
-- **FM:** previous/next channel using the selected region raster:
+- **DAB:** previous/next station from the persistent global scan list. If no
+  global list exists, falls back to audio services in the current multiplex.
+- **FM AUTO:** previous/next station from the persistent FM scan list. Rotary 2
+  has no tuning action when that list is empty.
+- **FM MAN/MEM:** previous/next channel using the selected region raster:
   - Europe/Japan: 100 kHz
   - North America: 200 kHz
 - No hidden tuning action is performed while System Information is open.
@@ -418,7 +429,24 @@ Direct manual tuning.
 
 ## AUTO
 
-Starts seek/scan in the rotation direction.
+AUTO always searches current RF reception; it never treats an old scan list as
+the authoritative tuning source.
+
+- **FM:** every rotary action starts the Si4684 live seek in that direction.
+- **DAB:** first selects the adjacent valid audio service in the current live
+  multiplex. At the first/last service boundary it scans the fixed Band-III
+  channel table in the requested direction, waits for a current service list
+  and service-mode classification, then starts the last/first audio service.
+  The 38-channel table wraps in both directions.
+- A short upper-rotary push opens the separately scanned global FM/DAB list.
+  FM stations without stable PS are shown by frequency. The DAB Channel List
+  never substitutes the current-multiplex service table for the global scan
+  database; current-multiplex services remain selectable with the lower rotary.
+  An empty list explicitly reports either `SCAN NOT RUN` or `NO STATIONS FOUND`
+  and offers a full scan with OK.
+- Rotary 2 uses these global scan lists directly on the main screen. DAB falls
+  back to the current multiplex only when its global list is unavailable; FM
+  AUTO deliberately does nothing when its global list is unavailable.
 
 - Repeating/holding IR TUNE does not continually restart an already running AUTO seek.
 
@@ -567,9 +595,10 @@ The menu contains:
 8. **FM Region** — Europe / North America / Japan
 9. **GPIO12** — AUTO / INTB / IR
 10. **IR Remote** — Learn / Clear / Test
-11. **About**
+11. **FM Seek** — Weak / Normal / Strong acceptance thresholds
+12. **About**
 
-Settings are edited in RAM and committed when leaving Settings. Values that did not actually change are not unnecessarily rewritten to EEPROM.
+Settings are edited in RAM and committed when leaving Settings. Values that did not actually change are not unnecessarily rewritten to NVS.
 
 Changing GPIO12 causes an automatic restart after the settings have been committed, because GPIO12 ownership is established during boot.
 
@@ -701,7 +730,8 @@ Detailed diagnostics then become available, including:
 - boot/RAM information;
 - FM status;
 - DAB status;
-- RDS PI/PTY/PS/RT processing;
+- RDS PI/PTY/PS/RT plus AF, TP/TA and validated CT processing;
+- FM full-scan discoveries/completion and DAB AUTO transitions;
 - MOT headers and segment progress;
 - SlideShow JPEG/PNG status;
 - SI4684 SPI replies and errors;
@@ -723,9 +753,13 @@ The external serial control protocol remains independent of the diagnostic gate.
 
 ---
 
-# EEPROM and stored data
+# NVS and stored data
 
-Current EEPROM schema: **5**.
+Runtime data is stored directly in the `si4684` NVS namespace. The stable keys
+are `settings`, `dab_presets`, `fm_presets`, `ir_profile`, `fm_scan`,
+`fm_scan_reg`, `fm_scan_done`, `dab_scan` and `dab_scan_done`; no NVS
+schema/version field is used. Missing records, unexpected record lengths and
+out-of-range setting values are replaced by safe defaults.
 
 Stored information includes:
 
@@ -737,8 +771,14 @@ Stored information includes:
 - 99 FM presets.
 - GPIO12 role.
 - Learned eight-key IR profile.
+- Completed FM station scan (up to 64 PI/frequency records with PS and quality).
+- Completed DAB Band-III scan (up to 64 audio-service records).
 
-Known older schemas are migrated without moving the established DAB preset layout. EEPROM writes are delayed/grouped so display refreshes do not repeatedly write flash-backed EEPROM storage.
+Legacy EEPROM-emulation data is not read or migrated, and the EEPROM library is
+not linked. Runtime writes use compact direct-NVS records. Settings/preset
+writes remain delayed or grouped, and station lists are written only after a
+completed scan. Erased, missing, partial or malformed NVS records are replaced
+with safe defaults.
 
 ---
 

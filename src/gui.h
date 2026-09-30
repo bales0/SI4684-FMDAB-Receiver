@@ -12,8 +12,8 @@
 #include "TPA6130A2.h"
 #include "language.h"
 #include "constants.h"
+#include "fm_station_list.h"
 #include "graphics.h"
-#include <EEPROM.h>
 #include <cstring>
 
 extern bool autoslideshow;
@@ -55,10 +55,12 @@ extern RadioMode radioMode;
 extern RadioMode requestedRadioMode;
 extern uint8_t fmRegion;
 extern uint8_t requestedFmRegion;
+extern uint8_t fmSeekSensitivity;
 extern uint8_t gpio12Mode;
 extern uint8_t requestedGpio12Mode;
 extern uint16_t fmfreq;
 extern char _serviceName[17];
+extern uint8_t _serviceNameCharset;
 extern int ActiveColor;
 extern int ActiveColorSmooth;
 extern int BackgroundColor;
@@ -117,6 +119,9 @@ extern TFT_eSprite ModeSprite;
 extern TFT_eSprite QualityBarSprite;
 extern TFT_eSprite ShortSprite;
 extern DAB radio;
+extern bool DabGlobalListView;
+extern bool fmScanCompleted;
+extern bool dabScanCompleted;
 extern TPA6130A2 Headphones;
 
 void BuildChannelList(void);
@@ -158,5 +163,7 @@ extern void tftPrintFixed(int8_t offset, const char *text, int16_t x, int16_t y,
 extern void loadFonts(bool option);
 extern bool IsStationEmpty(void);
 extern void MarkEepromDirty(void);
+extern uint8_t ChannelListCount(void);
+extern uint8_t ChannelListIndex(void);
 
 #endif

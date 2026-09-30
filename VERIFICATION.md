@@ -10,6 +10,10 @@
   phased periodic deadlines, continuous-DSRV fairness, FM tune/RDS/RSQ
   priority, DAB/FM sample/display separation, one-shot time application,
   debug throttling and `millis()` wraparound.
+- Host FM feature test: regional frequency wrapping, AF code filtering and
+  deduplication, CT/MJD validation, RDS/RBDS PTY lookup, PI/frequency station
+  identity, DAB audio-service boundaries and channel wrap, plus Rotary 1
+  short/long-press suppression.
 - Host JPEG tests with GCC C++11, `-Wall -Wextra -Werror -pedantic`:
   baseline grayscale, YCbCr 4:4:4/4:2:2/4:2:0, a complete 320×240 baseline
   4:2:0 decode, and progressive grayscale/4:4:4/4:2:2/4:2:0 decodes including
@@ -23,8 +27,8 @@
   pixel-identical to the matching baseline fixture. It is not the unavailable
   station object with hash `47083CD0`.
 - PlatformIO release build with `espressif32@6.9.0`: success for `esp32dev`
-  without PSRAM. Reported static usage: 48,808 bytes RAM (14.9%) and
-  3,413,257 bytes flash (82.7%). The persistent 50 KiB MOT buffer and 76,800
+  without PSRAM. Reported static usage: 56,000 bytes RAM (17.1%) and
+  3,432,673 bytes flash (83.1%). The persistent 50 KiB MOT buffer and 76,800
   byte shared decoder arena are allocated at runtime and therefore are not
   included in that static RAM number.
 - Clang is not installed in this environment: **NOT VERIFIED**.
@@ -32,8 +36,8 @@
   **NOT VERIFIED**.
 
 The generated `.pio/build/esp32dev/firmware.bin` is a successful development
-build of 3,413,872 bytes with SHA-256
-`D8D230CD860EDA93CFF5EEFDBE62F32F8F6FAD6FB84678D27052694723D5C0BC`.
+build of 3,433,296 bytes with SHA-256
+`189244E8875168FDDFA85EC11DD3D591B43521AA25EA990CB5B195A6BB6486E1`.
 It is not copied into `Release/` or represented as a hardware-validated release.
 `Release/firmware_v2_0.bin` remains an unchanged historical image.
 
@@ -64,6 +68,38 @@ It is not copied into `Release/` or represented as a hardware-validated release.
 9. With `DEBUG` enabled, confirm milestone-only MOT logging and usable UI; use
    `DEBUG SLSV` separately to verify explicit verbose tracing and UART-drop
    summaries. Confirm that repeated NOT_AVAILABLE replies are aggregated.
+10. Test erased, missing, partial and malformed direct-NVS records and verify
+    safe defaults. Confirm that no legacy EEPROM namespace is read or written.
+11. In FM, verify live AUTO seek remains independent of the scanned list.
+    Long-press Rotary 1 through a complete band scan, confirm bounded RDS dwell,
+    frequency fallback for missing PS, list selection, cancellation preserving
+    the previous list, and persistence across reboot.
+12. With real RDS/RBDS broadcasts, verify AF list reset on tune/PI change,
+    TP/TA transitions, regional PTY names and stable two-sample CT publication.
+13. In DAB AUTO, traverse forward/backward inside a multiplex, cross both mux
+    boundaries, wrap the Band-III table, reverse/cancel during a search, and
+    confirm first/last valid audio service selection without stale list data.
+14. Long-press Rotary 1 in DAB through a complete 5A..13F scan. Confirm only
+    audio services enter the global list, cancellation preserves the previous
+    saved list, the original service is restored, and the list persists across
+    reboot. Confirm the progress bar advances through all 38 channels. With no
+    completed scan, confirm Channel List stays empty, says `SCAN NOT RUN`, and
+    OK starts scanning; after a completed empty scan it says `NO STATIONS FOUND`.
+15. During FM full scan confirm the current frequency never paints through the
+    scan overlay, and that PS is used only after all four segments are confirmed
+    for the current PI; otherwise the list must show the frequency fallback.
+    Confirm the compact progress bar advances across the configured regional band.
+16. In FM System Information, verify live AF frequencies, TP/TA/PTY, RDS CT
+    with half-hour offset, and RSSI/SNR/multipath/blend. Confirm a two-sample
+    validated CT updates the main clock to local time without repeatedly
+    resetting its seconds.
+17. In FM AUTO, verify Rotary 2 traverses the persistent scan list in both
+    directions and wraps; with an empty list it must perform no tuning action.
+    In DAB, verify Rotary 2 traverses the global list, falls back to the current
+    mux only when the global list is absent, and rapidly scrolling commits only
+    the final selection. For services sharing a SID, confirm the Component ID
+    selects the correct audio component and the UI does not remain on
+    `Select service`. Repeat the exact-component check from the Rotary 1 list.
 
 ## Expected diagnostic sequence examples
 

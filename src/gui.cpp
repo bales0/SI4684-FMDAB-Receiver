@@ -7,6 +7,7 @@
 #include "gui.h"
 #include "ir_remote.h"
 #include "dab_scheduler_policy.h"
+#include "dab_station_list.h"
 #include <esp_efuse.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
@@ -25,7 +26,7 @@ extern void DabDynamicLabelTextToBuffer(const char* input, char* output, size_t 
 
 byte menuitem;                    // logical item index in Settings
 static byte menuFirstItem = 0;      // first logical item shown in 9-row window
-static constexpr byte MENU_ITEM_COUNT = 11;
+static constexpr byte MENU_ITEM_COUNT = 12;
 static constexpr byte MENU_VISIBLE_ROWS = 9;
 
 // Apply the user-selected colour theme to the global PrimaryColor/etc. used
@@ -298,10 +299,18 @@ void ShowServiceInfo(void) {
     tftPrintFixed(0, myLanguage[language][27], 155, 4,
                   ActiveColor, ActiveColorSmooth, 28);
 
-    // Logical order: tuner/radio, GPIO12 runtime + boot supply selection,
-    // then ESP32 runtime and memory diagnostics.
+    // Logical order: tuner/radio and GPIO12 first. In FM mode the middle
+    // rows expose live RDS/quality data; in DAB mode they retain the hardware
+    // diagnostics. Heap rows remain common to both modes.
     for (uint8_t row = 0; row < 9; ++row) {
-      tftPrintFixed(-1, myLanguage[language][28 + row],
+      const char* label = myLanguage[language][28 + row];
+      if (radio.isFm()) {
+        if (row == 3U) label = fmAfInfoText[language];
+        else if (row == 4U) label = fmTrafficInfoText[language];
+        else if (row == 5U) label = fmCtInfoText[language];
+        else if (row == 6U) label = fmQualityInfoText[language];
+      }
+      tftPrintFixed(-1, label,
                     8, 36 + row * 20,
                     ActiveColor, ActiveColorSmooth, 16);
     }
@@ -312,20 +321,22 @@ void ShowServiceInfo(void) {
     tftPrintFixed(-1, value, 166, 36,
                   PrimaryColor, PrimaryColorSmooth, 16);
 
-    FormatVddSdioStatus(value, sizeof(value));
-    tftPrintFixed(-1, value, 166, 96,
-                  PrimaryColor, PrimaryColorSmooth, 16);
+    if (!radio.isFm()) {
+      FormatVddSdioStatus(value, sizeof(value));
+      tftPrintFixed(-1, value, 166, 96,
+                    PrimaryColor, PrimaryColorSmooth, 16);
 
-    snprintf(value, sizeof(value), "rev%u / %uM / %s",
-             static_cast<unsigned>(ESP.getChipRevision()),
-             static_cast<unsigned>(ESP.getCpuFreqMHz()),
-             VERSION);
-    tftPrintFixed(-1, value, 166, 116,
-                  PrimaryColor, PrimaryColorSmooth, 16);
+      snprintf(value, sizeof(value), "rev%u / %uM / %s",
+               static_cast<unsigned>(ESP.getChipRevision()),
+               static_cast<unsigned>(ESP.getCpuFreqMHz()),
+               VERSION);
+      tftPrintFixed(-1, value, 166, 116,
+                    PrimaryColor, PrimaryColorSmooth, 16);
 
-    tftPrintFixed(-1,
-                  systemResetReasonText[language][SystemResetReasonIndex()],
-                  166, 156, PrimaryColor, PrimaryColorSmooth, 16);
+      tftPrintFixed(-1,
+                    systemResetReasonText[language][SystemResetReasonIndex()],
+                    166, 156, PrimaryColor, PrimaryColorSmooth, 16);
+    }
 
     systemInfoRefreshTimer = 0;
   }
@@ -348,8 +359,64 @@ void ShowServiceInfo(void) {
   tftPrintFixed(-1, value, 166, 76,
                 PrimaryColor, PrimaryColorSmooth, 16);
 
-  RestoreSystemInfoValueRow(5);
-  {
+  if (radio.isFm()) {
+    RestoreSystemInfoValueRow(3);
+    if (radio.fmAf.count == 0U) {
+      snprintf(value, sizeof(value), "-");
+    } else {
+      const uint16_t first = radio.fmAf.frequency10kHz[0];
+      if (radio.fmAf.count == 1U) {
+        snprintf(value, sizeof(value), "%u: %u.%u",
+                 static_cast<unsigned>(radio.fmAf.count),
+                 static_cast<unsigned>(first / 100U),
+                 static_cast<unsigned>((first % 100U) / 10U));
+      } else {
+        const uint16_t second = radio.fmAf.frequency10kHz[1];
+        snprintf(value, sizeof(value), "%u: %u.%u %u.%u%s",
+                 static_cast<unsigned>(radio.fmAf.count),
+                 static_cast<unsigned>(first / 100U),
+                 static_cast<unsigned>((first % 100U) / 10U),
+                 static_cast<unsigned>(second / 100U),
+                 static_cast<unsigned>((second % 100U) / 10U),
+                 radio.fmAf.count > 2U ? "+" : "");
+      }
+    }
+    tftPrintFixed(-1, value, 166, 96,
+                  PrimaryColor, PrimaryColorSmooth, 16);
+
+    RestoreSystemInfoValueRow(4);
+    snprintf(value, sizeof(value), "TP:%u TA:%u %.10s",
+             radio.fmTp ? 1U : 0U, radio.fmTa ? 1U : 0U,
+             fmPtyValid ? fm_features::ptyName(radio.fmPty, radio.isRbds()) : "-");
+    tftPrintFixed(-1, value, 166, 116,
+                  PrimaryColor, PrimaryColorSmooth, 16);
+
+    RestoreSystemInfoValueRow(5);
+    if (radio.fmCtValid) {
+      const int offset = static_cast<int>(radio.fmCt.localOffsetHalfHours);
+      const unsigned magnitude = static_cast<unsigned>(offset < 0 ? -offset : offset);
+      snprintf(value, sizeof(value), "%02u-%02u %02u:%02u %c%u.%u",
+               static_cast<unsigned>(radio.fmCt.day),
+               static_cast<unsigned>(radio.fmCt.month),
+               static_cast<unsigned>(radio.fmCt.hour),
+               static_cast<unsigned>(radio.fmCt.minute),
+               offset < 0 ? '-' : '+', magnitude / 2U,
+               (magnitude % 2U) * 5U);
+    } else {
+      snprintf(value, sizeof(value), "-");
+    }
+    tftPrintFixed(-1, value, 166, 136,
+                  PrimaryColor, PrimaryColorSmooth, 16);
+
+    RestoreSystemInfoValueRow(6);
+    snprintf(value, sizeof(value), "%d/%d MP%u BL%u",
+             static_cast<int>(radio.fmRssi), static_cast<int>(radio.fmSnr),
+             static_cast<unsigned>(radio.fmMultipath),
+             static_cast<unsigned>(radio.fmStereoBlend));
+    tftPrintFixed(-1, value, 166, 156,
+                  PrimaryColor, PrimaryColorSmooth, 16);
+  } else {
+    RestoreSystemInfoValueRow(5);
     const uint64_t uptimeSeconds =
         static_cast<uint64_t>(esp_timer_get_time()) / 1000000ULL;
     const uint64_t totalHours = uptimeSeconds / 3600ULL;
@@ -359,9 +426,9 @@ void ShowServiceInfo(void) {
              static_cast<unsigned long long>(totalHours),
              static_cast<unsigned long long>(minutes),
              static_cast<unsigned long long>(seconds));
+    tftPrintFixed(-1, value, 166, 136,
+                  PrimaryColor, PrimaryColorSmooth, 16);
   }
-  tftPrintFixed(-1, value, 166, 136,
-                PrimaryColor, PrimaryColorSmooth, 16);
 
   RestoreSystemInfoValueRow(7);
   snprintf(value, sizeof(value), "%lu / %lu kB",
@@ -391,45 +458,55 @@ void ShowServiceInfo(void) {
                 PrimaryColor, PrimaryColorSmooth, 16);
 }
 
-// Render the scrollable list of services in the current ensemble. Used as
+static uint8_t ChannelListPageStart(uint8_t index) {
+  return index < 9U ? 0U
+                    : static_cast<uint8_t>(9U + ((index - 9U) / 8U) * 8U);
+}
+
+// Render the scrollable list of services/stations. Used as
 // the alternative to "main display" when the user opens the channel list.
 void BuildChannelList(void) {
   setvolume = false;
   tft.pushImage (0, 0, 320, 240, servicelistbackground);
-  tftPrintFixed(0, myLanguage[language][11], 155, 4, ActiveColor, ActiveColorSmooth, 28);
+  const char* title = radio.isFm()
+      ? fmStationListText[language]
+      : (DabGlobalListView ? dabStationListText[language]
+                           : currentMuxListText[language]);
+  tftPrintFixed(0, title, 155, 4, ActiveColor, ActiveColorSmooth, 28);
 
-  byte y = 0;
-  if (radio.ServiceIndex > 8 && radio.ServiceIndex < 17) {
-    y = 9;
-  } else if (radio.ServiceIndex > 16 && radio.ServiceIndex < 25) {
-    y = 17;
-  } else if (radio.ServiceIndex > 24) {
-    y = 25;
+  const uint8_t count = ChannelListCount();
+  const uint8_t index = ChannelListIndex();
+  const uint8_t y = ChannelListPageStart(index);
+
+  if (count == 0U) {
+    const bool globalScanList = radio.isFm() || DabGlobalListView;
+    if (globalScanList) {
+      const bool completed = radio.isFm() ? fmScanCompleted : dabScanCompleted;
+      tftPrintFixed(0, completed ? noStationsFoundText[language]
+                                 : scanNotRunText[language],
+                    155, 100, SecondaryColor, SecondaryColorSmooth, 16);
+      tftPrintFixed(0, pressOkScanText[language],
+                    155, 130, ActiveColor, ActiveColorSmooth, 16);
+    } else {
+      tftPrintFixed(0, noDabServiceText[language],
+                    155, 112, SecondaryColor, SecondaryColorSmooth, 16);
+    }
+    return;
   }
 
-  if (radio.numberofservices > 8) {
-    byte z = 0;
-    if (radio.numberofservices < 17) {
-      z = 2;
-    } else if (radio.numberofservices < 25) {
-      z = 3;
-    } else if (radio.numberofservices > 24) {
-      z = 4;
-    }
-    uint8_t page = 1;
-    if (y == 9) page = 2;
-    else if (y == 17) page = 3;
-    else if (y == 25) page = 4;
+  if (count > 9U) {
+    const uint8_t page = y == 0U ? 1U : static_cast<uint8_t>(2U + (y - 9U) / 8U);
+    const uint8_t pages = static_cast<uint8_t>(1U + (count - 9U + 7U) / 8U);
 
     char pageText[8];
     snprintf(pageText, sizeof(pageText), "%u/%u",
-             static_cast<unsigned>(page), static_cast<unsigned>(z));
+             static_cast<unsigned>(page), static_cast<unsigned>(pages));
     tftPrintFixed(0, pageText, 290, 10,
                   SecondaryColor, SecondaryColorSmooth, 16);
   }
 
-  for (byte i = y; i < radio.numberofservices; i++) {
-    ShowOneLine(20 * (i - y), i, (radio.ServiceIndex - y == i - y ? true : false));
+  for (byte i = y; i < count; i++) {
+    ShowOneLine(20 * (i - y), i, index == i);
     if (i - y == 8) i = 254;
   }
 }
@@ -445,7 +522,8 @@ void ShowOneLine(byte position, byte item, bool selected) {
     if (selected) FullLineSprite.pushImage(0, 0, 304, 20, selector);
 
     if (radio.isFm()) {
-      const uint16_t stationFrequency = static_cast<uint16_t>(radio.service[item].CompID);
+      const FmStationRecord& station = FmStations[item];
+      const uint16_t stationFrequency = station.frequency10kHz;
       FullLineSprite.setTextDatum(TL_DATUM);
       FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
       snprintf(value, sizeof(value), "%u.%u",
@@ -455,17 +533,44 @@ void ShowOneLine(byte position, byte item, bool selected) {
 
       FullLineSprite.setTextDatum(TC_DATUM);
       snprintf(value, sizeof(value), "%04X",
-               static_cast<unsigned>(radio.service[item].ServiceID & 0xFFFF));
+               static_cast<unsigned>(station.pi));
       FullLineSprite.drawString(value, 92, 3);
 
       FullLineSprite.setTextDatum(TL_DATUM);
       FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
-      radio.ASCIIToBuffer(radio.service[item].Label, 0, value, sizeof(value));
+      if (station.ps[0] != '\0')
+        radio.ASCIIToBuffer(station.ps, 0, value, sizeof(value));
+      else
+        snprintf(value, sizeof(value), "%u.%u MHz",
+                 static_cast<unsigned>(stationFrequency / 100U),
+                 static_cast<unsigned>((stationFrequency % 100U) / 10U));
       FullLineSprite.drawString(value, 122, 3);
 
       FullLineSprite.setTextDatum(TR_DATUM);
       FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
-      FullLineSprite.drawString(fmModeText[language], 300, 3);
+      snprintf(value, sizeof(value), "%d/%d",
+               static_cast<int>(station.rssi), static_cast<int>(station.snr));
+      FullLineSprite.drawString(value, 300, 3);
+      FullLineSprite.pushSprite(8, 35 + position);
+      return;
+    }
+
+    if (DabGlobalListView) {
+      const DabStationRecord& station = DabStations[item];
+      FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+      FullLineSprite.setTextDatum(TL_DATUM);
+      FullLineSprite.drawString(radio.getChannel(station.channelIndex), 8, 3);
+      FullLineSprite.setTextDatum(TC_DATUM);
+      snprintf(value, sizeof(value), "%04X",
+               static_cast<unsigned>(station.serviceId & 0xFFFFU));
+      FullLineSprite.drawString(value, 58, 3);
+      FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
+      FullLineSprite.setTextDatum(TL_DATUM);
+      radio.ASCIIToBuffer(station.label, station.charset, value, sizeof(value));
+      FullLineSprite.drawString(value, 86, 3);
+      FullLineSprite.setTextDatum(TR_DATUM);
+      FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+      FullLineSprite.drawString(ServiceTypeText[station.serviceType], 300, 3);
       FullLineSprite.pushSprite(8, 35 + position);
       return;
     }
@@ -584,6 +689,14 @@ void ShowOneLine(byte position, byte item, bool selected) {
         break;
 
       case 10:
+        FullLineSprite.drawString(fmSeekMenuText[language], 6, 3);
+        FullLineSprite.setTextDatum(TR_DATUM);
+        FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
+        FullLineSprite.drawString(
+            fmSeekValueText[language][fmSeekSensitivity], 300, 3);
+        break;
+
+      case 11:
         FullLineSprite.drawString(myLanguage[language][81], 6, 3);
         FullLineSprite.setTextDatum(TR_DATUM);
         break;
@@ -615,7 +728,7 @@ static void RedrawMenuSelection(byte oldItem) {
 
 // Full redraw of the settings menu (entered by long-pressing MODE).
 void BuildMenu(void) {
-  // Settings has 11 logical entries while the display layout has nine rows.
+  // Settings has more logical entries than the display's nine-row window.
   // Scroll the existing 9-row window instead of shrinking the proven UI.
   menuopen = false;
   IrRemoteUiAbort();
@@ -624,6 +737,7 @@ void BuildMenu(void) {
   slsWaitingOverlayVisible = false;
   ShowServiceInformation = false;
   ChannelListView = false;
+  DabGlobalListView = false;
 
   if (menuitem >= MENU_ITEM_COUNT) menuitem = 0;
   if (menuitem < menuFirstItem) menuFirstItem = menuitem;
@@ -717,7 +831,7 @@ void MenuUp(void) {
     IrRemoteUiRotate(+1);
     return;
   }
-  if (menuitem == 10) return;  // About is read-only.
+  if (menuitem == 11) return;  // About is read-only.
 
   OneBigLineSprite.pushImage(-11, -88, 292, 170, popupbackground);
   OneBigLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
@@ -815,6 +929,13 @@ void MenuUp(void) {
           Gpio12ModeText[requestedGpio12Mode], 135, 2);
       OneBigLineSprite.pushSprite(24, 118);
       break;
+
+    case 10:
+      fmSeekSensitivity = static_cast<uint8_t>((fmSeekSensitivity + 1U) % 3U);
+      OneBigLineSprite.drawString(
+          fmSeekValueText[language][fmSeekSensitivity], 135, 2);
+      OneBigLineSprite.pushSprite(24, 118);
+      break;
   }
 }
 
@@ -845,7 +966,7 @@ void MenuDown(void) {
     IrRemoteUiRotate(-1);
     return;
   }
-  if (menuitem == 10) return;  // About is read-only.
+  if (menuitem == 11) return;  // About is read-only.
 
   OneBigLineSprite.pushImage(-11, -88, 292, 170, popupbackground);
   OneBigLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
@@ -948,11 +1069,19 @@ void MenuDown(void) {
           Gpio12ModeText[requestedGpio12Mode], 135, 2);
       OneBigLineSprite.pushSprite(24, 118);
       break;
+
+    case 10:
+      fmSeekSensitivity = fmSeekSensitivity == 0U
+                              ? 2U : fmSeekSensitivity - 1U;
+      OneBigLineSprite.drawString(
+          fmSeekValueText[language][fmSeekSensitivity], 135, 2);
+      OneBigLineSprite.pushSprite(24, 118);
+      break;
   }
 }
 
 // Menu confirm: rotary-button click while in the menu. Either enters a sub-
-// menu, applies the current change, or commits the value to EEPROM.
+// menu, applies the current change, or commits the value to NVS.
 void DoMenu(void) {
   if (menuopen) {
     if (menuitem == 9) {
@@ -1056,6 +1185,13 @@ void DoMenu(void) {
       break;
 
     case 10:
+      Infoboxprint(fmSeekMenuText[language]);
+      OneBigLineSprite.drawString(
+          fmSeekValueText[language][fmSeekSensitivity], 135, 2);
+      OneBigLineSprite.pushSprite(24, 118);
+      break;
+
+    case 11:
       tftPrintFixed(0, myLanguage[language][79], 155, 40,
                     ActiveColor, ActiveColorSmooth, 28);
       tftPrintFixed(0, "PE5PVB, bales", 155, 72,
@@ -1150,22 +1286,41 @@ void ShowPTY(void) {
   const uint8_t ptyValue = radio.isFm() ? radio.fmPty : radio.pty;
   const bool ptyVisible =
       radio.isFm()
-          ? (!tuning && fmPtyValid && ptyValue > 0 && ptyValue <= 31)
+          ? (!tuning && fmPtyValid && ptyValue <= 31)
           : (radio.ServiceStart && ptyValue > 0 && ptyValue <= 29);
   const uint8_t displayPty = ptyVisible ? ptyValue : 0xFF;
+  static uint8_t fmIndicatorsOld = 0xFF;
+  const uint8_t fmIndicators = radio.isFm()
+      ? static_cast<uint8_t>((radio.fmAf.count != 0U ? 1U : 0U) |
+                             (radio.fmTp ? 2U : 0U) |
+                             (radio.fmTa ? 4U : 0U))
+      : 0U;
 
-  // PTY is checked every UI pass. Point directly at the existing language
-  // string instead of constructing a temporary Arduino String each time.
-  // PTY 0 means no/undefined programme type and remains visually blank.
-  const char* value = ptyVisible ? myLanguage[language][37 + ptyValue] : "";
+  char fmValue[64] = "";
+  const char* value = "";
+  if (radio.isFm()) {
+    char indicators[12];
+    snprintf(indicators, sizeof(indicators), "%s%s%s",
+             radio.fmAf.count != 0U ? " AF" : "",
+             radio.fmTp ? " TP" : "", radio.fmTa ? " TA" : "");
+    const int maxPtyChars = 18 - static_cast<int>(strlen(indicators));
+    snprintf(fmValue, sizeof(fmValue), "%.*s%s",
+             maxPtyChars > 0 ? maxPtyChars : 0,
+             ptyVisible ? fm_features::ptyName(ptyValue, radio.isRbds()) : "",
+             indicators);
+    value = fmValue;
+  } else if (ptyVisible) {
+    value = myLanguage[language][37 + ptyValue];
+  }
 
-  if (displayPty != ptyold || displayreset) {
+  if (displayPty != ptyold || fmIndicators != fmIndicatorsOld || displayreset) {
     LongSprite.pushImage(-8, -162, 320, 240, Background);
     LongSprite.setTextDatum(TC_DATUM);
     LongSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
     LongSprite.drawString(value, 75, 0);
     LongSprite.pushSprite(8, 162);
     ptyold = displayPty;
+    fmIndicatorsOld = fmIndicators;
   }
 }
 
@@ -1360,6 +1515,12 @@ void ShowPS(void) {
     }
   } else if (tuning || seek) {
     value[0] = '\0';
+  } else if (trysetservice && _serviceName[0] != '\0') {
+    // A global-list selection already has a validated scan label. Keep that
+    // target visible while its multiplex list is loading and the exact
+    // SID/component pair is being started asynchronously.
+    radio.ASCIIToBuffer(_serviceName, _serviceNameCharset,
+                        value, sizeof(value));
   } else if (radio.signallock) {
     if (radio.numberofservices == 0) {
       snprintf(value, sizeof(value), "%s", myLanguage[language][73]);  // Waiting for list
@@ -1385,7 +1546,7 @@ void ShowPS(void) {
         snprintf(value, sizeof(value), "%s", myLanguage[language][74]);  // Select service
     }
   } else if (trysetservice) {
-    // The EEPROM name belongs to the previously stored service. Do not paint it
+    // The stored preset name belongs to the previously selected service. Do not paint it
     // until the current multiplex/service list confirms that service ID; this
     // avoids a brief stale/incorrect station-name flash after restart.
     value[0] = '\0';
@@ -1892,6 +2053,8 @@ void ShowBitrate(void) {
 
 void ShowClock(void) {
   static uint32_t appliedDabTimeGeneration = 0;
+  static bool appliedFmCt = false;
+  static fm_features::ClockTime previousFmCt;
   const uint32_t timeGeneration = radio.timeSampleGeneration();
   if (!radio.isFm() && radio.signallock &&
       dab_scheduler::takeGeneration(timeGeneration,
@@ -1899,6 +2062,25 @@ void ShowClock(void) {
     setTime(radio.Hours, radio.Minutes, radio.Seconds,
             radio.Days, radio.Months, radio.Year);
     appliedDabTimeGeneration = timeGeneration;
+  }
+
+  // RDS CT carries UTC plus a local offset. Apply a confirmed sample only
+  // when it changes; repeated RDS groups must not reset seconds to zero.
+  if (!radio.isFm() || !radio.fmCtValid) {
+    appliedFmCt = false;
+  } else {
+    const fm_features::ClockTime& ct = radio.fmCt;
+    const bool changed = !appliedFmCt ||
+        ct.year != previousFmCt.year || ct.month != previousFmCt.month ||
+        ct.day != previousFmCt.day || ct.hour != previousFmCt.hour ||
+        ct.minute != previousFmCt.minute ||
+        ct.localOffsetHalfHours != previousFmCt.localOffsetHalfHours;
+    if (changed) {
+      setTime(ct.hour, ct.minute, 0, ct.day, ct.month, ct.year);
+      adjustTime(static_cast<long>(ct.localOffsetHalfHours) * 1800L);
+      previousFmCt = ct;
+      appliedFmCt = true;
+    }
   }
 
   // This function runs in the normal UI loop. Keep the two displayed strings in
