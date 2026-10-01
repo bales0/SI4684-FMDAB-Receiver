@@ -31,6 +31,55 @@ inline Rotary2Target rotary2Target(bool fmMode, bool autoMode,
                              : Rotary2Target::None;
 }
 
+inline bool shouldShowStoredFmPs(bool manualTuning, bool seekActive,
+                                 uint16_t currentFrequency,
+                                 uint16_t targetFrequency,
+                                 bool storedPsAvailable,
+                                 bool livePsAvailable) {
+  return !manualTuning && !seekActive && storedPsAvailable &&
+         !livePsAvailable && currentFrequency == targetFrequency;
+}
+
+inline bool rotary2ClosesDabSlideshowWait(bool fmMode, bool waitingForSlide,
+                                          bool globalListAvailable) {
+  return !fmMode && waitingForSlide && globalListAvailable;
+}
+
+inline bool isDabAudioServiceType(uint8_t serviceType) {
+  return serviceType == 0x00U || serviceType == 0x04U ||
+         serviceType == 0x05U;
+}
+
+template <typename ServiceT>
+int16_t findDabServiceByIdentity(const ServiceT* services, uint8_t count,
+                                 uint32_t serviceId, uint32_t componentId,
+                                 bool componentValid) {
+  int16_t uniqueSidMatch = -1;
+  uint8_t sidMatchCount = 0U;
+  for (uint8_t i = 0; i < count; ++i) {
+    if (services[i].ServiceID != serviceId) continue;
+
+    // A freshly parsed DAB service list uses type 8 as an explicit
+    // "metadata not queried yet" marker. SID+component already form an exact
+    // identity at that point, so do not make the fast path wait for the later
+    // cooperative GET_SUBCHAN_INFO pass. Once classified, still reject an
+    // exact match that is known not to be an audio component.
+    if (componentValid && services[i].CompID == componentId &&
+        (services[i].ServiceType == 8U ||
+         isDabAudioServiceType(services[i].ServiceType)))
+      return static_cast<int16_t>(i);
+
+    if (!isDabAudioServiceType(services[i].ServiceType)) continue;
+    uniqueSidMatch = static_cast<int16_t>(i);
+    if (sidMatchCount != 0xFFU) ++sidMatchCount;
+  }
+  return sidMatchCount == 1U ? uniqueSidMatch : -1;
+}
+
+inline bool deferMissingDabIdentity(bool metadataReady, bool matchFound) {
+  return !matchFound && !metadataReady;
+}
+
 struct AfList {
   uint16_t pi = 0;
   uint8_t expected = 0;
@@ -66,6 +115,12 @@ struct ClockTime {
   uint8_t hour = 0;
   uint8_t minute = 0;
   int8_t localOffsetHalfHours = 0;
+};
+
+enum class ClockSampleResult : uint8_t {
+  Candidate,
+  Confirmed,
+  Rejected
 };
 
 inline bool leapYear(uint16_t year) {
@@ -117,6 +172,93 @@ inline bool decodeClockTime(uint16_t blockB, uint16_t blockC, uint16_t blockD,
   if ((blockD & 0x0020U) != 0) parsed.localOffsetHalfHours *= -1;
   output = parsed;
   return true;
+}
+
+inline bool clockTimeToMinutes(const ClockTime& value, int32_t& minutes) {
+  if (value.year < 1900U || value.year > 2099U || value.month < 1U ||
+      value.month > 12U || value.day < 1U ||
+      value.day > daysInMonth(value.year, value.month) || value.hour > 23U ||
+      value.minute > 59U || value.localOffsetHalfHours < -24 ||
+      value.localOffsetHalfHours > 24)
+    return false;
+
+  int32_t days = 0;
+  for (uint16_t year = 1900U; year < value.year; ++year)
+    days += leapYear(year) ? 366 : 365;
+  for (uint8_t month = 1U; month < value.month; ++month)
+    days += daysInMonth(value.year, month);
+  days += static_cast<int32_t>(value.day) - 1;
+  minutes = days * 1440L + static_cast<int32_t>(value.hour) * 60L +
+            value.minute;
+  return true;
+}
+
+inline bool clockSamplesConsistent(const ClockTime& previous,
+                                   const ClockTime& current,
+                                   uint32_t elapsedMs,
+                                   uint8_t maxAdvanceMinutes = 5U) {
+  if (previous.localOffsetHalfHours != current.localOffsetHalfHours ||
+      elapsedMs > 10UL * 60UL * 1000UL)
+    return false;
+  int32_t previousMinutes = 0;
+  int32_t currentMinutes = 0;
+  if (!clockTimeToMinutes(previous, previousMinutes) ||
+      !clockTimeToMinutes(current, currentMinutes))
+    return false;
+  const int32_t advance = currentMinutes - previousMinutes;
+  const uint32_t elapsedMinutes = elapsedMs / 60000UL;
+  const uint32_t elapsedAllowance = elapsedMinutes + 1U;
+  const uint32_t allowed = elapsedAllowance < maxAdvanceMinutes
+                               ? elapsedAllowance
+                               : maxAdvanceMinutes;
+  return advance >= 0 && static_cast<uint32_t>(advance) <= allowed;
+}
+
+struct ClockValidator {
+  bool candidateValid = false;
+  uint16_t candidatePi = 0U;
+  uint32_t candidateTimestampMs = 0U;
+  ClockTime candidate;
+
+  void reset() {
+    candidateValid = false;
+    candidatePi = 0U;
+    candidateTimestampMs = 0U;
+    candidate = ClockTime{};
+  }
+
+  ClockSampleResult ingest(const ClockTime& decoded, uint16_t pi,
+                           uint32_t now, ClockTime& confirmed) {
+    if (pi == 0U) {
+      reset();
+      return ClockSampleResult::Rejected;
+    }
+    if (!candidateValid || candidatePi != pi) {
+      candidate = decoded;
+      candidatePi = pi;
+      candidateTimestampMs = now;
+      candidateValid = true;
+      return ClockSampleResult::Candidate;
+    }
+    const uint32_t elapsed = now - candidateTimestampMs;
+    if (!clockSamplesConsistent(candidate, decoded, elapsed)) {
+      candidate = decoded;
+      candidateTimestampMs = now;
+      return ClockSampleResult::Rejected;
+    }
+    candidate = decoded;
+    candidateTimestampMs = now;
+    confirmed = decoded;
+    return ClockSampleResult::Confirmed;
+  }
+};
+
+inline bool shouldShowPendingDabTarget(bool selectionDebounce,
+                                       bool restorePending,
+                                       bool driverStartPending,
+                                       bool labelAvailable) {
+  return labelAvailable &&
+         (selectionDebounce || restorePending || driverStartPending);
 }
 
 inline const char* ptyName(uint8_t pty, bool rbds) {

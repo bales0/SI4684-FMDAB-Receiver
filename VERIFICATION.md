@@ -14,6 +14,10 @@
   deduplication, CT/MJD validation, RDS/RBDS PTY lookup, PI/frequency station
   identity, DAB audio-service boundaries and channel wrap, plus Rotary 1
   short/long-press suppression.
+- Host DAB service-switch policy test: data-before-audio STOP ordering, latest-
+  request-wins supersession, bounded wrap-safe retry/backoff, 200 ms settle
+  gates, central data evaluation, deferred audio-only SLS retry and SLS context
+  ownership, including audio-PAD SLS without a separate type-3 service.
 - Host JPEG tests with GCC C++11, `-Wall -Wextra -Werror -pedantic`:
   baseline grayscale, YCbCr 4:4:4/4:2:2/4:2:0, a complete 320×240 baseline
   4:2:0 decode, and progressive grayscale/4:4:4/4:2:2/4:2:0 decodes including
@@ -27,8 +31,8 @@
   pixel-identical to the matching baseline fixture. It is not the unavailable
   station object with hash `47083CD0`.
 - PlatformIO release build with `espressif32@6.9.0`: success for `esp32dev`
-  without PSRAM. Reported static usage: 56,000 bytes RAM (17.1%) and
-  3,432,673 bytes flash (83.1%). The persistent 50 KiB MOT buffer and 76,800
+  without PSRAM. Reported static usage: 56,120 bytes RAM (17.1%) and
+  3,440,053 bytes flash (83.3%). The persistent 50 KiB MOT buffer and 76,800
   byte shared decoder arena are allocated at runtime and therefore are not
   included in that static RAM number.
 - Clang is not installed in this environment: **NOT VERIFIED**.
@@ -36,8 +40,8 @@
   **NOT VERIFIED**.
 
 The generated `.pio/build/esp32dev/firmware.bin` is a successful development
-build of 3,433,296 bytes with SHA-256
-`189244E8875168FDDFA85EC11DD3D591B43521AA25EA990CB5B195A6BB6486E1`.
+build of 3,440,672 bytes with SHA-256
+`2C9EB44E8D2778EA127B7E5397C8199B23891E350498F88CB69AB0286E60BB8A`.
 It is not copied into `Release/` or represented as a hardware-validated release.
 `Release/firmware_v2_0.bin` remains an unchanged historical image.
 
@@ -100,6 +104,24 @@ It is not copied into `Release/` or represented as a hardware-validated release.
     the final selection. For services sharing a SID, confirm the Component ID
     selects the correct audio component and the UI does not remain on
     `Select service`. Repeat the exact-component check from the Rotary 1 list.
+18. With active DAB SLS, rapidly select A -> B -> C and repeat across multiplexes.
+    The log must show data STOP, audio STOP, `ServiceSettle`, audio START,
+    `AudioSettle`, then at most one data START for the final service. Verify no
+    command storm, watchdog/reset, stale slide or stale station label. Inject or
+    observe `0x03` rejections and confirm bounded backoff without cold recovery;
+    separately interrupt CTS/INTB and confirm only consecutive CTS timeouts invoke
+    the existing transport recovery. Repeat in POLL, INTB and AUTO configurations.
+19. On an ensemble that emits DSRV/MOT from audio PAD but has no standalone
+    type-3 data service, confirm `ResolveData -> Ready`, no continuing
+    `staleMOT` growth, and successful slideshow reception. While its manual
+    `Loading slideshow` view is visible, turn Rotary 2 and confirm that the
+    overlay closes immediately and the adjacent global station is selected.
+20. Enable `FM AF`, remain on one PI for at least 10 s and attenuate the RF
+    signal below the selected seek-sensitivity thresholds for at least 4 s.
+    Verify that probes are muted and non-blocking, wrong/missing PI candidates
+    are rejected, a same-PI candidate needs two valid RSQ samples and at least
+    +5 dB RSSI without more than 1 dB SNR loss, failures restore the original
+    frequency, and 30 s/10 s success/failure cooldowns prevent ping-pong.
 
 ## Expected diagnostic sequence examples
 
@@ -108,6 +130,9 @@ It is not copied into `Release/` or represented as a hardware-validated release.
 [RADIO] PRECHECK result=0 image=...
 [RADIO/CTS] late host service gap=... us afterDeadline=... us result=0 (CTS-ready time unknown)
 [DAB/STOP] unconfirmed result=-4 retry=1/3 backoffUntil=...
+[DAB/SWITCH] state=StopAudio -> WaitAudioStop request=...
+[DAB/SWITCH] state=WaitAudioStop -> ServiceSettle request=...
+[DAB/DATA] start rejected retry=1/3 until=... result=... reason=0x03
 [SLS/JPEG] tid=... size=... hash=... coding=SUPPORTED_PROGRESSIVE_JPEG ...
 [SLS/JPEG] render=OK size=... lastMCURow=...
 ```

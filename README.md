@@ -59,7 +59,8 @@ Official Espressif references:
 - Up to **99 FM presets**.
 - RDS/RBDS:
   - PI, region-specific PTY text, PS and RadioText;
-  - AF list decoding from group 0A (display/diagnostics only; no automatic retune);
+  - AF list decoding from group 0A plus optional, default-off automatic AF
+    switching with mandatory PI verification and RSSI/SNR hysteresis;
   - TP and TA indicators;
   - validated group 4A Clock-Time/date, shown in System Information and used
     for the displayed local clock after applying the broadcast UTC offset;
@@ -164,6 +165,26 @@ command receive a turn before draining resumes. Stable intervals are:
   subchannel 60 s;
 - FM RSQ 500 ms; ACF 1000 ms; signal/multipath UI 250 ms;
 - FM RDS remains IRQ-driven with an 80 ms polling fallback.
+
+DAB service changes use one explicit non-blocking switch state machine. It
+serializes data STOP, audio STOP, a 200 ms settle interval, the new audio START,
+another 200 ms settle after confirmation, and only then resolves and starts the
+matching data component. A rapid A -> B -> C selection supersedes older request
+IDs; completion of an already submitted command is reconciled with the physical
+tuner state before the newest request continues. Metadata callbacks only request
+data-component evaluation, so there is a single authority that can issue data
+START and no callback-driven command storm.
+
+Si4684 `NOT_AVAILABLE` (`0x03`) is treated as a responsive command rejection and
+uses bounded non-blocking backoff. It does not trigger a cold reset. Only repeated
+CTS timeouts use the existing bounded transport recovery. If slideshow data cannot
+be started, audio remains playing and SLS is retried later; MOT objects received
+outside the confirmed current data-service context are discarded. Data association
+prefers a component with the active audio SID and accepts the legacy ensemble-wide
+fallback only when exactly one eligible component exists. Ensembles that carry
+MOT/SLS directly in the confirmed audio service PAD do not require a separate
+type-3 data-service START; that context becomes valid after audio confirmation
+and its settle interval.
 
 The signal display has two stages: each new RF sample updates the radio filter
 once, while the faster UI timer only interpolates toward that filtered target.
@@ -446,7 +467,9 @@ the authoritative tuning source.
   and offers a full scan with OK.
 - Rotary 2 uses these global scan lists directly on the main screen. DAB falls
   back to the current multiplex only when its global list is unavailable; FM
-  AUTO deliberately does nothing when its global list is unavailable.
+  AUTO deliberately does nothing when its global list is unavailable. A DAB
+  global-list detent also closes a manually armed `Loading slideshow` view and
+  continues directly with the adjacent station.
 
 - Repeating/holding IR TUNE does not continually restart an already running AUTO seek.
 

@@ -26,7 +26,7 @@ extern void DabDynamicLabelTextToBuffer(const char* input, char* output, size_t 
 
 byte menuitem;                    // logical item index in Settings
 static byte menuFirstItem = 0;      // first logical item shown in 9-row window
-static constexpr byte MENU_ITEM_COUNT = 12;
+static constexpr byte MENU_ITEM_COUNT = 13;
 static constexpr byte MENU_VISIBLE_ROWS = 9;
 
 // Apply the user-selected colour theme to the global PrimaryColor/etc. used
@@ -697,6 +697,15 @@ void ShowOneLine(byte position, byte item, bool selected) {
         break;
 
       case 11:
+        FullLineSprite.drawString(fmAfMenuText[language], 6, 3);
+        FullLineSprite.setTextDatum(TR_DATUM);
+        FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
+        FullLineSprite.drawString(
+            fmAfEnabled ? myLanguage[language][23] : myLanguage[language][24],
+            300, 3);
+        break;
+
+      case 12:
         FullLineSprite.drawString(myLanguage[language][81], 6, 3);
         FullLineSprite.setTextDatum(TR_DATUM);
         break;
@@ -831,7 +840,7 @@ void MenuUp(void) {
     IrRemoteUiRotate(+1);
     return;
   }
-  if (menuitem == 11) return;  // About is read-only.
+  if (menuitem == 12) return;  // About is read-only.
 
   OneBigLineSprite.pushImage(-11, -88, 292, 170, popupbackground);
   OneBigLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
@@ -936,6 +945,13 @@ void MenuUp(void) {
           fmSeekValueText[language][fmSeekSensitivity], 135, 2);
       OneBigLineSprite.pushSprite(24, 118);
       break;
+    case 11:
+      fmAfEnabled = !fmAfEnabled;
+      OneBigLineSprite.drawString(
+          fmAfEnabled ? myLanguage[language][23] : myLanguage[language][24],
+          135, 2);
+      OneBigLineSprite.pushSprite(24, 118);
+      break;
   }
 }
 
@@ -966,7 +982,7 @@ void MenuDown(void) {
     IrRemoteUiRotate(-1);
     return;
   }
-  if (menuitem == 11) return;  // About is read-only.
+  if (menuitem == 12) return;  // About is read-only.
 
   OneBigLineSprite.pushImage(-11, -88, 292, 170, popupbackground);
   OneBigLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
@@ -1075,6 +1091,13 @@ void MenuDown(void) {
                               ? 2U : fmSeekSensitivity - 1U;
       OneBigLineSprite.drawString(
           fmSeekValueText[language][fmSeekSensitivity], 135, 2);
+      OneBigLineSprite.pushSprite(24, 118);
+      break;
+    case 11:
+      fmAfEnabled = !fmAfEnabled;
+      OneBigLineSprite.drawString(
+          fmAfEnabled ? myLanguage[language][23] : myLanguage[language][24],
+          135, 2);
       OneBigLineSprite.pushSprite(24, 118);
       break;
   }
@@ -1192,6 +1215,14 @@ void DoMenu(void) {
       break;
 
     case 11:
+      Infoboxprint(fmAfMenuText[language]);
+      OneBigLineSprite.drawString(
+          fmAfEnabled ? myLanguage[language][23] : myLanguage[language][24],
+          135, 2);
+      OneBigLineSprite.pushSprite(24, 118);
+      break;
+
+    case 12:
       tftPrintFixed(0, myLanguage[language][79], 155, 40,
                     ActiveColor, ActiveColorSmooth, 28);
       tftPrintFixed(0, "PE5PVB, bales", 155, 72,
@@ -1314,11 +1345,11 @@ void ShowPTY(void) {
   }
 
   if (displayPty != ptyold || fmIndicators != fmIndicatorsOld || displayreset) {
-    LongSprite.pushImage(-8, -162, 320, 240, Background);
-    LongSprite.setTextDatum(TC_DATUM);
-    LongSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
-    LongSprite.drawString(value, 75, 0);
-    LongSprite.pushSprite(8, 162);
+    FullLineSprite.pushImage(-8, -162, 320, 240, Background);
+    FullLineSprite.setTextDatum(TC_DATUM);
+    FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+    FullLineSprite.drawString(value, 75, 0);
+    FullLineSprite.pushSprite(8, 162, 0, 0, 150, 17);
     ptyold = displayPty;
     fmIndicatorsOld = fmIndicators;
   }
@@ -1434,11 +1465,11 @@ void ShowSID(void) {
   }
 
   if (strcmp(value, SIDold) != 0 || displayreset) {
-    ShortSprite.pushImage(-38, -120, 320, 240, Background);
-    ShortSprite.setTextDatum(TL_DATUM);
-    ShortSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
-    ShortSprite.drawString(value, 0, 0);
-    ShortSprite.pushSprite(38, 120);
+    FullLineSprite.pushImage(-38, -120, 320, 240, Background);
+    FullLineSprite.setTextDatum(TL_DATUM);
+    FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+    FullLineSprite.drawString(value, 0, 0);
+    FullLineSprite.pushSprite(38, 120, 0, 0, 36, 16);
     snprintf(SIDold, sizeof(SIDold), "%s", value);
   }
 }
@@ -1455,11 +1486,11 @@ void ShowEID(void) {
   }
 
   if (strcmp(value, EIDold) != 0 || displayreset) {
-    ShortSprite.pushImage(-38, -106, 320, 240, Background);
-    ShortSprite.setTextDatum(TL_DATUM);
-    ShortSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
-    ShortSprite.drawString(value, 0, 0);
-    ShortSprite.pushSprite(38, 106);
+    FullLineSprite.pushImage(-38, -106, 320, 240, Background);
+    FullLineSprite.setTextDatum(TL_DATUM);
+    FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+    FullLineSprite.drawString(value, 0, 0);
+    FullLineSprite.pushSprite(38, 106, 0, 0, 36, 16);
     snprintf(EIDold, sizeof(EIDold), "%s", value);
   }
 }
@@ -1484,8 +1515,20 @@ void ShowPS(void) {
     if (!tuning) radio.ASCIIToBuffer(radio.fmPs, 0, value, sizeof(value));
     trimFixed(value);
 
-    // The station-name field has only two visible states: placeholder while
-    // PS is unknown/acquiring, then the decoder-confirmed eight-character PS.
+    const bool livePsAvailable = value[0] != '\0';
+    if (livePsAvailable) {
+      // The decoder-confirmed live PS is authoritative from this point on.
+      fmPendingStationPs[0] = '\0';
+      fmPendingStationFrequency = 0U;
+    } else if (fm_features::shouldShowStoredFmPs(
+                   tuning, seek, fmfreq, fmPendingStationFrequency,
+                   fmPendingStationPs[0] != '\0', livePsAvailable)) {
+      radio.ASCIIToBuffer(fmPendingStationPs, 0, value, sizeof(value));
+      trimFixed(value);
+    }
+
+    // A scan-list selection may supply its saved PS during acquisition. For
+    // every other tune the placeholder remains until live RDS is confirmed.
     if (value[0] == '\0') snprintf(value, sizeof(value), "--------");
 
     if (strcmp(value, PSold) != 0 || displayreset) {
@@ -1499,7 +1542,13 @@ void ShowPS(void) {
     return;
   }
 
-  if (radio.ServiceStart) {
+  const bool showPendingTarget = fm_features::shouldShowPendingDabTarget(
+      dabServiceSelectionPending, trysetservice,
+      radio.isDabServiceStartPending(), _serviceName[0] != '\0');
+  if (showPendingTarget) {
+    radio.ASCIIToBuffer(_serviceName, _serviceNameCharset,
+                        value, sizeof(value));
+  } else if (radio.ServiceStart) {
     radio.ASCIIToBuffer(radio.PStext, radio.ServiceLabelCharset,
                         value, sizeof(value));
 
@@ -1515,12 +1564,6 @@ void ShowPS(void) {
     }
   } else if (tuning || seek) {
     value[0] = '\0';
-  } else if (trysetservice && _serviceName[0] != '\0') {
-    // A global-list selection already has a validated scan label. Keep that
-    // target visible while its multiplex list is loading and the exact
-    // SID/component pair is being started asynchronously.
-    radio.ASCIIToBuffer(_serviceName, _serviceNameCharset,
-                        value, sizeof(value));
   } else if (radio.signallock) {
     if (radio.numberofservices == 0) {
       snprintf(value, sizeof(value), "%s", myLanguage[language][73]);  // Waiting for list
@@ -1621,11 +1664,11 @@ void ShowProtectionlevel(void) {
   }
 
   if (strcmp(value, PLold) != 0 || displayreset) {
-    MediumSprite.pushImage(-9, -90, 320, 240, Background);
-    MediumSprite.setTextDatum(TC_DATUM);
-    MediumSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
-    MediumSprite.drawString(value, 30, 0);
-    MediumSprite.pushSprite(9, 90);
+    FullLineSprite.pushImage(-9, -90, 320, 240, Background);
+    FullLineSprite.setTextDatum(TC_DATUM);
+    FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
+    FullLineSprite.drawString(value, 30, 0);
+    FullLineSprite.pushSprite(9, 90, 0, 0, 70, 16);
     snprintf(PLold, sizeof(PLold), "%s", value);
   }
 }
@@ -1941,11 +1984,11 @@ void ShowSignalLevel(void) {
   if (!ShowServiceInformation) {
     if (SignalLevelprint > SignalLevelold + 3 ||
         SignalLevelprint < SignalLevelold - 3 || displayreset) {
-      ShortSprite.fillSprite(BackgroundColor3);
-      ShortSprite.setTextDatum(TR_DATUM);
-      ShortSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
-      ShortSprite.drawString(signalText, 35, 0);
-      ShortSprite.pushSprite(146, 109);
+      FullLineSprite.fillSprite(BackgroundColor3);
+      FullLineSprite.setTextDatum(TR_DATUM);
+      FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
+      FullLineSprite.drawString(signalText, 35, 0);
+      FullLineSprite.pushSprite(146, 109, 0, 0, 36, 16);
 
       int segments = 0;
       if (SignalLevel > 120)
@@ -2042,11 +2085,11 @@ void ShowBitrate(void) {
                static_cast<unsigned>(radio.bitrate));
     }
 
-    MediumSprite.pushImage(-9, -140, 320, 240, Background);
-    MediumSprite.setTextDatum(TC_DATUM);
-    MediumSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
-    MediumSprite.drawString(value, 30, 0);
-    MediumSprite.pushSprite(9, 140);
+    FullLineSprite.pushImage(-9, -140, 320, 240, Background);
+    FullLineSprite.setTextDatum(TC_DATUM);
+    FullLineSprite.setTextColor(PrimaryColor, PrimaryColorSmooth, false);
+    FullLineSprite.drawString(value, 30, 0);
+    FullLineSprite.pushSprite(9, 140, 0, 0, 70, 16);
     BitrateOld = radio.bitrate;
   }
 }
@@ -2091,20 +2134,20 @@ void ShowClock(void) {
   snprintf(datestring, sizeof(datestring), "%02d-%02d-%04d", day(), month(), year());
 
   if (strcmp(clockstringOld, clockstring) != 0 || displayreset) {
-    ShortSprite.pushImage(-105, -7, 320, 240, Background);
-    ShortSprite.setTextDatum(TL_DATUM);
-    ShortSprite.setTextColor(ActiveColor, ActiveColorSmooth, false);
-    ShortSprite.drawString(clockstring, 0, 0);
-    ShortSprite.pushSprite(105, 7);
+    FullLineSprite.pushImage(-105, -7, 320, 240, Background);
+    FullLineSprite.setTextDatum(TL_DATUM);
+    FullLineSprite.setTextColor(ActiveColor, ActiveColorSmooth, false);
+    FullLineSprite.drawString(clockstring, 0, 0);
+    FullLineSprite.pushSprite(105, 7, 0, 0, 36, 16);
     snprintf(clockstringOld, sizeof(clockstringOld), "%s", clockstring);
   }
 
   if (strcmp(datestringOld, datestring) != 0 || displayreset) {
-    MediumSprite.pushImage(-177, -7, 320, 240, Background);
-    MediumSprite.setTextDatum(TL_DATUM);
-    MediumSprite.setTextColor(ActiveColor, ActiveColorSmooth, false);
-    MediumSprite.drawString(datestring, 0, 0);
-    MediumSprite.pushSprite(177, 7);
+    FullLineSprite.pushImage(-177, -7, 320, 240, Background);
+    FullLineSprite.setTextDatum(TL_DATUM);
+    FullLineSprite.setTextColor(ActiveColor, ActiveColorSmooth, false);
+    FullLineSprite.drawString(datestring, 0, 0);
+    FullLineSprite.pushSprite(177, 7, 0, 0, 70, 16);
     snprintf(datestringOld, sizeof(datestringOld), "%s", datestring);
   }
 }

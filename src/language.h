@@ -749,6 +749,9 @@ static const char* const fmScanText[8] PROGMEM = {
 static const char* const fmSeekMenuText[8] PROGMEM = {
   "FM Seek", "FM Seek", "FM Seek", "FM Seek",
   "FM Seek", "FM Seek", "FM Seek", "FM Seek"};
+static const char* const fmAfMenuText[8] PROGMEM = {
+  "FM AF", "FM AF", "FM AF", "FM AF",
+  "FM AF", "FM AF", "FM AF", "FM AF"};
 static const char* const fmSeekValueText[8][3] PROGMEM = {
   {"Weak", "Normal", "Strong"}, {"Weak", "Normal", "Strong"},
   {"Weak", "Normal", "Strong"}, {"Weak", "Normal", "Strong"},

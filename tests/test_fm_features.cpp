@@ -1,9 +1,14 @@
 #include "../src/fm_features.h"
+#include "../src/fm_af_policy.h"
 #include "../src/FmRegion.h"
 #include <cassert>
 #include <cstring>
 
-struct Service { uint8_t ServiceType; };
+struct Service {
+  uint8_t ServiceType;
+  uint32_t ServiceID;
+  uint32_t CompID;
+};
 
 int main() {
   assert(stepFmFrequency(10800, 10, static_cast<uint8_t>(FmRegion::Europe)) == 8750);
@@ -33,7 +38,43 @@ int main() {
   assert(std::strcmp(fm_features::ptyName(4, false), "Sport") == 0);
   assert(std::strcmp(fm_features::ptyName(4, true), "Talk") == 0);
 
-  const Service services[] = {{8}, {0}, {4}, {8}, {5}};
+  fm_features::ClockValidator clockValidator;
+  fm_features::ClockTime confirmed;
+  assert(clockValidator.ingest(ct, 0x1234, 1000, confirmed) ==
+         fm_features::ClockSampleResult::Candidate);
+  fm_features::ClockTime nextMinute = ct;
+  nextMinute.minute = 46;
+  assert(clockValidator.ingest(nextMinute, 0x1234, 61000, confirmed) ==
+         fm_features::ClockSampleResult::Confirmed);
+  assert(confirmed.minute == 46);
+  fm_features::ClockTime implausible = nextMinute;
+  implausible.hour = 17;
+  assert(clockValidator.ingest(implausible, 0x1234, 62000, confirmed) ==
+         fm_features::ClockSampleResult::Rejected);
+  assert(clockValidator.ingest(implausible, 0x5678, 63000, confirmed) ==
+         fm_features::ClockSampleResult::Candidate);
+  fm_features::ClockTime dayEnd;
+  dayEnd.year = 2023; dayEnd.month = 2; dayEnd.day = 28;
+  dayEnd.hour = 23; dayEnd.minute = 59; dayEnd.localOffsetHalfHours = 2;
+  fm_features::ClockTime nextDay;
+  nextDay.year = 2023; nextDay.month = 3; nextDay.day = 1;
+  nextDay.hour = 0; nextDay.minute = 0; nextDay.localOffsetHalfHours = 2;
+  fm_features::ClockTime yearEnd;
+  yearEnd.year = 2023; yearEnd.month = 12; yearEnd.day = 31;
+  yearEnd.hour = 23; yearEnd.minute = 59; yearEnd.localOffsetHalfHours = -7;
+  fm_features::ClockTime nextYear;
+  nextYear.year = 2024; nextYear.month = 1; nextYear.day = 1;
+  nextYear.hour = 0; nextYear.minute = 0; nextYear.localOffsetHalfHours = -7;
+  assert(fm_features::clockSamplesConsistent(dayEnd, nextDay, 60000));
+  assert(fm_features::clockSamplesConsistent(yearEnd, nextYear, 60000));
+  fm_features::ClockTime negativeOffset;
+  const uint16_t negativeD = static_cast<uint16_t>(
+      ((13U & 15U) << 12) | (45U << 6) | 0x20U | 7U);
+  assert(fm_features::decodeClockTime(b, c, negativeD, negativeOffset));
+  assert(negativeOffset.localOffsetHalfHours == -7);
+
+  const Service services[] = {
+      {8, 0, 0}, {0, 0, 0}, {4, 0, 0}, {8, 0, 0}, {5, 0, 0}};
   assert(fm_features::adjacentAudioService(services, 5, 1, true) == 2);
   assert(fm_features::adjacentAudioService(services, 5, 4, true) == -1);
   assert(fm_features::adjacentAudioService(services, 5, 1, false) == -1);
@@ -58,6 +99,58 @@ int main() {
          Rotary2Target::DabCurrentMux);
   assert(fm_features::rotary2Target(false, false, false, false) ==
          Rotary2Target::None);
+  assert(fm_features::shouldShowStoredFmPs(
+      false, false, 9500U, 9500U, true, false));
+  assert(!fm_features::shouldShowStoredFmPs(
+      true, false, 9500U, 9500U, true, false));
+  assert(!fm_features::shouldShowStoredFmPs(
+      false, true, 9500U, 9500U, true, false));
+  assert(!fm_features::shouldShowStoredFmPs(
+      false, false, 9510U, 9500U, true, false));
+  assert(!fm_features::shouldShowStoredFmPs(
+      false, false, 9500U, 9500U, true, true));
+  assert(fm_features::rotary2ClosesDabSlideshowWait(false, true, true));
+  assert(!fm_features::rotary2ClosesDabSlideshowWait(false, false, true));
+  assert(!fm_features::rotary2ClosesDabSlideshowWait(false, true, false));
+  assert(!fm_features::rotary2ClosesDabSlideshowWait(true, true, true));
+
+  const Service identities[] = {
+      {0, 0x100U, 0x10U}, {4, 0x200U, 0x20U},
+      {5, 0x200U, 0x21U}, {8, 0x300U, 0x30U},
+      {0, 0x400U, 0x40U}, {3, 0x500U, 0x50U}};
+  assert(fm_features::findDabServiceByIdentity(
+             identities, 5, 0x200U, 0x21U, true) == 2);
+  assert(fm_features::findDabServiceByIdentity(
+             identities, 5, 0x400U, 0x99U, true) == 4);
+  assert(fm_features::findDabServiceByIdentity(
+             identities, 5, 0x200U, 0x99U, true) == -1);
+  assert(fm_features::findDabServiceByIdentity(
+             identities, 5, 0x300U, 0x30U, true) == 3);
+  assert(fm_features::findDabServiceByIdentity(
+             identities, 6, 0x300U, 0x30U, true) == 3);
+  assert(fm_features::findDabServiceByIdentity(
+             identities, 6, 0x300U, 0x99U, true) == -1);
+  assert(fm_features::findDabServiceByIdentity(
+             identities, 6, 0x500U, 0x50U, true) == -1);
+  assert(fm_features::deferMissingDabIdentity(false, false));
+  assert(!fm_features::deferMissingDabIdentity(true, false));
+  assert(!fm_features::deferMissingDabIdentity(false, true));
+  assert(fm_features::shouldShowPendingDabTarget(true, false, false, true));
+  assert(fm_features::shouldShowPendingDabTarget(false, true, false, true));
+  assert(!fm_features::shouldShowPendingDabTarget(false, false, false, true));
+  assert(!fm_features::shouldShowPendingDabTarget(true, false, false, false));
+
+  assert(fm_af::weakSignal(true, 10, 8, 18, 4));
+  assert(!fm_af::weakSignal(true, 20, 8, 18, 4));
+  assert(fm_af::candidateIsBetter(true, 0x1234, 0x1234,
+                                  10, 5, 15, 4));
+  assert(!fm_af::candidateIsBetter(true, 0x1234, 0x5678,
+                                   10, 5, 20, 8));
+  assert(!fm_af::candidateIsBetter(true, 0x1234, 0x1234,
+                                   10, 5, 14, 8));
+  assert(!fm_af::sweepExpired(999U, 1000U));
+  assert(fm_af::sweepExpired(1000U, 1000U));
+  assert(fm_af::sweepExpired(5U, 0xFFFFFFF0UL));
 
   fm_features::PressTracker press;
   assert(press.update(true, 100, 1000) == 0);

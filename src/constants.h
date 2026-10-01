@@ -80,6 +80,7 @@ static const char* const Gpio12ModeText[] = {"AUTO", "INTB", "IR"};
 #define EE_BYTE_FM_REGION           20
 #define EE_BYTE_GPIO12_MODE         21
 #define EE_CHAR17_SERVICENAME       22
+#define EE_BYTE_FM_AF_ENABLED       37
 #define EE_BYTE_FM_SEEK_SENSITIVITY 38
 #define EE_PRESETS_FREQ_START       39
 #define EE_PRESETS_SERVICEID_START  138

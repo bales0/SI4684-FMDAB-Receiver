@@ -23,6 +23,8 @@
 #include <climits>
 #include "FmRegion.h"
 #include "fm_features.h"
+#include "fm_af_policy.h"
+#include "dab_service_switch_policy.h"
 
 struct DABFrequencyLabel_DAB {
   uint32_t frequency;
@@ -186,6 +188,10 @@ class DAB {
     void setFmSeekSensitivity(uint8_t profile, bool applyNow = true);
     void setFmFrequency(uint16_t frequency10kHz);
     bool startFmSeek(bool up);
+    void setFmAfEnabled(bool enabled);
+    void setFmAfAllowed(bool allowed);
+    bool isFmAfProbing(void) const;
+    bool takeFmAfSwitch(uint16_t& frequency10kHz);
     void setService(uint8_t index);
     // Always pumps an in-flight transport operation. When allowNewWork is
     // false no new metadata, DSRV or status command is scheduled.
@@ -211,6 +217,7 @@ class DAB {
     // one-shot restore decisions without guessing from numberofservices.
     bool isDabServiceListReady(void) const { return !isFm() && dabServiceListReady; }
     bool isDabServiceMetadataReady(void) const;
+    bool isDabServiceStartPending(void) const;
     const uint8_t* slideshowData(void) const { return slideshowSegBuf; }
     uint32_t slideshowSize(void) const { return SlideShowAvailable ? slideshowRamSize : 0; }
     size_t slideshowCapacity(void) const { return SLS_BUFFER_BYTES; }
@@ -268,8 +275,29 @@ class DAB {
     bool fmRtVersionKnown;
     char fmPsWork[9];
     char fmRtWork[65];
-    fm_features::ClockTime fmCtCandidate;
-    uint8_t fmCtCandidateConfirmations = 0;
+    fm_features::ClockValidator fmCtValidator;
+    enum class FmAfState : uint8_t {
+      Idle, WeakHold, CandidateTune, CandidatePi, RestoreTune, Cooldown
+    };
+    FmAfState fmAfState = FmAfState::Idle;
+    bool fmAfEnabled = false;
+    bool fmAfAllowed = false;
+    bool fmAfSwitchPending = false;
+    uint8_t fmAfCandidateIndex = 0;
+    uint16_t fmAfOriginalFrequency = 0;
+    uint16_t fmAfCandidateFrequency = 0;
+    uint16_t fmAfExpectedPi = 0;
+    uint16_t fmAfCandidatePi = 0;
+    int8_t fmAfOriginalRssi = -100;
+    int8_t fmAfOriginalSnr = 0;
+    int8_t fmAfCandidateRssi = -100;
+    int8_t fmAfCandidateSnr = 0;
+    bool fmAfCandidateValid = false;
+    uint8_t fmAfCandidateSamples = 0;
+    uint32_t fmAfStateSince = 0;
+    uint32_t fmAfSweepDeadline = 0;
+    uint32_t fmAfStationSince = 0;
+    uint32_t fmAfCooldownUntil = 0;
     char ChipType[7];
     char FirmwVersion[6];
     uint32_t componentID;
@@ -312,11 +340,10 @@ class DAB {
     uint32_t dabActiveComponentId = 0;
     uint32_t dabCommandServiceId = 0;
     uint32_t dabCommandComponentId = 0;
+    dab_switch::Controller dabSwitch;
     bool dabServiceRequestPending = false;
     bool dabActiveServiceValid = false;
     bool dabServiceListReady = false;
-    bool dabServiceSettlePending = false;
-    uint32_t dabServiceStartNotBeforeMs = 0;
 
     bool dabSignalRefreshPending = false;
     bool dabServiceListRefreshPending = false;
@@ -334,17 +361,12 @@ class DAB {
     uint32_t dabCurrentSubchannelNextDueMs = 0;
     uint32_t dabLastLowPriorityCommandMs = 0;
 
-    bool dabDataServicePending = false;
     uint32_t dabDataServiceId = 0;
     uint32_t dabDataComponentId = 0;
     uint32_t dabActiveDataServiceId = 0;
     uint32_t dabActiveDataComponentId = 0;
     bool dabActiveDataServiceValid = false;
     uint8_t dabDsrvBurstCount = 0;
-    uint8_t dabDataServiceRetryCount = 0;
-    uint32_t dabDataServiceRetryNotBeforeMs = 0;
-    uint8_t dabStopRetryCount = 0;
-    uint32_t dabStopRetryNotBeforeMs = 0;
     uint8_t dabConsecutiveCtsTimeouts = 0;
     bool dabTransportStalled = false;
 
@@ -373,6 +395,10 @@ class DAB {
     void clearFmData(void);
     void processFmRds(void);
     void updateFm(void);
+    bool processFmAf(uint32_t now);
+    bool startFmAfTune(uint16_t frequency10kHz, FmAfState nextState,
+                       uint32_t now);
+    void cancelFmAf(bool userRetune);
     bool startDabCommand(DabCommand operation, uint8_t command,
                          const uint8_t* args, uint16_t argLength,
                          uint16_t replyLength = 0,
@@ -383,7 +409,10 @@ class DAB {
     void resetDabServiceDeadlines(uint32_t now);
     void updateDabPeriodicRequests(uint32_t now);
     void parseDabServiceListReply(uint16_t replyLength);
-    void queueDabDataService(void);
+    void requestDabDataServiceEvaluation(void);
+    bool resolveDabDataService(void);
+    void processDabSwitchState(uint32_t now);
+    void setDabSwitchState(dab_switch::State state);
 };
 
 #endif

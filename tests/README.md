@@ -19,6 +19,10 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
 ./test_fm_features.exe
 
 g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
+  tests/test_dab_service_switch.cpp -o test_dab_service_switch.exe
+./test_dab_service_switch.exe
+
+g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
   -I tests/stubs -I src tests/test_jpeg.cpp src/JPEGdecoder.cpp `
   -o test_jpeg.exe
 ./test_jpeg.exe
@@ -27,11 +31,18 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
 `test_scheduler.cpp` exercises the actual generation, retry/backoff, phased
 deadline, continuous-DSRV fairness, FM work-priority, RF/display-filter,
 one-shot time-sample and debug-throttling helpers used by the firmware.
-`test_fm_features.cpp` covers regional FM wrapping, AF validation and
-deduplication, RDS CT/MJD parsing, RDS versus RBDS PTY lookup, PI/frequency
+`test_fm_features.cpp` covers regional FM wrapping, AF validation,
+deduplication, quality hysteresis and wrap-safe sweep timeout, RDS CT/MJD
+parsing and chronological confirmation across minute/day/month/year rollover,
+RDS versus RBDS PTY lookup, PI/frequency
 station identity, DAB audio-service boundary selection, 38-channel wrap and
 short/long Rotary 1 press suppression. It also locks down Rotary 2 routing:
-FM AUTO scan-list/no-list behavior and DAB global-list/current-mux fallback.
+FM AUTO scan-list/no-list behavior, DAB global-list/current-mux fallback,
+closing the slideshow wait view, and exact/unique SID-component matching.
+`test_dab_service_switch.cpp` covers serialized data/audio teardown, rapid
+request supersession, wrap-safe bounded backoff, both settle intervals,
+metadata-trigger deduplication, audio-only deferred SLS retries and SLS context
+ownership, including audio-PAD SLS without a separate data service.
 `test_jpeg.cpp` runs the application JPEG parser and
 decoder against baseline grayscale, 4:4:4, 4:2:2, 4:2:0 and restart-marker
 fixtures, including a complete 320×240 baseline 4:2:0 decode. Progressive
