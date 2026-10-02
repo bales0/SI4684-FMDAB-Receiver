@@ -64,7 +64,7 @@ void resetOutputCaches() {
 }
 
 void DataPrint(const char* data) {
-  if (data) Serial.print(data);
+  if (data) diagSerial.print(data);
 }
 
 char* trimInPlace(char* text) {
@@ -127,7 +127,7 @@ void emitServiceList() {
   char label[kUtf8LabelBytes];
   radio.ASCIIToBuffer(radio.EnsembleLabel, radio.EnsembleLabelCharset,
                       label, sizeof(label));
-  Serial.printf("$L=COUNT=%u,ENSEMBLE=%s,%s;SERVICES=",
+  diagSerial.printf("$L=COUNT=%u,ENSEMBLE=%s,%s;SERVICES=",
                 static_cast<unsigned>(radio.numberofservices), radio.EID, label);
 
   if (radio.signallock) {
@@ -135,14 +135,14 @@ void emitServiceList() {
     for (uint8_t i = 0; i < count; ++i) {
       radio.ASCIIToBuffer(radio.service[i].Label, radio.ServiceLabelCharset,
                           label, sizeof(label));
-      Serial.printf("%u,%u,%s", static_cast<unsigned>(i),
+      diagSerial.printf("%u,%u,%s", static_cast<unsigned>(i),
                     static_cast<unsigned>(radio.service[i].ServiceType), label);
-      if (i + 1U < count) Serial.print(';');
+      if (i + 1U < count) diagSerial.print(';');
     }
   } else {
-    Serial.print('0');
+    diagSerial.print('0');
   }
-  Serial.print('\n');
+  diagSerial.print('\n');
 }
 
 void captureServiceInfo(ServiceInfoSnapshot& out) {
@@ -175,7 +175,7 @@ void emitServiceInfo() {
     DataPrint("$I=ID=0;SID=0;PTY=0;PROTECTION=0;SAMPLERATE=0;BITRATE=0;AUDIO=0\n");
     return;
   }
-  Serial.printf("$I=ID=%u;SID=%s;PTY=%u;PROTECTION=%u;SAMPLERATE=%u;BITRATE=%u;AUDIO=%u\n",
+  diagSerial.printf("$I=ID=%u;SID=%s;PTY=%u;PROTECTION=%u;SAMPLERATE=%u;BITRATE=%u;AUDIO=%u\n",
                 static_cast<unsigned>(radio.service[radio.ServiceIndex].CompID & 0xFFU),
                 radio.SID,
                 static_cast<unsigned>(radio.pty),
@@ -190,9 +190,9 @@ void emitServiceDataIfChanged() {
   radio.ASCIIToBuffer(radio.ServiceData, radio.ServiceLabelCharset,
                       current, sizeof(current));
   if (!serviceDataOldValid || strcmp(current, serviceDataOld) != 0) {
-    Serial.print("$D=RT=");
-    Serial.print(current);
-    Serial.print('\n');
+    diagSerial.print("$D=RT=");
+    diagSerial.print(current);
+    diagSerial.print('\n');
     snprintf(serviceDataOld, sizeof(serviceDataOld), "%s", current);
     serviceDataOldValid = true;
   }
@@ -209,29 +209,29 @@ void doMOTShow() {
         image[6] == 0x1A && image[7] == 0x0A) type = 2;
     else if (image[0] == 0xFF && image[1] == 0xD8 && image[2] == 0xFF) type = 1;
   }
-  Serial.printf("$M=SLIDESHOW=%u\n", static_cast<unsigned>(type));
+  diagSerial.printf("$M=SLIDESHOW=%u\n", static_cast<unsigned>(type));
   radio.SlideShowUpdate2 = false;
 }
 
 void doEnableConnection() {
-  Serial.printf("*ENABLE=1,%s,%s/%s\n", VERSION,
+  diagSerial.printf("*ENABLE=1,%s,%s/%s\n", VERSION,
                 radio.getChipID(), radio.getFirmwareVersion());
   DataPrint(":MODE=3,3-3\n");
-  Serial.printf("*INTERVAL=%u\n", interval);
+  diagSerial.printf("*INTERVAL=%u\n", interval);
 
   const size_t count = sizeof(DABfrequencyTable_DAB) / sizeof(DABfrequencyTable_DAB[0]);
-  Serial.printf(":FREQ=%u,", static_cast<unsigned>(count));
+  diagSerial.printf(":FREQ=%u,", static_cast<unsigned>(count));
   for (size_t i = 0; i < count; ++i) {
-    Serial.printf("%u:%lu,%s", static_cast<unsigned>(i),
+    diagSerial.printf("%u:%lu,%s", static_cast<unsigned>(i),
                   static_cast<unsigned long>(DABfrequencyTable_DAB[i].frequency),
                   DABfrequencyTable_DAB[i].label);
-    if (i + 1U < count) Serial.print(';');
+    if (i + 1U < count) diagSerial.print(';');
   }
-  Serial.print('\n');
+  diagSerial.print('\n');
 
   if (radio.ServiceStart)
-    Serial.printf("*SERVICE=%u\n", static_cast<unsigned>(radio.ServiceIndex));
-  Serial.printf("*TUNE=%u\n", static_cast<unsigned>(dabfreq));
+    diagSerial.printf("*SERVICE=%u\n", static_cast<unsigned>(radio.ServiceIndex));
+  diagSerial.printf("*TUNE=%u\n", static_cast<unsigned>(dabfreq));
   DataPrint("$M=SLIDESHOW=0\n");
 
   resetOutputCaches();
@@ -250,13 +250,13 @@ void processCommandLine(char* line) {
       diagnosticDebug = !diagnosticDebug;
       radio.SlideShowDebug = diagnosticDebug;
       if (!diagnosticDebug) radio.SlideShowVerbose = false;
-      Serial.printf("[DEBUG] diagnostics %s\n", diagnosticDebug ? "ON" : "OFF");
+      diagSerial.printf("[DEBUG] diagnostics %s\n", diagnosticDebug ? "ON" : "OFF");
     } else if (strcmp(input, "DEBUG VERBOSE") == 0 ||
                strcmp(input, "DEBUG SLSV") == 0) {
       diagnosticDebug = true;
       radio.SlideShowDebug = true;
       radio.SlideShowVerbose = !radio.SlideShowVerbose;
-      Serial.printf("[DEBUG] SLS per-segment verbose %s\n",
+      diagSerial.printf("[DEBUG] SLS per-segment verbose %s\n",
                     radio.SlideShowVerbose ? "ON" : "OFF");
     } else {
       DataPrint("#2\n");
@@ -298,7 +298,7 @@ void processCommandLine(char* line) {
     case 'I':
       if (intValue > 0 && intValue <= 500) {
         interval = static_cast<unsigned int>(intValue);
-        Serial.printf("*INTERVAL=%u\n#0\n", interval);
+        diagSerial.printf("*INTERVAL=%u\n#0\n", interval);
       } else DataPrint("#1\n");
       break;
 
@@ -321,7 +321,7 @@ void processCommandLine(char* line) {
           menu = false;
           BuildDisplay();
         } else ShowFreq();
-        Serial.printf("#0\n*TUNE=%u\n", static_cast<unsigned>(dabfreq));
+        diagSerial.printf("#0\n*TUNE=%u\n", static_cast<unsigned>(dabfreq));
         DataPrint("$M=SLIDESHOW=0\n");
       } else DataPrint("#1\n");
       break;
@@ -333,7 +333,7 @@ void processCommandLine(char* line) {
         radio.ServiceIndex = static_cast<uint8_t>(intValue);
         radio.setService(radio.ServiceIndex);
         store = true;
-        Serial.printf("#0\n*SERVICE=%u\n", static_cast<unsigned>(radio.ServiceIndex));
+        diagSerial.printf("#0\n*SERVICE=%u\n", static_cast<unsigned>(radio.ServiceIndex));
         DataPrint("$M=SLIDESHOW=0\n");
       } else DataPrint("#1\n");
       break;
@@ -390,13 +390,13 @@ void Communication(void) {
 
   if (radio.ServiceIndex != ServiceIndexOld) {
     if (radio.ServiceStart)
-      Serial.printf("*SERVICE=%u\n", static_cast<unsigned>(radio.ServiceIndex));
+      diagSerial.printf("*SERVICE=%u\n", static_cast<unsigned>(radio.ServiceIndex));
     DataPrint("$M=SLIDESHOW=0\n");
     ServiceIndexOld = radio.ServiceIndex;
   }
 
   if (dabfreq != dabfreqOld) {
-    Serial.printf("*TUNE=%u\n", static_cast<unsigned>(dabfreq));
+    diagSerial.printf("*TUNE=%u\n", static_cast<unsigned>(dabfreq));
     DataPrint("$M=SLIDESHOW=0\n");
     dabfreqOld = dabfreq;
   }
@@ -406,7 +406,7 @@ void Communication(void) {
   emitServiceDataIfChanged();
 
   if (millis() - signalMillis > interval) {
-    Serial.printf("$S=SIGNAL=%d.%d,LOCK=%u,CNR=%u,FIC=%u\n",
+    diagSerial.printf("$S=SIGNAL=%d.%d,LOCK=%u,CNR=%u,FIC=%u\n",
                   static_cast<int>(SignalLevel / 10),
                   static_cast<int>(SignalLevel % 10),
                   radio.signallock ? 1U : 0U,

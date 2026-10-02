@@ -1,6 +1,7 @@
 #include "dab_station_list.h"
 #include "nvs_storage.h"
 #include "fm_features.h"
+#include "dab_scheduler_policy.h"
 #include <cstring>
 
 DabStationList DabStations;
@@ -41,8 +42,20 @@ bool DabStationList::add(const DabStationRecord& station) {
   for (uint8_t i = 0; i < count_; ++i) {
     if (records_[i].channelIndex == station.channelIndex &&
         records_[i].serviceId == station.serviceId &&
-        records_[i].componentId == station.componentId)
+        records_[i].componentId == station.componentId) {
+      // A provisional scan list may contain the correct identity with an
+      // empty label. Upgrade it when a later generation supplies a real name,
+      // but never erase an already useful label with empty data.
+      if (!dab_scheduler::labelHasContent(records_[i].label) &&
+          dab_scheduler::labelHasContent(station.label)) {
+        memcpy(records_[i].label, station.label, sizeof(records_[i].label));
+        records_[i].label[16] = '\0';
+        records_[i].charset = station.charset;
+      }
+      if (fm_features::isAudioServiceType(station.serviceType))
+        records_[i].serviceType = station.serviceType;
       return false;
+    }
   }
   if (count_ >= DAB_STATION_LIST_CAPACITY) return false;
   records_[count_++] = station;

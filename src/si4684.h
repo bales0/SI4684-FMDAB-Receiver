@@ -23,6 +23,7 @@
 #include <climits>
 #include "FmRegion.h"
 #include "fm_features.h"
+#include "dab_scheduler_policy.h"
 #include "fm_af_policy.h"
 #include "dab_service_switch_policy.h"
 
@@ -216,6 +217,13 @@ class DAB {
     // has been parsed for the currently tuned ensemble. This lets the UI make
     // one-shot restore decisions without guessing from numberofservices.
     bool isDabServiceListReady(void) const { return !isFm() && dabServiceListReady; }
+    uint32_t serviceListGeneration(void) const { return dabServiceListGeneration; }
+    void requestServiceListRefresh(void) {
+      if (!isFm()) dabServiceListRefreshPending = true;
+    }
+    bool isDabAudioInfoValid(void) const {
+      return !isFm() && dabAudioInfoValid;
+    }
     bool isDabServiceMetadataReady(void) const;
     bool isDabServiceStartPending(void) const;
     const uint8_t* slideshowData(void) const { return slideshowSegBuf; }
@@ -333,6 +341,8 @@ class DAB {
     bool dabTuneRequestPending = false;
     bool dabWaitingForStc = false;
     uint32_t dabTuneDeadlineMs = 0;
+    uint8_t dabTuneBusyRetries = 0;
+    uint32_t dabTuneRetryNotBeforeMs = 0;
 
     uint32_t dabRequestedServiceId = 0;
     uint32_t dabRequestedComponentId = 0;
@@ -344,12 +354,16 @@ class DAB {
     bool dabServiceRequestPending = false;
     bool dabActiveServiceValid = false;
     bool dabServiceListReady = false;
+    uint32_t dabServiceListGeneration = 0;
 
     bool dabSignalRefreshPending = false;
     bool dabServiceListRefreshPending = false;
     bool dabEnsembleRefreshPending = false;
     bool dabTimeRefreshPending = false;
     bool dabAudioRefreshPending = false;
+    bool dabAudioInfoValid = false;
+    uint8_t dabAudioInfoRetryCount = 0;
+    uint32_t dabAudioInfoNotBeforeMs = 0;
     bool dabCurrentSubchannelRefreshPending = false;
     bool dabCurrentServiceRefreshPending = false;
     uint8_t dabServiceTypeScanIndex = 0;
@@ -408,6 +422,8 @@ class DAB {
     void resetDabPeriodicDeadlines(uint32_t now);
     void resetDabServiceDeadlines(uint32_t now);
     void updateDabPeriodicRequests(uint32_t now);
+    void invalidateDabAudioInfo(uint32_t notBeforeMs = 0U);
+    dab_scheduler::CtsTimeoutClass recordDabCtsResult(bool timedOut);
     void parseDabServiceListReply(uint16_t replyLength);
     void requestDabDataServiceEvaluation(void);
     bool resolveDabDataService(void);

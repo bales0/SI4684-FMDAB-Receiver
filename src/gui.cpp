@@ -184,6 +184,20 @@ static constexpr int16_t SYSTEM_INFO_VALUE_X = 166;
 static constexpr int16_t SYSTEM_INFO_VALUE_W = 146;
 static constexpr int16_t SYSTEM_INFO_ROW_H = 20;
 
+// Background[] is a full-screen bitmap with a fixed 320-pixel row stride.
+// TFT_eSPI's cropped pushImage() treats the source as tightly packed, so every
+// partial restore must be sent one scanline at a time. Besides avoiding stray
+// pixels from neighbouring rows, this keeps the original rounded borders and
+// gradients intact.
+static void RestoreMainBackgroundRegion(int16_t x, int16_t y,
+                                        int16_t width, int16_t height) {
+  for (int16_t row = 0; row < height; ++row) {
+    const uint32_t offset =
+        static_cast<uint32_t>(y + row) * 320U + static_cast<uint32_t>(x);
+    tft.pushImage(x, y + row, width, 1, Background + offset);
+  }
+}
+
 static void RestoreSystemInfoValueRow(uint8_t row) {
   const int16_t y = static_cast<int16_t>(36 + row * 20);
   for (int16_t line = 0; line < SYSTEM_INFO_ROW_H; ++line) {
@@ -1465,11 +1479,13 @@ void ShowSID(void) {
   }
 
   if (strcmp(value, SIDold) != 0 || displayreset) {
-    FullLineSprite.pushImage(-38, -120, 320, 240, Background);
+    // Give the smooth font one transparent row above its nominal y position.
+    // Drawing at sprite row zero clips the top antialiasing row on some glyphs.
+    FullLineSprite.pushImage(-38, -119, 320, 240, Background);
     FullLineSprite.setTextDatum(TL_DATUM);
     FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
-    FullLineSprite.drawString(value, 0, 0);
-    FullLineSprite.pushSprite(38, 120, 0, 0, 36, 16);
+    FullLineSprite.drawString(value, 0, 1);
+    FullLineSprite.pushSprite(38, 119, 0, 0, 36, 18);
     snprintf(SIDold, sizeof(SIDold), "%s", value);
   }
 }
@@ -1486,11 +1502,11 @@ void ShowEID(void) {
   }
 
   if (strcmp(value, EIDold) != 0 || displayreset) {
-    FullLineSprite.pushImage(-38, -106, 320, 240, Background);
+    FullLineSprite.pushImage(-38, -105, 320, 240, Background);
     FullLineSprite.setTextDatum(TL_DATUM);
     FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
-    FullLineSprite.drawString(value, 0, 0);
-    FullLineSprite.pushSprite(38, 106, 0, 0, 36, 16);
+    FullLineSprite.drawString(value, 0, 1);
+    FullLineSprite.pushSprite(38, 105, 0, 0, 36, 18);
     snprintf(EIDold, sizeof(EIDold), "%s", value);
   }
 }
@@ -1612,6 +1628,22 @@ void ShowPS(void) {
 void ShowEN(void) {
   char value[65] = "";
 
+  const auto drawEnsembleField = [](const char* text) {
+    // Match the adjacent PTY/program-info baseline exactly. Restore only the
+    // interior so neither the upper highlight nor the PS border below can be
+    // touched by subsequent ensemble-label updates.
+    constexpr int16_t fieldX = 167;
+    constexpr int16_t fieldY = 162;
+    constexpr int16_t fieldW = 145;
+    constexpr int16_t fieldH = 17;
+    constexpr int16_t textCenterX = 71;
+    FullLineSprite.pushImage(-fieldX, -fieldY, 320, 240, Background);
+    FullLineSprite.setTextDatum(TC_DATUM);
+    FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+    FullLineSprite.drawString(text != nullptr ? text : "", textCenterX, 0);
+    FullLineSprite.pushSprite(fieldX, fieldY, 0, 0, fieldW, fieldH);
+  };
+
   if (radio.isFm()) {
     const char* source = tuning || radio.isTunePending() ? myLanguage[language][75]
                          : (!radio.signallock ? myLanguage[language][76]
@@ -1622,9 +1654,7 @@ void ShowEN(void) {
     snprintf(value, sizeof(value), "%s", source);
 
     if (strcmp(value, EnsembleNameOld) != 0 || displayreset) {
-      tft.fillRect(167, 162, 145, 16, BackgroundColor4);
-      tftPrintFixed(0, value, 238, 162,
-                    SecondaryColor, SecondaryColorSmooth, 16);
+      drawEnsembleField(value);
       snprintf(EnsembleNameOld, sizeof(EnsembleNameOld), "%s", value);
     }
     return;
@@ -1640,9 +1670,7 @@ void ShowEN(void) {
   }
 
   if (strcmp(value, EnsembleNameOld) != 0 || displayreset) {
-    tft.fillRect(167, 162, 145, 16, BackgroundColor4);
-    tftPrintFixed(0, value, 238, 162,
-                  SecondaryColor, SecondaryColorSmooth, 16);
+    drawEnsembleField(value);
     snprintf(EnsembleNameOld, sizeof(EnsembleNameOld), "%s", value);
   }
   // Preserve the display state semantics: tuning/no-lock never leaves a
@@ -1674,19 +1702,62 @@ void ShowProtectionlevel(void) {
 }
 
 void ShowAudioMode(void) {
+  constexpr int16_t codecCellX = 58;
+  constexpr int16_t codecCellY = 30;
+  constexpr int16_t codecCellW = 58;
+  constexpr int16_t codecCellH = 20;
+  constexpr int16_t codecTextCenterX = 87;
+  static uint8_t codecPage = 0U;
+  static uint32_t codecPageTimer = 0U;
+
   if (radio.isFm()) {
     if (displayreset || audiomodeold != radio.audiomode) {
-      tftPrint(-1, fmModeText[language], 70, 33, SecondaryColor, SecondaryColorSmooth, 16);
+      RestoreMainBackgroundRegion(codecCellX, codecCellY,
+                                  codecCellW, codecCellH);
+      tftPrint(0, fmModeText[language], codecTextCenterX, 33,
+               SecondaryColor, SecondaryColorSmooth, 16);
       tft.pushImage(10, 4, 28, 19, radio.fmPilot ? stereoon : mono);
       audiomodeold = radio.audiomode;
+      codecPage = 0U;
+      codecPageTimer = millis();
     }
     return;
   }
   if (!radio.ServiceStart) radio.servicetype = 9;
-  if (servicetypeold != radio.servicetype || displayreset) {
-    tftPrint(-1, ServiceTypeText[4], 70, 33, GreyoutColor, BackgroundColor, 16);
-    if (radio.servicetype == 4 || radio.servicetype == 5) tftPrint(-1, ServiceTypeText[radio.servicetype], 70, 33, SecondaryColor, SecondaryColorSmooth, 16);
+  const bool audioInfoReady = radio.ServiceStart &&
+                              radio.isDabAudioInfoValid() &&
+                              fm_features::isAudioServiceType(
+                                  radio.servicetype);
+  static bool audioInfoReadyOld = false;
+  const bool codecChanged = servicetypeold != radio.servicetype ||
+                            audioInfoReadyOld != audioInfoReady;
+  bool codecPageChanged = false;
+  const uint32_t codecNow = millis();
+  if (codecChanged || displayreset) {
+    codecPage = 0U;
+    codecPageTimer = codecNow;
+  } else if (audioInfoReady && codecNow - codecPageTimer >= 2000UL) {
+    codecPage ^= 1U;
+    codecPageTimer = codecNow;
+    codecPageChanged = true;
+  }
+  if (codecChanged || codecPageChanged || displayreset) {
+    RestoreMainBackgroundRegion(codecCellX, codecCellY,
+                                codecCellW, codecCellH);
+    if (radio.ServiceStart && !audioInfoReady) {
+      tftPrint(0, "...", codecTextCenterX, 33,
+               GreyoutColor, BackgroundColor, 16);
+    } else if (radio.servicetype == 4) {
+      tftPrint(0, codecPage == 0U ? "DAB+" : "HE-AAC",
+               codecTextCenterX, 33,
+               SecondaryColor, SecondaryColorSmooth, 16);
+    } else if (radio.servicetype == 0 || radio.servicetype == 5) {
+      tftPrint(0, codecPage == 0U ? "DAB" : "MP2",
+               codecTextCenterX, 33,
+               SecondaryColor, SecondaryColorSmooth, 16);
+    }
     servicetypeold = radio.servicetype;
+    audioInfoReadyOld = audioInfoReady;
   }
 
   if (!radio.ServiceStart) radio.audiomode = 4;
@@ -2078,11 +2149,38 @@ void ShowSignalLevel(void) {
 void ShowBitrate(void) {
   if (radio.isFm()) return;
   if (tuning) radio.bitrate = 0;
-  if (radio.bitrate != BitrateOld || displayreset) {
+  static uint8_t bitratePage = 0U;
+  static uint32_t bitratePageTimer = 0U;
+  static uint32_t sampleRateOld = 0;
+  const bool bitrateChanged = radio.bitrate != BitrateOld ||
+                              radio.samplerate != sampleRateOld;
+  bool bitratePageChanged = false;
+  const uint32_t bitrateNow = millis();
+  if (bitrateChanged || displayreset) {
+    bitratePage = 0U;
+    bitratePageTimer = bitrateNow;
+  } else if (radio.ServiceStart && radio.bitrate != 0U &&
+             radio.samplerate != 0U &&
+             bitrateNow - bitratePageTimer >= 2000UL) {
+    bitratePage ^= 1U;
+    bitratePageTimer = bitrateNow;
+    bitratePageChanged = true;
+  }
+  if (bitrateChanged || bitratePageChanged || displayreset) {
     char value[16] = "";
-    if (radio.bitrate != 0 && radio.ServiceStart && !tuning) {
+    if (radio.ServiceStart && !tuning && bitratePage == 0U &&
+        radio.bitrate != 0) {
       snprintf(value, sizeof(value), "%u kbit/s",
                static_cast<unsigned>(radio.bitrate));
+    } else if (radio.ServiceStart && !tuning && radio.samplerate != 0U) {
+      if (radio.samplerate % 1000U == 0U) {
+        snprintf(value, sizeof(value), "%lu kHz",
+                 static_cast<unsigned long>(radio.samplerate / 1000U));
+      } else {
+        snprintf(value, sizeof(value), "%lu.%lu kHz",
+                 static_cast<unsigned long>(radio.samplerate / 1000U),
+                 static_cast<unsigned long>((radio.samplerate % 1000U) / 100U));
+      }
     }
 
     FullLineSprite.pushImage(-9, -140, 320, 240, Background);
@@ -2091,6 +2189,7 @@ void ShowBitrate(void) {
     FullLineSprite.drawString(value, 30, 0);
     FullLineSprite.pushSprite(9, 140, 0, 0, 70, 16);
     BitrateOld = radio.bitrate;
+    sampleRateOld = radio.samplerate;
   }
 }
 

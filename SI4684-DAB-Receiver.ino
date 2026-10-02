@@ -64,6 +64,7 @@
 TPA6130A2 Headphones;
 DAB radio;
 bool diagnosticDebug = false;
+NonBlockingSerialMonitor diagSerial(Serial);
 
 TFT_eSPI tft = TFT_eSPI(240, 320);
 
@@ -112,10 +113,15 @@ static uint16_t fmScanFirstFrequency = 0;
 static uint16_t fmScanCandidateFrequency = 0;
 static uint16_t fmScanSeekCount = 0;
 static uint32_t fmScanDeadlineMs = 0;
+static constexpr uint32_t FM_SCAN_PS_STABILITY_MS = 4000UL;
+static char fmScanPsCandidate[9] = {};
+static bool fmScanPsCandidateValid = false;
+static bool fmScanPsDynamic = false;
 static uint32_t fmScanOverlayUntilMs = 0;
 static bool fmScanNeedsMainRedraw = false;
 enum class DabFullScanState : uint8_t {
-  Idle, TuneChannel, WaitTune, WaitServiceList, WaitServiceTypes
+  Idle, TuneChannel, WaitTune, WaitServiceList, WaitServiceTypes,
+  WaitListRefresh
 };
 static DabFullScanState dabFullScanState = DabFullScanState::Idle;
 static uint8_t dabScanChannel = 0;
@@ -123,6 +129,12 @@ static uint8_t dabScanChannelsTried = 0;
 static uint8_t dabScanRestoreChannel = 0;
 static uint32_t dabScanRestoreServiceId = 0;
 static uint32_t dabScanDeadlineMs = 0;
+static uint32_t dabScanTuneListGeneration = 0;
+static uint32_t dabScanObservedListGeneration = 0;
+static uint32_t dabScanHardDeadlineMs = 0;
+static uint32_t dabScanSettleDeadlineMs = 0;
+static uint8_t dabScanListRequests = 0;
+static bool dabScanStoredAnyList = false;
 static uint32_t dabScanOverlayUntilMs = 0;
 static bool dabScanNeedsMainRedraw = false;
 byte audiomodeold;
@@ -1061,7 +1073,14 @@ void ExitSettingsMenu(void) {
 }
 
 void CycleTuneMode(void) {
+  // A tune-mode change starts a new input context. Do not let an unfinished
+  // AUTO seek or a debounced Rotary2 selection consume the first Rotary1 tick
+  // in the newly selected mode.
+  seek = false;
   CancelDabAuto();
+  dabSeekStarted = false;
+  fmSeekStarted = false;
+  dabServiceSelectionPending = false;
   CancelFmFullScan();
   CancelDabFullScan();
   const byte previous = tunemode;
@@ -1241,7 +1260,7 @@ void setup(void) {
 
   // Keep the ESP32 brownout detector enabled so undervoltage resets remain
   // distinguishable from software failures.
-  Serial.begin(115200);
+  diagSerial.begin(115200);
   delay(500);
 
   DIAG_PRINTLN();
@@ -1695,6 +1714,7 @@ void setup(void) {
   DIAG_PRINTF("[BOOT] SETUP COMPLETE free heap=%u min=%u\n",
                 ESP.getFreeHeap(), ESP.getMinFreeHeap());
   LogMemoryIntegrity("setup-complete");
+  diagSerial.enableBuffering();
 }
 
 // Main cooperative scheduler. Three subsystems run every iteration:
@@ -1702,10 +1722,12 @@ void setup(void) {
 //   Communication() serial control protocol
 // Everything else is timer-gated or input-driven and must stay non-blocking.
 void loop(void) {
+  diagSerial.service(64U);
   ProcessDAB();
   ProcessFmFullScan();
   ProcessDabFullScan();
   Communication();
+  diagSerial.service(64U);
   if (displayreset) ShowTuneModeCurrent();
   displayreset = false;
 
@@ -1716,6 +1738,14 @@ void loop(void) {
   if (memoryIntegrityNow - memoryIntegrityTimer >= 60000UL) {
     memoryIntegrityTimer = memoryIntegrityNow;
     LogMemoryIntegrity("runtime");
+  }
+
+  static uint32_t serialDiagnosticsTimer = 0;
+  if (memoryIntegrityNow - serialDiagnosticsTimer >= 30000UL) {
+    serialDiagnosticsTimer = memoryIntegrityNow;
+    DIAG_PRINTF("[SERIAL] queued=%u dropped=%u\n",
+                static_cast<unsigned>(diagSerial.queuedBytes()),
+                static_cast<unsigned>(diagSerial.droppedBytes()));
   }
 
   if (eepromDirty && millis() - EepromDirtyTimer >= EEPROM_COMMIT_DELAY_MS) FlushEeprom();
@@ -2123,6 +2153,10 @@ bool ActivateCurrentService(void) {
     const DabStationRecord& station = DabStations[DabStationListIndex];
     const bool sameChannel = dabfreq == station.channelIndex;
     dabfreq = station.channelIndex;
+    // The global-list selection changes the requested mux immediately, while
+    // the actual tune/service start remains debounced. Publish the channel now
+    // so the frequency field follows rotary 2 instead of retaining the old mux.
+    ShowFreq();
     _serviceID = station.serviceId;
     strncpy(_serviceName, station.label, sizeof(_serviceName) - 1U);
     _serviceName[sizeof(_serviceName) - 1U] = '\0';
@@ -2459,7 +2493,10 @@ void ProcessFmFullScan(void) {
         FinishFmFullScan();
         return;
       }
-      fmScanDeadlineMs = now + 2200UL;
+      fmScanDeadlineMs = now + FM_SCAN_PS_STABILITY_MS;
+      memset(fmScanPsCandidate, 0, sizeof(fmScanPsCandidate));
+      fmScanPsCandidateValid = false;
+      fmScanPsDynamic = false;
       fmScanState = FmScanState::RdsDwell;
       {
         const FmRegionProfile& profile = radio.fmProfile();
@@ -2475,19 +2512,31 @@ void ProcessFmFullScan(void) {
       }
       return;
     case FmScanState::RdsDwell:
-      if (static_cast<int32_t>(now - fmScanDeadlineMs) < 0 &&
-          !radio.isFmPsStable()) return;
+      if (radio.isFmPsStable() && radio.fmPs[0] != '\0') {
+        if (!fmScanPsCandidateValid) {
+          memcpy(fmScanPsCandidate, radio.fmPs, 8U);
+          fmScanPsCandidate[8] = '\0';
+          fmScanPsCandidateValid = true;
+        } else if (memcmp(fmScanPsCandidate, radio.fmPs, 8U) != 0) {
+          fmScanPsDynamic = true;
+        }
+      }
+      if (static_cast<int32_t>(now - fmScanDeadlineMs) < 0) return;
       {
         FmStationRecord station{};
         station.frequency10kHz = fmScanCandidateFrequency;
         station.pi = radio.fmPi;
-        if (radio.isFmPsStable())
-          strncpy(station.ps, radio.fmPs, sizeof(station.ps) - 1U);
+        if (fmScanPsCandidateValid && !fmScanPsDynamic)
+          strncpy(station.ps, fmScanPsCandidate, sizeof(station.ps) - 1U);
         station.rssi = radio.fmRssi;
         station.snr = radio.fmSnr;
         station.multipath = radio.fmMultipath;
         station.pty = radio.fmPty;
         const bool added = FmStations.add(station);
+        if (fmScanPsDynamic)
+          DIAG_PRINTF("[FM/SCAN] dynamic PS protected freq=%u first='%s' latest='%.8s'\n",
+                      static_cast<unsigned>(station.frequency10kHz),
+                      fmScanPsCandidate, radio.fmPs);
         DIAG_PRINTF("[FM/SCAN] found freq=%u PI=%04X PS='%s' RSSI=%d SNR=%d add=%u\n",
                     static_cast<unsigned>(station.frequency10kHz),
                     static_cast<unsigned>(station.pi), station.ps,
@@ -2569,10 +2618,44 @@ void StartDabFullScan(void) {
   DabStations.clear();
   dabScanChannel = 0;
   dabScanChannelsTried = 0;
+  dabScanTuneListGeneration = radio.serviceListGeneration();
+  dabScanObservedListGeneration = 0;
+  dabScanListRequests = 0;
+  dabScanStoredAnyList = false;
   dabScanNeedsMainRedraw = false;
   dabFullScanState = DabFullScanState::TuneChannel;
   ShowScanProgressOverlay(dabScanText[language], 0);
   DIAG_PRINTLN("[DAB/SCAN] start Band III 5A..13F");
+}
+
+static uint8_t StoreCurrentDabScanServices(bool addFallbackLabels) {
+  uint8_t missingLabels = 0;
+  for (uint8_t i = 0; i < radio.numberofservices; ++i) {
+    if (!fm_features::isAudioServiceType(radio.service[i].ServiceType))
+      continue;
+    DabStationRecord station{};
+    station.channelIndex = dabfreq;
+    station.serviceId = radio.service[i].ServiceID;
+    station.componentId = radio.service[i].CompID;
+    strncpy(station.label, radio.service[i].Label,
+            sizeof(station.label) - 1U);
+    if (!dab_scheduler::labelHasContent(station.label)) {
+      ++missingLabels;
+      if (addFallbackLabels) {
+        snprintf(station.label, sizeof(station.label), "SID %08lX",
+                 static_cast<unsigned long>(station.serviceId));
+      }
+    }
+    station.charset = DabServiceLabelCharset(i);
+    station.serviceType = radio.service[i].ServiceType;
+    DabStations.add(station);
+  }
+  return missingLabels;
+}
+
+static void AdvanceDabScanChannel(void) {
+  dabScanChannel = fm_features::nextDabChannel(dabScanChannel, true);
+  dabFullScanState = DabFullScanState::TuneChannel;
 }
 
 void ProcessDabFullScan(void) {
@@ -2595,9 +2678,14 @@ void ProcessDabFullScan(void) {
       radio.ServiceIndex = 0;
       radio.ServiceStart = false;
       memset(_serviceName, 0, sizeof(_serviceName));
+      dabScanTuneListGeneration = radio.serviceListGeneration();
+      dabScanObservedListGeneration = 0;
+      dabScanListRequests = 0;
+      dabScanStoredAnyList = false;
       radio.setFreq(dabfreq);
       ++dabScanChannelsTried;
-      dabScanDeadlineMs = now + 6000UL;
+      dabScanDeadlineMs =
+          now + dab_scheduler::DAB_SCAN_NO_SIGNAL_TIMEOUT_MS;
       dabFullScanState = DabFullScanState::WaitTune;
       char progress[32];
       snprintf(progress, sizeof(progress), "%s %u/38 %s",
@@ -2614,49 +2702,107 @@ void ProcessDabFullScan(void) {
       if (radio.isTunePending() &&
           static_cast<int32_t>(now - dabScanDeadlineMs) < 0) return;
       if (!radio.signallock) {
-        dabScanChannel = fm_features::nextDabChannel(dabScanChannel, true);
-        dabFullScanState = DabFullScanState::TuneChannel;
+        AdvanceDabScanChannel();
         return;
       }
-      dabScanDeadlineMs = now + 8000UL;
+      dabScanHardDeadlineMs =
+          now + dab_scheduler::DAB_SCAN_LIST_TIMEOUT_MS;
       dabFullScanState = DabFullScanState::WaitServiceList;
       return;
 
     case DabFullScanState::WaitServiceList:
       if (!radio.signallock ||
-          static_cast<int32_t>(now - dabScanDeadlineMs) >= 0) {
-        dabScanChannel = fm_features::nextDabChannel(dabScanChannel, true);
-        dabFullScanState = DabFullScanState::TuneChannel;
+          static_cast<int32_t>(now - dabScanHardDeadlineMs) >= 0) {
+        AdvanceDabScanChannel();
         return;
       }
-      if (!radio.isDabServiceListReady()) return;
-      dabScanDeadlineMs = now + 12000UL;
+      if (!dab_scheduler::serviceListArrived(
+              radio.serviceListGeneration(), dabScanTuneListGeneration))
+        return;
+      dabScanObservedListGeneration = radio.serviceListGeneration();
+      dabScanSettleDeadlineMs =
+          now + dab_scheduler::DAB_SCAN_LIST_SETTLE_MS;
       dabFullScanState = DabFullScanState::WaitServiceTypes;
       return;
 
     case DabFullScanState::WaitServiceTypes:
-      if (!radio.signallock ||
-          static_cast<int32_t>(now - dabScanDeadlineMs) >= 0) {
-        dabScanChannel = fm_features::nextDabChannel(dabScanChannel, true);
-        dabFullScanState = DabFullScanState::TuneChannel;
+      if (!radio.signallock) {
+        AdvanceDabScanChannel();
         return;
       }
-      if (!radio.isDabServiceMetadataReady()) return;
-      for (uint8_t i = 0; i < radio.numberofservices; ++i) {
-        if (!fm_features::isAudioServiceType(radio.service[i].ServiceType))
-          continue;
-        DabStationRecord station{};
-        station.channelIndex = dabfreq;
-        station.serviceId = radio.service[i].ServiceID;
-        station.componentId = radio.service[i].CompID;
-        strncpy(station.label, radio.service[i].Label,
-                sizeof(station.label) - 1U);
-        station.charset = DabServiceLabelCharset(i);
-        station.serviceType = radio.service[i].ServiceType;
-        DabStations.add(station);
+      if (static_cast<int32_t>(now - dabScanHardDeadlineMs) >= 0) {
+        if (radio.isDabServiceMetadataReady())
+          StoreCurrentDabScanServices(true);
+        DIAG_PRINTF("[DAB/SCAN] hard timeout index=%u gen=%u requests=%u saved=%u\n",
+                    static_cast<unsigned>(dabfreq),
+                    static_cast<unsigned>(radio.serviceListGeneration()),
+                    static_cast<unsigned>(dabScanListRequests),
+                    dabScanStoredAnyList ? 1U : 0U);
+        AdvanceDabScanChannel();
+        return;
       }
-      dabScanChannel = fm_features::nextDabChannel(dabScanChannel, true);
-      dabFullScanState = DabFullScanState::TuneChannel;
+      if (static_cast<int32_t>(now - dabScanSettleDeadlineMs) < 0 ||
+          !radio.isDabServiceMetadataReady()) return;
+      {
+        const uint8_t missingLabels = StoreCurrentDabScanServices(false);
+        dabScanStoredAnyList = true;
+        DIAG_PRINTF("[DAB/SCAN] index=%u gen=%u refresh=%u services=%u missingLabels=%u\n",
+                    static_cast<unsigned>(dabfreq),
+                    static_cast<unsigned>(dabScanObservedListGeneration),
+                    static_cast<unsigned>(dabScanListRequests),
+                    static_cast<unsigned>(radio.numberofservices),
+                    static_cast<unsigned>(missingLabels));
+
+        // Always ask once after the first provisional list. Later complete
+        // generations can be committed immediately; incomplete ones receive
+        // bounded refresh attempts until the hard deadline.
+        if (dabScanListRequests != 0U && missingLabels == 0U) {
+          AdvanceDabScanChannel();
+          return;
+        }
+        if (dabScanListRequests >=
+            dab_scheduler::DAB_SCAN_LIST_MAX_REQUESTS) {
+          if (missingLabels != 0U) StoreCurrentDabScanServices(true);
+          AdvanceDabScanChannel();
+          return;
+        }
+        ++dabScanListRequests;
+        radio.requestServiceListRefresh();
+        dabScanDeadlineMs = now + dab_scheduler::DAB_SCAN_LIST_RETRY_MS;
+        dabFullScanState = DabFullScanState::WaitListRefresh;
+      }
+      return;
+
+    case DabFullScanState::WaitListRefresh:
+      if (!radio.signallock) {
+        AdvanceDabScanChannel();
+        return;
+      }
+      if (static_cast<int32_t>(now - dabScanHardDeadlineMs) >= 0) {
+        if (radio.isDabServiceMetadataReady())
+          StoreCurrentDabScanServices(true);
+        DIAG_PRINTF("[DAB/SCAN] hard timeout index=%u gen=%u refresh=%u saved=%u\n",
+                    static_cast<unsigned>(dabfreq),
+                    static_cast<unsigned>(radio.serviceListGeneration()),
+                    static_cast<unsigned>(dabScanListRequests),
+                    dabScanStoredAnyList ? 1U : 0U);
+        AdvanceDabScanChannel();
+        return;
+      }
+      if (dab_scheduler::refreshedServiceListArrived(
+              radio.serviceListGeneration(),
+              dabScanObservedListGeneration, true)) {
+        dabScanObservedListGeneration = radio.serviceListGeneration();
+        dabScanSettleDeadlineMs = now;
+        dabFullScanState = DabFullScanState::WaitServiceTypes;
+        return;
+      }
+      if (static_cast<int32_t>(now - dabScanDeadlineMs) >= 0 &&
+          dabScanListRequests < dab_scheduler::DAB_SCAN_LIST_MAX_REQUESTS) {
+        ++dabScanListRequests;
+        radio.requestServiceListRefresh();
+        dabScanDeadlineMs = now + dab_scheduler::DAB_SCAN_LIST_RETRY_MS;
+      }
       return;
   }
 }
@@ -3007,6 +3153,14 @@ void KeyUp(void) {
           break;
 
         case TUNE_AUTO:
+          // A DAB seek is asynchronous and may take several seconds. Extra
+          // detents in the same direction must not repeatedly reset its state;
+          // that made rotary 1 appear intermittent. An opposite detent changes
+          // direction and restarts once, while the in-flight radio command is
+          // still allowed to complete through radio.Update().
+          if (radioMode == RADIO_MODE_DAB &&
+              seek && direction == true &&
+              dabAutoState != DabAutoState::Idle) break;
           if (radioMode == RADIO_MODE_DAB) CancelDabAuto();
           direction = true;
           seek = true;
@@ -3105,6 +3259,9 @@ void KeyDown(void) {
           break;
 
         case TUNE_AUTO:
+          if (radioMode == RADIO_MODE_DAB &&
+              seek && direction == false &&
+              dabAutoState != DabAutoState::Idle) break;
           if (radioMode == RADIO_MODE_DAB) CancelDabAuto();
           direction = false;
           seek = true;
@@ -3519,7 +3676,9 @@ static void EnterLightSleep(bool showStandbyScreen) {
                   irWakeEnabled ? "IR/LOW+QUALIFY" : "DISABLED",
                   digitalRead(SI4684_INTB_PIN) == HIGH ? 'H' : 'L',
                   radio.controlModeName(), static_cast<int>(wakeEnableResult));
-    Serial.flush();
+    // Do not wait for the UART line before sleeping. Diagnostics are best
+    // effort; move one bounded chunk and leave any remainder queued.
+    diagSerial.service(64U);
 
     const int64_t sleepStartedUs = esp_timer_get_time();
     sleepResult = wakeEnableResult == ESP_OK
@@ -3639,7 +3798,7 @@ static void EnterLightSleep(bool showStandbyScreen) {
 // reset or firmware reload.
 void doStandby(void) {
   if (!FlushEeprom()) {
-    Serial.println("[NVS] standby cancelled: commit failed");
+    diagSerial.println("[NVS] standby cancelled: commit failed");
     ShowStatusOverlay("NVS ERROR");
     return;
   }
@@ -3673,6 +3832,14 @@ void CancelDabAuto(void) {
 }
 
 void StartDabAuto(bool forward) {
+  // AUTO walks the live service list of the current mux before moving through
+  // Band III. A previous Rotary2 global-list selection must not redirect
+  // ActivateCurrentService() back into DabStations or restore its old target.
+  DabGlobalListView = false;
+  dabServiceSelectionPending = false;
+  trysetservice = false;
+  trysetserviceFreq = 0xFF;
+  trysetserviceComponentValid = false;
   dabAutoForward = forward;
   dabAutoChannelsTried = 0;
 
@@ -3928,13 +4095,6 @@ void tftReplaceFixed(int8_t offset, const char *textold, const char *text,
 // Heap-stable print variant for fixed char buffers.
 void tftPrintFixed(int8_t offset, const char *text, int16_t x, int16_t y,
                    int color, int smoothcolor, uint8_t fontsize) {
-  // This lower status field uses FONT16. Characters with descenders (j/p/q/g/y)
-  // extend below the nominal 16 px field, so restore the complete glyph area
-  // before redrawing so descenders are fully cleared in the fixed-buffer path.
-  if (fontsize == 16 && offset == 0 && x == 238 && y == 162) {
-    tft.fillRect(165, 159, 149, 23, BackgroundColor4);
-  }
-
   const uint8_t *selectedFont = nullptr;
   if (fontsize == 16) selectedFont = FONT16;
   if (fontsize == 28) selectedFont = FONT28;
@@ -3971,7 +4131,7 @@ void tftPrint(int8_t offset, const char *text, int16_t x, int16_t y,
 void deepSleep(void) {
   StoreFrequency();
   if (!FlushEeprom()) {
-    Serial.println("[NVS] timeout light-sleep cancelled: commit failed");
+    diagSerial.println("[NVS] timeout light-sleep cancelled: commit failed");
     // Prevent a tight retry loop on every main-loop iteration.
     tottimer = millis();
     return;

@@ -4,13 +4,22 @@
 #ifndef CONSTANTS_H
 #define CONSTANTS_H
 
+#ifdef ARDUINO
+#include "serial_monitor.h"
+#define DIAG_STREAM diagSerial
+#else
+// Host-only decoder tests provide a minimal Serial stub and do not link the
+// Arduino HardwareSerial facade.
+#define DIAG_STREAM Serial
+#endif
+
 // Global UART diagnostics gate. Normal operation keeps application diagnostics
 // silent; the bare serial command DEBUG toggles this flag at runtime. The
 // control protocol in comms.cpp deliberately bypasses these macros.
 extern bool diagnosticDebug;
-#define DIAG_PRINT(...)   do { if (diagnosticDebug) Serial.print(__VA_ARGS__); } while (0)
-#define DIAG_PRINTLN(...) do { if (diagnosticDebug) Serial.println(__VA_ARGS__); } while (0)
-#define DIAG_PRINTF(...)  do { if (diagnosticDebug) Serial.printf(__VA_ARGS__); } while (0)
+#define DIAG_PRINT(...)   do { if (diagnosticDebug) DIAG_STREAM.print(__VA_ARGS__); } while (0)
+#define DIAG_PRINTLN(...) do { if (diagnosticDebug) DIAG_STREAM.println(__VA_ARGS__); } while (0)
+#define DIAG_PRINTF(...)  do { if (diagnosticDebug) DIAG_STREAM.printf(__VA_ARGS__); } while (0)
 
 // ---------- Hardware pin assignments ----------
 #define ROTARY_PIN_A    27

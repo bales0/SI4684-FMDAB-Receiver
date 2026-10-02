@@ -4,6 +4,49 @@
 #include <cstdint>
 
 int main() {
+  assert(dab_scheduler::classifyCtsTimeout(false, 8000U) ==
+         dab_scheduler::CtsTimeoutClass::NotTimeout);
+  assert(dab_scheduler::classifyCtsTimeout(true, 8000U) ==
+         dab_scheduler::CtsTimeoutClass::HostStarved);
+  assert(dab_scheduler::classifyCtsTimeout(true, 38U) ==
+         dab_scheduler::CtsTimeoutClass::Genuine);
+  uint8_t consecutiveCts = 2U;
+  consecutiveCts = dab_scheduler::nextConsecutiveCtsTimeouts(
+      dab_scheduler::CtsTimeoutClass::HostStarved, consecutiveCts);
+  assert(consecutiveCts == 0U);
+  consecutiveCts = dab_scheduler::nextConsecutiveCtsTimeouts(
+      dab_scheduler::CtsTimeoutClass::Genuine, consecutiveCts);
+  assert(consecutiveCts == 1U);
+  assert(!dab_scheduler::ctsRecoveryRequired(consecutiveCts, 3U));
+  consecutiveCts = dab_scheduler::nextConsecutiveCtsTimeouts(
+      dab_scheduler::CtsTimeoutClass::Genuine, consecutiveCts);
+  consecutiveCts = dab_scheduler::nextConsecutiveCtsTimeouts(
+      dab_scheduler::CtsTimeoutClass::Genuine, consecutiveCts);
+  assert(dab_scheduler::ctsRecoveryRequired(consecutiveCts, 3U));
+
+  assert(dab_scheduler::audioInfoRetryDelayMs(0U) == 400U);
+  assert(dab_scheduler::audioInfoRetryDelayMs(1U) == 500U);
+  assert(dab_scheduler::audioInfoRetryDelayMs(2U) == 1000U);
+  assert(dab_scheduler::audioInfoRetryDelayMs(3U) == 2000U);
+  assert(dab_scheduler::audioInfoRetryDelayMs(4U) == 10000U);
+  assert(dab_scheduler::DAB_TUNE_BUSY_BACKOFF_MS == 40U);
+  assert(dab_scheduler::DAB_TUNE_BUSY_MAX_RETRIES == 3U);
+  assert(dab_scheduler::DAB_SCAN_NO_SIGNAL_TIMEOUT_MS == 2500U);
+  assert(dab_scheduler::DAB_SCAN_LIST_TIMEOUT_MS == 9000U);
+  assert(dab_scheduler::DAB_SCAN_LIST_MAX_REQUESTS == 4U);
+
+  assert(dab_scheduler::serviceListArrived(8U, 7U));
+  assert(!dab_scheduler::serviceListArrived(7U, 7U));
+  assert(dab_scheduler::refreshedServiceListArrived(9U, 8U, true));
+  assert(!dab_scheduler::refreshedServiceListArrived(8U, 8U, true));
+  assert(!dab_scheduler::refreshedServiceListArrived(9U, 8U, false));
+  const char emptyLabel[16] = {};
+  const char blankLabel[16] = {' ', ' ', ' '};
+  const char realLabel[16] = {'R', 'a', 'd', 'i', 'o'};
+  assert(!dab_scheduler::labelHasContent(emptyLabel));
+  assert(!dab_scheduler::labelHasContent(blankLabel));
+  assert(dab_scheduler::labelHasContent(realLabel));
+
   assert(dab_scheduler::nextGeneration(1U) == 2U);
   assert(dab_scheduler::nextGeneration(0xFFFFFFFFU) == 1U);
   assert(dab_scheduler::generationMatches(7U, 7U));

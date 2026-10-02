@@ -9,12 +9,23 @@ namespace dab_scheduler {
 // used by the firmware.
 static const uint32_t DAB_SIGNAL_INTERVAL_MS = 1000U;
 static const uint32_t DAB_SIGNAL_UI_INTERVAL_MS = 500U;
+static const uint32_t DAB_SCAN_LIST_SETTLE_MS = 1000U;
+static const uint32_t DAB_SCAN_LIST_RETRY_MS = 1500U;
+static const uint32_t DAB_SCAN_NO_SIGNAL_TIMEOUT_MS = 2500U;
+static const uint32_t DAB_SCAN_LIST_TIMEOUT_MS = 9000U;
+static const uint8_t DAB_SCAN_LIST_MAX_REQUESTS = 4U;
 static const uint32_t DAB_ENSEMBLE_INTERVAL_MS = 30000U;
 static const uint32_t DAB_TIME_INTERVAL_MS = 60000U;
 static const uint32_t DAB_AUDIO_INTERVAL_MS = 10000U;
 static const uint32_t DAB_SERVICE_INTERVAL_MS = 10000U;
 static const uint32_t DAB_SUBCHANNEL_INTERVAL_MS = 60000U;
 static const uint32_t DAB_LOW_PRIORITY_GAP_MS = 100U;
+static const uint32_t DAB_HOST_STARVATION_US = 2000U;
+static const uint32_t DAB_AUDIO_INFO_INITIAL_DELAY_MS = 400U;
+static const uint32_t DAB_AUDIO_INFO_SLOW_RETRY_MS = 10000U;
+static const uint8_t DAB_AUDIO_INFO_FAST_RETRIES = 3U;
+static const uint32_t DAB_TUNE_BUSY_BACKOFF_MS = 40U;
+static const uint8_t DAB_TUNE_BUSY_MAX_RETRIES = 3U;
 
 static const uint32_t DAB_AUDIO_INITIAL_PHASE_MS = 2000U;
 static const uint32_t DAB_SERVICE_INITIAL_PHASE_MS = 5000U;
@@ -49,6 +60,57 @@ inline bool takeGeneration(uint32_t current, uint32_t& consumed) {
   if (current == 0U || current == consumed) return false;
   consumed = current;
   return true;
+}
+
+inline bool serviceListArrived(uint32_t current, uint32_t tuneGeneration) {
+  return current != 0U && current != tuneGeneration;
+}
+
+inline bool refreshedServiceListArrived(uint32_t current,
+                                        uint32_t firstGeneration,
+                                        bool refreshRequested) {
+  return refreshRequested && firstGeneration != 0U &&
+         current != firstGeneration;
+}
+
+enum class CtsTimeoutClass : uint8_t {
+  NotTimeout,
+  HostStarved,
+  Genuine
+};
+
+inline CtsTimeoutClass classifyCtsTimeout(bool timedOut,
+                                          uint32_t lastServiceGapUs) {
+  if (!timedOut) return CtsTimeoutClass::NotTimeout;
+  return lastServiceGapUs >= DAB_HOST_STARVATION_US
+             ? CtsTimeoutClass::HostStarved
+             : CtsTimeoutClass::Genuine;
+}
+
+inline uint8_t nextConsecutiveCtsTimeouts(CtsTimeoutClass classification,
+                                          uint8_t current) {
+  if (classification != CtsTimeoutClass::Genuine) return 0U;
+  return current == 0xFFU ? current : static_cast<uint8_t>(current + 1U);
+}
+
+inline bool ctsRecoveryRequired(uint8_t consecutive, uint8_t threshold) {
+  return consecutive >= threshold;
+}
+
+inline uint32_t audioInfoRetryDelayMs(uint8_t retryNumber) {
+  if (retryNumber == 0U) return DAB_AUDIO_INFO_INITIAL_DELAY_MS;
+  if (retryNumber > DAB_AUDIO_INFO_FAST_RETRIES)
+    return DAB_AUDIO_INFO_SLOW_RETRY_MS;
+  return 500U << (retryNumber - 1U);
+}
+
+inline bool labelHasContent(const char* label, uint8_t length = 16U) {
+  if (label == nullptr) return false;
+  for (uint8_t i = 0; i < length; ++i) {
+    const uint8_t value = static_cast<uint8_t>(label[i]);
+    if (value != 0U && value != static_cast<uint8_t>(' ')) return true;
+  }
+  return false;
 }
 
 // Report a periodic deadline once and move it into the future.  Advancing from

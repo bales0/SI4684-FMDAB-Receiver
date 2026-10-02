@@ -28,7 +28,9 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
 ./test_jpeg.exe
 ```
 
-`test_scheduler.cpp` exercises the actual generation, retry/backoff, phased
+`test_scheduler.cpp` exercises CTS host-starvation classification and recovery
+counting, AUDIO_INFO delays, tune-busy backoff constants, service-list
+generations, label quality, the existing generic retry/backoff, phased
 deadline, continuous-DSRV fairness, FM work-priority, RF/display-filter,
 one-shot time-sample and debug-throttling helpers used by the firmware.
 `test_fm_features.cpp` covers regional FM wrapping, AF validation,
