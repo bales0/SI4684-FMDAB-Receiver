@@ -6,6 +6,21 @@ Firmware v2.2.1 uses separate SPI controllers for the TFT and radio, supports le
 
 This project is based on the original open-source SI4684/DAB receiver work published by **PE5PVB**.
 
+## Complete ESP32 build image
+
+Every successful `pio run -e esp32dev` also creates
+`.pio/build/esp32dev/receiver-complete.bin`, containing the bootloader,
+partition table, boot application image and receiver firmware. Flash this
+combined file at **0x0**. Its blank padding covers the NVS partition, so
+flashing it clears saved settings, presets and station lists. For normal
+updates that retain NVS, use `pio run -e esp32dev -t upload` instead.
+
+The same build also generates `.pio/build/esp32dev/flash-addresses.txt` with
+the flash addresses and filenames for the combined image and each individual image.
+The framework-provided `boot_app0.bin` is copied into the same build directory,
+so all listed binary files are available together.
+Choose either the combined image or the individual images when flashing.
+
 > [!CAUTION]
 > ## GPIO12 / MTDI eFuse requirement — read before using INTB or IR
 >

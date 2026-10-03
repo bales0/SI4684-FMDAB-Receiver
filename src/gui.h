@@ -126,6 +126,7 @@ extern bool dabScanCompleted;
 extern TPA6130A2 Headphones;
 
 void BuildChannelList(void);
+void RedrawChannelListSelection(uint8_t oldIndex);
 void BuildMenu(void);
 void BuildDisplay(void);
 void MenuUp(void);

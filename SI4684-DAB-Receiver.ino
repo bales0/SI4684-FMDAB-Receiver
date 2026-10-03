@@ -3188,33 +3188,9 @@ void KeyUp(void) {
           break;
       }
     } else {
-      byte y = 0;
-      byte y_old = 0;
       const uint8_t oldIndex = ChannelListIndex();
-      if (oldIndex > 8 && oldIndex < 17) {
-        y_old = 9;
-      } else if (oldIndex > 16) {
-        y_old = static_cast<uint8_t>(17 + ((oldIndex - 17) / 8) * 8);
-      }
-
-      if (ChannelListCount() > 0)
-        ShowOneLine(20 * (oldIndex - y_old), oldIndex, false);
-
       MoveChannelList(true);
-
-      const uint8_t newIndex = ChannelListIndex();
-      if (newIndex > 8 && newIndex < 17) {
-        y = 9;
-      } else if (newIndex > 16) {
-        y = static_cast<uint8_t>(17 + ((newIndex - 17) / 8) * 8);
-      }
-
-      if (y_old != y) {
-        BuildChannelList();
-      } else {
-        if (ChannelListCount() > 0)
-          ShowOneLine(20 * (newIndex - y), newIndex, true);
-      }
+      RedrawChannelListSelection(oldIndex);
     }
   } else {
     MenuUp();
@@ -3289,33 +3265,9 @@ void KeyDown(void) {
           break;
       }
     } else {
-      byte y = 0;
-      byte y_old = 0;
       const uint8_t oldIndex = ChannelListIndex();
-      if (oldIndex > 8 && oldIndex < 17) {
-        y_old = 9;
-      } else if (oldIndex > 16) {
-        y_old = static_cast<uint8_t>(17 + ((oldIndex - 17) / 8) * 8);
-      }
-
-      if (ChannelListCount() > 0)
-        ShowOneLine(20 * (oldIndex - y_old), oldIndex, false);
-
       MoveChannelList(false);
-
-      const uint8_t newIndex = ChannelListIndex();
-      if (newIndex > 8 && newIndex < 17) {
-        y = 9;
-      } else if (newIndex > 16) {
-        y = static_cast<uint8_t>(17 + ((newIndex - 17) / 8) * 8);
-      }
-
-      if (y_old != y) {
-        BuildChannelList();
-      } else {
-        if (ChannelListCount() > 0)
-          ShowOneLine(20 * (newIndex - y), newIndex, true);
-      }
+      RedrawChannelListSelection(oldIndex);
     }
   } else {
     MenuDown();

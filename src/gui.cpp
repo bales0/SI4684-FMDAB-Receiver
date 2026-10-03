@@ -473,8 +473,52 @@ void ShowServiceInfo(void) {
 }
 
 static uint8_t ChannelListPageStart(uint8_t index) {
+  if (radio.isFm() || DabGlobalListView) {
+    const uint8_t count = ChannelListCount();
+    if (count <= 9U || index <= 4U) return 0U;
+    const uint8_t centered = static_cast<uint8_t>(index - 4U);
+    const uint8_t lastStart = static_cast<uint8_t>(count - 9U);
+    return centered < lastStart ? centered : lastStart;
+  }
   return index < 9U ? 0U
                     : static_cast<uint8_t>(9U + ((index - 9U) / 8U) * 8U);
+}
+
+static void ShowGlobalListPosition(void) {
+  if (!(radio.isFm() || DabGlobalListView) || ChannelListCount() == 0U) return;
+  char value[8];
+  snprintf(value, sizeof(value), "%u/%u",
+           static_cast<unsigned>(ChannelListIndex()) + 1U,
+           static_cast<unsigned>(ChannelListCount()));
+  FullLineSprite.pushImage(-264, -5, 320, 240, servicelistbackground);
+  FullLineSprite.setTextDatum(TC_DATUM);
+  FullLineSprite.setTextColor(SecondaryColor, SecondaryColorSmooth, false);
+  FullLineSprite.drawString(value, 26, 5);
+  FullLineSprite.pushSprite(264, 5, 0, 0, 52, 20);
+}
+
+// Only repaint list rows when the window moves; keep the title and background
+// in place to avoid a full-screen flash on every centered scrolling step.
+void RedrawChannelListSelection(uint8_t oldIndex) {
+  const uint8_t count = ChannelListCount();
+  if (count == 0U) return;
+  const uint8_t index = ChannelListIndex();
+  const uint8_t oldStart = ChannelListPageStart(oldIndex);
+  const uint8_t start = ChannelListPageStart(index);
+  if (oldStart != start) {
+    if (!(radio.isFm() || DabGlobalListView)) {
+      BuildChannelList();
+      return;
+    }
+    for (uint8_t row = 0; row < 9U && start + row < count; ++row) {
+      const uint8_t item = static_cast<uint8_t>(start + row);
+      ShowOneLine(20U * row, item, item == index);
+    }
+  } else {
+    ShowOneLine(20U * (oldIndex - start), oldIndex, false);
+    ShowOneLine(20U * (index - start), index, true);
+  }
+  ShowGlobalListPosition();
 }
 
 // Render the scrollable list of services/stations. Used as
@@ -508,7 +552,9 @@ void BuildChannelList(void) {
     return;
   }
 
-  if (count > 9U) {
+  if (radio.isFm() || DabGlobalListView) {
+    ShowGlobalListPosition();
+  } else if (count > 9U) {
     const uint8_t page = y == 0U ? 1U : static_cast<uint8_t>(2U + (y - 9U) / 8U);
     const uint8_t pages = static_cast<uint8_t>(1U + (count - 9U + 7U) / 8U);
 
