@@ -1,0 +1,733 @@
+--- a/Serial_protocol.md
++++ b/Serial_protocol.md
+@@ -264,12 +264,33 @@
+ section 6.3.1). CID and all other classification fields remain unchanged.
+ A corresponding synthetic `CID=01FC0002` fixture reports `PS=secondary`.
+ 
+-`[DAB/XPAD] value=0x0097 setResult=0 rev=unverified` records successful boot-time
+-SET_PROPERTY; -1 means no recorded attempt. Other values are vendor Result errors.
+-The value stays unchanged. `[DSRV/UA] raw16_17=0x.... rev=unverified src=...`
+-is at most one line per 5 seconds, only with DEBUG and sufficient UART space.
+-This raw field is neither SPI evidence nor a routing input. Firmware support
+-remains unverified; see [the stabilization report](tests/DAB_SPI_fixes_20261009_report.md).
++`DAB_XPAD_ENABLE` remains 0x0097. During DAB initialization only, a successful
++SET_PROPERTY is followed by one GET_PROPERTY (250 ms timeout) using the existing
++boot command API. DEBUG prints the cached result, not a new radio transaction:
++
++```text
++[DAB/XPAD] requested=0x0097 setResult=0 readback=0x0097 getResult=0 match=1 fw=6.0.9 rev=unverified
++```
++
++`setResult` and `getResult` are separate vendor Result codes; 0 means Ok, -4
++means timeout. `setResult=127` means no attempt was recorded. A failed write
++skips the read (`getResult=not-attempted`). Failed or absent reads print
++`readback=unavailable` without `match`. Successful unequal reads print `match=0`.
++Boot/recovery/hardware reset invalidates the cached result; FM never reads B400.
++DEBUG toggles may repeat the cached diagnostic line, never the GET_PROPERTY.
++
++`[DSRV/UA]` preserves the raw field and adds `meaning`, source name, routing
++context, scan generation and suppressed-sample count. Raw 2/7 at source 0/1
++prints SLS-candidate/SPI-candidate; source 2 prints DLS-raw regardless of raw UA,
++and source 3 prints reserved. `context` reports audio/sls/spi/unmatched/inactive
++using existing endpoint and audio-state rules. Raw interpretation does not
++supply endpoint confirmation or change routing.
++
++One line globally per five seconds within a scan generation is allowed, only
++with DEBUG and at least 256 bytes of UART headroom. Suppressed counts saturate;
++retune/new generation discards the old diagnostic window. No payload is retained
++for later logging. `rev=unverified` remains because the firmware UATYPE contract
++has not been established. See [the diagnostics report](tests/DAB_XPAD_UATYPE_diagnostics_report.md).
+ 
+ ### `DEBUG SPI`
+ 
+--- a/src/si4684.cpp
++++ b/src/si4684.cpp
+@@ -623,6 +623,10 @@
+ //   4. Configure DAB-specific properties (sample rate, audio output, FIC etc.)
+ // Returns true once the chip reports the requested application image is running.
+ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
++  // Invalidate before any early boot failure or firmware/mode change.
++  dabXpad = dab_diag::XpadReadback{};
++  dabXpadLogPending = false;
++  dabRawUaLog = dab_diag::RawLog{};
+   radioI2sOutputReady = false;
+   const uint32_t radioBeginMs = millis();
+   if (!radioMemoryPrepared || !slideshowSegBuf || !chipWorkspace) {
+@@ -1254,12 +1258,7 @@
+     Set_Property(static_cast<uint16_t>(si468x::Property::DAB_EVENT_MIN_SVRLIST_PERIOD), 0x0000);
+     Set_Property(static_cast<uint16_t>(si468x::Property::DAB_EVENT_MIN_SVRLIST_PERIOD_RECONFIG), 0x0000);
+     Set_Property(static_cast<uint16_t>(si468x::Property::DAB_EVENT_MIN_FREQINFO_PERIOD), 0x0000);
+-    const si468x::Result xpadResult = chip.setProperty(si468x::Property::DAB_XPAD_ENABLE, 0x0097);
+-    finishCommandDiagnostics(xpadResult);
+-    dabXpadSetResult = static_cast<int8_t>(xpadResult);
+-    if (xpadResult != si468x::Result::Ok)
+-      DIAG_PRINTF("[RADIO/PROP] set 0xB400=0x0097 failed result=%d\n",
+-                  static_cast<int>(xpadResult));
++    configureDabXpad();
+     Set_Property(static_cast<uint16_t>(si468x::Property::DAB_DRC_OPTION), 0x0002);
+     Set_Property(static_cast<uint16_t>(si468x::Property::DAB_CTRL_DAB_MUTE_ENABLE), 0x0000);
+     const uint16_t interruptSources =
+@@ -1338,7 +1337,33 @@
+   return true;
+ }
+ 
++// Boot-only, after DAB image verification. The existing bounded executeCommand
++// API owns CTS/IRQ and finishes each transaction before the next is issued.
++// Never call this from Update()/the live command scheduler.
++void DAB::configureDabXpad(void) {
++  dabXpad = dab_diag::XpadReadback{};
++  const si468x::Result setResult = chip.setProperty(
++      si468x::Property::DAB_XPAD_ENABLE, dab_diag::XPAD_REQUESTED);
++  finishCommandDiagnostics(setResult);
++  dabXpad.setResult = static_cast<int8_t>(setResult);
++  if (setResult == si468x::Result::Ok) {
++    uint16_t value = 0;
++    const si468x::Result getResult = chip.getProperty(
++        si468x::Property::DAB_XPAD_ENABLE, value, 250000UL);
++    finishCommandDiagnostics(getResult);
++    dabXpad.getResult = static_cast<int8_t>(getResult);
++    if (getResult == si468x::Result::Ok) {
++      dabXpad.value = value;
++      dabXpad.valid = true;
++    }
++  }
++  dabXpadLogPending = true;
++}
++
+ void DAB::onHardwareResetComplete(void) {
++  dabXpad = dab_diag::XpadReadback{};
++  dabXpadLogPending = false;
++  dabRawUaLog = dab_diag::RawLog{};
+   dabServiceLabelValid = false;
+   dabSpiProbe = dab_probe::Probe{};
+   const si468x::Result aborted = chip.abortCommand();
+@@ -3440,23 +3465,30 @@
+       dabSpiProbe.observe(target, header.dataSource, header.serviceStopped(),
+                           header.byteCount > 0U);
+       const uint32_t routeNow = millis();
+-      // Raw observation only. Neither RFU nor unverified UATYPE may route data.
+-      static uint32_t lastRawUaLogMs = 0;
+-      static bool rawUaWasLogged = false;
+-      if (diagnosticDebug && (!rawUaWasLogged ||
+-          static_cast<uint32_t>(routeNow - lastRawUaLogMs) >= 5000U) &&
+-          diagSerial.availableForWrite() >= 256) {
+-        rawUaWasLogged = true;
+-        lastRawUaLogMs = routeNow;
+-        DIAG_PRINTF("[DSRV/UA] raw16_17=0x%04X rev=unverified src=%u sid=%08X cid=%08X\n",
+-                    header.rawUatypeOrRfu, header.dataSource,
+-                    static_cast<unsigned>(header.serviceId),
+-                    static_cast<unsigned>(header.componentId));
+-      }
+       const uint8_t routeIndex = static_cast<uint8_t>(target);
+       const bool feedLegacy = dab_probe::feedLegacyDecoder(
+           target, dabSpiProbe.spi.valid,
+           dabActiveServiceValid && dab_switch::audioContextUsable(dabSwitch.state));
++      // Only diagnostic interpretation: raw UA never enters route() or the
++      // legacy decoder gate. Old generation samples cannot supply confirmation.
++      if (dabRawUaLog.ready(routeNow, dabUaScan.generation, diagnosticDebug,
++                            diagSerial.availableForWrite())) {
++        const bool usable = dabActiveServiceValid &&
++            dab_switch::audioContextUsable(dabSwitch.state);
++        const char* context = !usable ? "inactive" :
++            target == dab_probe::Route::Audio ? "audio" :
++            target == dab_probe::Route::Sls ? "sls" :
++            target == dab_probe::Route::Spi ? "spi" : "unmatched";
++        DIAG_PRINTF("[DSRV/UA] raw16_17=0x%04X meaning=%s src=%u source=%s sid=%08X cid=%08X context=%s gen=%u rev=unverified suppressed=%u\n",
++                    header.rawUatypeOrRfu,
++                    dab_diag::rawMeaning(header.dataSource, header.rawUatypeOrRfu),
++                    header.dataSource, dab_diag::sourceName(header.dataSource),
++                    static_cast<unsigned>(header.serviceId),
++                    static_cast<unsigned>(header.componentId), context,
++                    static_cast<unsigned>(dabUaScan.generation),
++                    static_cast<unsigned>(dabRawUaLog.suppressed));
++        dabRawUaLog.emitted();
++      }
+       // Capture identity mismatches even when SPI is absent and the probe
+       // cannot run. Never guess a CID mask or disable collector switch guards.
+       static uint32_t lastIdentityLogMs = 0;
+@@ -4333,8 +4365,19 @@
+         diagSerial.availableForWrite() < 256) return;
+     dabUaNextLogMs = now + 100U;
+     dabXpadLogPending = false;
+-    DIAG_PRINTF("[DAB/XPAD] value=0x0097 setResult=%d rev=unverified\n",
+-                static_cast<int>(dabXpadSetResult));
++    if (dabXpad.valid) {
++      DIAG_PRINTF("[DAB/XPAD] requested=0x%04X setResult=%d readback=0x%04X getResult=%d match=%u fw=%s rev=unverified\n",
++                  dab_diag::XPAD_REQUESTED, static_cast<int>(dabXpad.setResult),
++                  dabXpad.value, static_cast<int>(dabXpad.getResult),
++                  dabXpad.matches() ? 1U : 0U, FirmwVersion);
++    } else if (dabXpad.getResult == dab_diag::NOT_ATTEMPTED) {
++      DIAG_PRINTF("[DAB/XPAD] requested=0x%04X setResult=%d readback=unavailable getResult=not-attempted fw=%s rev=unverified\n",
++                  dab_diag::XPAD_REQUESTED, static_cast<int>(dabXpad.setResult), FirmwVersion);
++    } else {
++      DIAG_PRINTF("[DAB/XPAD] requested=0x%04X setResult=%d readback=unavailable getResult=%d fw=%s rev=unverified\n",
++                  dab_diag::XPAD_REQUESTED, static_cast<int>(dabXpad.setResult),
++                  static_cast<int>(dabXpad.getResult), FirmwVersion);
++    }
+     return;
+   }
+   if (dabUaListLogPending) {
+--- a/src/si4684.h
++++ b/src/si4684.h
+@@ -28,6 +28,7 @@
+ #include "dab_service_switch_policy.h"
+ #include "dab_spi_discovery.h"
+ #include "dab_spi_probe.h"
++#include "dab_diagnostics.h"
+ #include "i2s_audio.h"
+ 
+ struct DABFrequencyLabel_DAB {
+@@ -413,7 +414,9 @@
+     bool dabServiceLabelValid = false;
+     uint32_t dabSpiDiscoveryGeneration = 0;
+     uint8_t dabUaSummaryStage = 3;
+-    int8_t dabXpadSetResult = -1;
++    dab_diag::XpadReadback dabXpad;
++    dab_diag::RawLog dabRawUaLog;
++    void configureDabXpad(void);
+     bool dabXpadLogPending = false;
+     uint8_t dabUaListLogService = 0;
+     uint8_t dabUaListLogComponent = 0;
+--- a/tests/README.md
++++ b/tests/README.md
+@@ -1,4 +1,17 @@
+ # Host regression tests
++
++Current XPAD readback and bounded raw UATYPE diagnostics are documented in
++[the XPAD/UATYPE report](DAB_XPAD_UATYPE_diagnostics_report.md).
++
++```powershell
++g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
++  tests/test_dab_diagnostics.cpp -o .pio/test_dab_diagnostics.exe
++./.pio/test_dab_diagnostics.exe
++python tests/test_dab_xpad_integration.py C:/msys64/ucrt64/bin/g++.exe
++```
++
++These fixtures test the actual boot function and DSRV diagnostic block with
++transport/UART mocks. Simulated raw 0x0007 is not an on-air SPI reception test.
+ 
+ Current P/S, UART-independent discovery and raw DSRV diagnostics are documented in
+ [the stabilization report](DAB_SPI_fixes_20261009_report.md).
+--- a/tests/test_dab_packet_runtime.py
++++ b/tests/test_dab_packet_runtime.py
+@@ -33,6 +33,7 @@
+ service = header[header.index("typedef struct _Services"):header.index("} DABService;") + len("} DABService;")]
+ prefix = r'''
+ #include "dab_spi_discovery.h"
++#include "dab_diagnostics.h"
+ #include "dab_spi_probe.h"
+ #include "dab_scheduler_policy.h"
+ #include "dab_service_switch_policy.h"
+@@ -65,6 +66,7 @@
+ definition = r'''
+ class DAB {
+  public:
++  char FirmwVersion[6] = "6.0.9";
+   DABService service[32] = {};
+   uint8_t numberofservices = 0, ServiceIndex = 0;
+   uint32_t serviceID = 0, componentID = 0, CurrentServiceID = 0;
+@@ -170,6 +172,28 @@
+   assert(sls.dabDataComponentId==0x00F0E321 && !sls.dabSpiPresent);
+   sls.refreshDabSpiDiscovery(); assert(sls.evaluationRequests==1);
+   diagnosticDebug=false; diagSerial.space=512; lines.clear();
++  // Actual XPAD logger prints only measured values and never fabricates match.
++  DAB xpadLog; xpadLog.dabUaDebugWasEnabled=true;
++  diagnosticDebug=true; diagSerial.space=0;
++  xpadLog.dabXpad.setResult=0; xpadLog.dabXpad.getResult=0;
++  xpadLog.dabXpad.value=0x0097; xpadLog.dabXpad.valid=true;
++  xpadLog.dabXpadLogPending=true;
++  xpadLog.logDabUserApplications(nowMs);
++  assert(lines.empty() && xpadLog.dabXpadLogPending);
++  diagSerial.space=512; xpadLog.logDabUserApplications(nowMs);
++  assert(lines.size()==1 && lines.back().find("readback=0x0097")!=std::string::npos);
++  assert(lines.back().find("match=1")!=std::string::npos);
++  xpadLog.dabXpad.value=0x0095; xpadLog.dabXpadLogPending=true; nowMs+=100;
++  xpadLog.logDabUserApplications(nowMs);
++  assert(lines.back().find("match=0")!=std::string::npos);
++  xpadLog.dabXpad.valid=false; xpadLog.dabXpad.getResult=-4;
++  xpadLog.dabXpadLogPending=true; nowMs+=100; xpadLog.logDabUserApplications(nowMs);
++  assert(lines.back().find("readback=unavailable getResult=-4")!=std::string::npos);
++  assert(lines.back().find("match=")==std::string::npos);
++  xpadLog.dabXpad=dab_diag::XpadReadback{};
++  xpadLog.dabXpadLogPending=true; nowMs+=100; xpadLog.logDabUserApplications(nowMs);
++  assert(lines.back().find("getResult=not-attempted")!=std::string::npos);
++  lines.clear(); diagnosticDebug=false;
+   // Check actual +1 reply prefix, four status bytes, SIZE, VERSION and service offsets.
+   DAB radio; settle(radio);
+   auto list = audioMux(); load(radio,list);
+@@ -311,8 +335,9 @@
+     body = function(signature)
+     assert "availableForWrite" not in body and "dabUaLogPending" not in body
+ # Raw field may only be printed; it is never passed to the router/legacy decoder.
+-assert cpp.count("header.rawUatypeOrRfu") == 1
+-assert "chip.setProperty(si468x::Property::DAB_XPAD_ENABLE, 0x0097)" in cpp
++route_call = cpp[cpp.index("      const dab_probe::Route target = dab_probe::route("):]
++assert "rawUatypeOrRfu" not in route_call.split(";", 1)[0]
++assert "si468x::Property::DAB_XPAD_ENABLE, dab_diag::XPAD_REQUESTED" in cpp
+ 
+ out = root / ".pio/tests_dab_packet"
+ out.mkdir(parents=True, exist_ok=True)
+--- /dev/null
++++ b/src/dab_diagnostics.h
+@@ -0,0 +1,63 @@
++#pragma once
++
++#include <stdint.h>
++
++// Host-side diagnostic state only. No application selection or payload routing.
++namespace dab_diag {
++
++static constexpr uint16_t XPAD_REQUESTED = 0x0097U;
++static constexpr int8_t NOT_ATTEMPTED = 127; // outside vendor Result values
++
++struct XpadReadback {
++  uint16_t value = 0;
++  int8_t setResult = NOT_ATTEMPTED;
++  int8_t getResult = NOT_ATTEMPTED;
++  bool valid = false;
++  bool matches() const {
++    return valid && setResult == 0 && getResult == 0 && value == XPAD_REQUESTED;
++  }
++};
++
++inline const char* rawMeaning(uint8_t source, uint16_t raw) {
++  if (source == 3U) return "reserved";
++  if (source == 2U) return "DLS-raw";
++  if (raw == 2U) return "SLS-candidate";
++  if (raw == 7U) return "SPI-candidate";
++  return "unknown";
++}
++
++inline const char* sourceName(uint8_t source) {
++  switch (source) {
++    case 0: return "data";
++    case 1: return "PAD";
++    case 2: return "DLS";
++    default: return "reserved";
++  }
++}
++
++// A global bound is stronger than per-key pacing: rapidly alternating identities
++// cannot flood UART. The suppression count covers all samples since the last line.
++struct RawLog {
++  uint32_t generation = 0;
++  uint32_t lastMs = 0;
++  uint32_t suppressed = 0;
++  bool logged = false;
++
++  bool ready(uint32_t now, uint32_t token, bool debug, int capacity) {
++    if (!debug || generation != token) {
++      *this = RawLog{};
++      generation = token;
++    }
++    if (!debug) return false;
++    if (capacity < 256 || (logged && static_cast<uint32_t>(now - lastMs) < 5000U)) {
++      if (suppressed != UINT32_MAX) ++suppressed;
++      return false;
++    }
++    logged = true;
++    lastMs = now;
++    return true;
++  }
++  void emitted() { suppressed = 0; }
++};
++
++} // namespace dab_diag
+--- /dev/null
++++ b/tests/test_dab_diagnostics.cpp
+@@ -0,0 +1,63 @@
++#include "../src/dab_diagnostics.h"
++#include "../src/dab_spi_discovery.h"
++#include "../src/dab_spi_probe.h"
++#include <cassert>
++#include <cstring>
++#include <cstdio>
++#include <initializer_list>
++
++int main() {
++  dab_diag::XpadReadback xpad;
++  assert(!xpad.valid && !xpad.matches());
++  xpad.setResult=0; xpad.getResult=0; xpad.value=0x0097; xpad.valid=true;
++  assert(xpad.matches());
++  xpad.value=0x0095; assert(!xpad.matches());
++  xpad.value=0x0097; xpad.getResult=-4; assert(!xpad.matches());
++  xpad=dab_diag::XpadReadback{}; assert(!xpad.valid && !xpad.matches());
++
++  assert(std::strcmp(dab_diag::rawMeaning(1,2),"SLS-candidate")==0);
++  assert(std::strcmp(dab_diag::rawMeaning(1,7),"SPI-candidate")==0);
++  assert(std::strcmp(dab_diag::rawMeaning(0,7),"SPI-candidate")==0);
++  assert(std::strcmp(dab_diag::rawMeaning(1,0),"unknown")==0);
++  assert(std::strcmp(dab_diag::rawMeaning(1,0x1234),"unknown")==0);
++  for (uint16_t raw : {uint16_t(0),uint16_t(2),uint16_t(7)}) {
++    assert(std::strcmp(dab_diag::rawMeaning(2,raw),"DLS-raw")==0);
++    assert(std::strcmp(dab_diag::rawMeaning(3,raw),"reserved")==0);
++  }
++  dab_diag::RawLog log;
++  assert(!log.ready(100,1,false,512) && log.suppressed==0);
++  assert(!log.ready(100,1,true,0) && log.suppressed==1);
++  assert(log.ready(100,1,true,512)); log.emitted();
++  assert(!log.ready(5099,1,true,512) && log.suppressed==1);
++  assert(log.ready(5100,1,true,512) && log.suppressed==1); log.emitted();
++  assert(!log.ready(10100,1,true,255));
++  assert(log.ready(10100,1,true,256) && log.suppressed==1); log.emitted();
++  assert(log.ready(10101,2,true,512) && log.suppressed==0); // retune
++  assert(!log.ready(10102,2,false,512) && log.suppressed==0);
++  assert(log.ready(0xFFFFFFF0U,3,true,512)); log.emitted();
++  assert(!log.ready(0x1377,3,true,512)); // 4999 ms over millis wrap
++  assert(log.ready(0x1378,3,true,512)); log.emitted();
++  log.suppressed=UINT32_MAX;
++  assert(!log.ready(0x1379,3,true,0) && log.suppressed==UINT32_MAX);
++
++  // Raw 0x007 is diagnostic only. Confirmation remains a separate UA scan.
++  const dab_probe::Endpoint audio(0x2FB9,0x01FE0005,true), none;
++  for (uint16_t raw : {uint16_t(0),uint16_t(2),uint16_t(7)}) {
++    (void)dab_diag::rawMeaning(1,raw);
++    const auto route=dab_probe::route(0x2FB9,5,1,audio,none,none);
++    assert(route==dab_probe::Route::Audio);
++    assert(dab_probe::feedLegacyDecoder(route,false,true));
++    assert(dab_probe::route(0x2FB9,5,2,audio,none,none)==dab_probe::Route::Audio);
++    assert(dab_probe::route(0x2FB8,5,1,audio,none,none)==dab_probe::Route::Ignored);
++    assert(dab_probe::route(0x2FB9,6,1,audio,none,none)==dab_probe::Route::Ignored);
++    dab_spi::Selector selector(0x2FB9);
++    selector.consider(0x2FB9,0x01FE0005,dab_spi::Identity::Slideshow);
++    assert(!selector.finish().confirmedPresent());
++  }
++  dab_spi::Selector packet(0x2FB9);
++  packet.consider(12,0x00F0E321,dab_spi::Identity::NotSpi,true);
++  assert(packet.finish().status==dab_spi::Status::PacketMotUnverified);
++  assert(!packet.finish().confirmedPresent());
++  assert(sizeof(dab_diag::RawLog)<=16 && sizeof(dab_diag::XpadReadback)<=6);
++  std::puts("XPAD diagnostic state, raw meaning, pacing, wrap, contexts and SPI isolation: PASS");
++}
+--- /dev/null
++++ b/tests/test_dab_xpad_integration.py
+@@ -0,0 +1,159 @@
++"""Compile the actual boot XPAD function against a fault-injecting chip mock."""
++from pathlib import Path
++import subprocess
++import sys
++
++root = Path(__file__).resolve().parents[1]
++source = (root / "src/si4684.cpp").read_text(encoding="utf-8")
++
++def function(signature):
++    start = source.index(signature + " {")
++    end = source.index("{", start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == "{") - (source[end] == "}")
++        end += 1
++    return source[start:end]
++
++actual = function("void DAB::configureDabXpad(void)")
++raw_start = source.index("      // Only diagnostic interpretation:")
++raw_end = source.index("      // Capture identity mismatches", raw_start)
++actual_raw = """
++void DAB::logRawSample(const si468x::DsrvHeader& header, dab_probe::Route target,
++                       uint32_t routeNow) {
++""" + source[raw_start:raw_end] + "}\n"
++prefix = r'''
++#include "dab_diagnostics.h"
++#include "dab_spi_discovery.h"
++#include "dab_spi_probe.h"
++#include "dab_service_switch_policy.h"
++#include "vendor/si468x/Si468x.h"
++#include <cassert>
++#include <cstdio>
++#include <vector>
++#include <string>
++#include <cstdarg>
++bool diagnosticDebug = true;
++struct Uart { int space = 512; int availableForWrite() { return space; } } diagSerial;
++std::vector<std::string> lines;
++void logLine(const char* format, ...) {
++  char text[256]; va_list args; va_start(args,format);
++  int n=vsnprintf(text,sizeof(text),format,args); va_end(args);
++  assert(n>0 && n<256); lines.emplace_back(text);
++}
++#define DIAG_PRINTF(...) logLine(__VA_ARGS__)
++unsigned diagnostics = 0;
++void finishCommandDiagnostics(si468x::Result) { ++diagnostics; }
++struct Chip {
++  si468x::Result setResult = si468x::Result::Ok;
++  si468x::Result getResult = si468x::Result::Ok;
++  uint16_t returned = 0x0097;
++  std::vector<unsigned> calls;
++  si468x::Result setProperty(si468x::Property p, uint16_t v) {
++    assert(p == si468x::Property::DAB_XPAD_ENABLE && v == 0x0097);
++    calls.push_back(1); return setResult;
++  }
++  si468x::Result getProperty(si468x::Property p, uint16_t& v, uint32_t timeout) {
++    assert(p == si468x::Property::DAB_XPAD_ENABLE && timeout == 250000);
++    assert(calls.size() == 1 && calls[0] == 1);
++    calls.push_back(2); v = returned; return getResult;
++  }
++} chip;
++class DAB {
++ public:
++  dab_diag::XpadReadback dabXpad;
++  bool dabXpadLogPending = false;
++  dab_diag::RawLog dabRawUaLog;
++  dab_spi::Scan dabUaScan;
++  bool dabActiveServiceValid = true;
++  dab_switch::Controller dabSwitch;
++  void configureDabXpad(void);
++  void logRawSample(const si468x::DsrvHeader&, dab_probe::Route, uint32_t);
++};
++'''
++suffix = r'''
++int main() {
++  DAB radio;
++  for (const auto result : {si468x::Result::Ok, si468x::Result::Timeout,
++                            si468x::Result::DeviceError, si468x::Result::Busy}) {
++    chip.calls.clear(); diagnostics=0; chip.setResult=si468x::Result::Ok;
++    chip.getResult=result; radio.configureDabXpad();
++    assert(chip.calls.size()==2 && diagnostics==2 && radio.dabXpadLogPending);
++    assert(radio.dabXpad.valid==(result==si468x::Result::Ok));
++    assert(radio.dabXpad.getResult==static_cast<int8_t>(result));
++    assert(radio.dabXpad.matches()==(result==si468x::Result::Ok));
++    if(result!=si468x::Result::Ok) assert(radio.dabXpad.value==0);
++  }
++  chip.calls.clear(); chip.getResult=si468x::Result::Ok; chip.returned=0x0095;
++  radio.configureDabXpad(); assert(radio.dabXpad.valid && !radio.dabXpad.matches());
++  chip.calls.clear(); diagnostics=0; chip.setResult=si468x::Result::DeviceError;
++  radio.configureDabXpad();
++  assert(chip.calls.size()==1 && diagnostics==1 && !radio.dabXpad.valid);
++  assert(radio.dabXpad.getResult==dab_diag::NOT_ATTEMPTED);
++  assert(!radio.dabXpad.matches() && radio.dabXpad.value==0);
++  std::puts("Actual boot XPAD: ordered write/read, mismatch, failure, timeout, no stale value: PASS");
++  radio.dabSwitch.state=dab_switch::State::Ready;
++  radio.dabUaScan.begin(1,true);
++  si468x::DsrvHeader header;
++  header.rawUatypeOrRfu=2; header.dataSource=1;
++  header.serviceId=0x2FB9; header.componentId=5;
++  diagSerial.space=0; radio.logRawSample(header,dab_probe::Route::Audio,0);
++  assert(lines.empty());
++  diagSerial.space=512; radio.logRawSample(header,dab_probe::Route::Audio,1);
++  assert(lines.size()==1 && lines.back().find("meaning=SLS-candidate")!=std::string::npos);
++  assert(lines.back().find("context=audio")!=std::string::npos);
++  assert(lines.back().find("suppressed=1")!=std::string::npos);
++  header.rawUatypeOrRfu=7;
++  radio.logRawSample(header,dab_probe::Route::Audio,2); assert(lines.size()==1);
++  radio.logRawSample(header,dab_probe::Route::Audio,5001);
++  assert(lines.size()==2 && lines.back().find("meaning=SPI-candidate")!=std::string::npos);
++  assert(lines.back().find("rev=unverified")!=std::string::npos);
++  header.serviceId++; // foreign identity remains explicitly unmatched
++  radio.logRawSample(header,dab_probe::Route::Ignored,10001);
++  assert(lines.back().find("context=unmatched")!=std::string::npos);
++  radio.dabActiveServiceValid=false;
++  radio.logRawSample(header,dab_probe::Route::Audio,15001);
++  assert(lines.back().find("context=inactive")!=std::string::npos);
++  radio.dabUaScan.begin(1,true); header.dataSource=2;
++  radio.logRawSample(header,dab_probe::Route::Audio,15002);
++  assert(lines.back().find("meaning=DLS-raw")!=std::string::npos);
++  const size_t count=lines.size(); diagnosticDebug=false;
++  radio.logRawSample(header,dab_probe::Route::Audio,25002); assert(lines.size()==count);
++  for(const auto& line:lines) std::fputs(line.c_str(),stdout);
++  std::puts("Actual DSRV diagnostic: context, suppressed samples, generation and UART pacing: PASS");
++}
++'''
++
++# Synchronous API is confined to the DAB initialization branch. Runtime command
++# scheduler, IRQ/CTS mechanics and recovery policy are unchanged.
++assert source.count("configureDabXpad();") == 1
++boot = function("bool DAB::begin(uint8_t SSpin, RadioMode requestedMode)")
++dab_start = boot.index('if (requestedMode == RADIO_MODE_DAB) {\n    DIAG_PRINTLN("[RADIO] DAB frequency')
++call = boot.index("configureDabXpad();")
++fm_start = boot.index('DIAG_PRINTLN("[RADIO] FM', call)
++assert dab_start < call < fm_start
++for signature in ("void DAB::Update(bool allowNewWork)", "void DAB::scheduleNextDabCommand(void)"):
++    body = function(signature)
++    assert "getProperty(" not in body and "configureDabXpad(" not in body
++reset = function("void DAB::onHardwareResetComplete(void)")
++for body in (boot, reset):
++    assert "dabXpad = dab_diag::XpadReadback{};" in body
++    assert "dabRawUaLog = dab_diag::RawLog{};" in body
++    assert "dabXpadLogPending = false;" in body
++assert boot.index("dabXpad =") < boot.index("if (!radioMemoryPrepared")
++assert "dabXpad" not in function("void DAB::clearData(void)") # tuning doesn't alter the chip property
++finish = function("void DAB::finishDabCommand(void)")
++assert finish.index("generationMatches") < finish.index("case DabCommand::DsrvHeader:")
++gui = (root / "src/gui.cpp").read_text(encoding="utf-8")
++assert "const bool present = visible && radio.spiPresent();" in gui
++
++out = root / ".pio/tests_dab_xpad"
++out.mkdir(parents=True, exist_ok=True)
++file = out / "boot.cpp"
++file.write_text(prefix + actual + actual_raw + suffix, encoding="utf-8")
++exe = out / "boot.exe"
++compiler = sys.argv[1] if len(sys.argv) > 1 else "g++"
++subprocess.run([compiler, "-std=c++11", "-Wall", "-Wextra", "-Werror", "-pedantic",
++                "-I", str(root / "src"), str(file), "-o", str(exe)], check=True)
++subprocess.run([str(exe)], check=True)
++print("DAB-only boot readback, reset/early-failure invalidation and unchanged EPG binding: PASS")
+--- /dev/null
++++ b/tests/DAB_XPAD_UATYPE_diagnostics_report.md
+@@ -0,0 +1,167 @@
++# DAB XPAD readback and raw UATYPE diagnostics — 2026-10-09
++
++This approved task extends the current working tree. The existing P/S fix,
++UART-independent discovery, EPG artwork and raw 24-byte DSRV parser were already
++present. No separate library repository, vendor sync or older ZIP was used.
++The [targeted diff](DAB_XPAD_UATYPE_diagnostics.patch) compares with a snapshot
++made immediately before these changes, preserving earlier uncommitted work.
++
++## What changed
++
++`configureDabXpad()` runs once in the DAB-only initialization branch, after
++image/function verification. It writes the unchanged 0x0097, then reads B400
++only if SET_PROPERTY returned Ok. Calls use the existing sequential boot API;
++the read has a 250,000 us limit. No synchronous reads occur in Update, the
++periodic scheduler, DEBUG toggles or FM. No new runtime command or competing
++SPI transaction was introduced. A failed read does not fail initialization;
++the existing command-diagnostic accounting still records its error.
++
++A small record retains separate SET/GET Result codes, the measured value and
++validity. A successful mismatch is valid evidence with match=0, not an error
++silently rewritten to the requested mask. On error, any value written by the
++transport is discarded. GET is not attempted after a failed SET. Every begin,
++including early failures, and hardware reset/recovery clear the record. An
++ordinary retune may retain it because the running image/property is unchanged.
++DAB-to-FM-to-DAB reinitialization cannot reuse an old readback.
++
++The existing paced DEBUG logger prints the record with actual GET_FUNC_INFO
++firmware text. It does not query the radio. Success example (expected format,
++not a newly measured hardware result):
++
++```text
++[DAB/XPAD] requested=0x0097 setResult=0 readback=0x0097 getResult=0 match=1 fw=6.0.9 rev=unverified
++```
++
++Vendor Result 0 is Ok; -4 is Timeout. A skipped GET prints `not-attempted`;
++127 is a local sentinel for an unattempted SET, outside vendor Result values.
++Failed GET logs `readback=unavailable getResult=-4`, without a match field.
++No failure path claims a measured readback or matching configuration.
++
++DSRV logging now adds source name, candidate meaning, existing routing context,
++UA scan generation and suppressed-sample count. A global five-second bound
++within the generation prevents alternating identities from flooding UART.
++A new generation discards the old diagnostic window. DEBUG off retains no
++pending sample; blocked/slow UART may skip arbitrary samples, counting them
++with saturation. Only scalar state is retained, no packet or heap buffer.
++
++Source 0 means data, 1 PAD, 2 DLS, 3 reserved. For sources 0/1, raw 2/7 is
++labelled SLS-candidate/SPI-candidate. Source 2 is labelled DLS-raw even if the
++raw field is nonzero; source 3 is reserved. Context is audio/sls/spi/unmatched
++according to the existing router, or inactive when audio context is unusable.
++Neither candidate names nor raw numbers change admission, presence or START/STOP.
++
++## Evidence versus interpretation
++
++The task supplied this **previous hardware excerpt**:
++
++```text
++[DAB/XPAD] value=0x0097 setResult=0 rev=unverified
++[DAB/INV] services=2 components=2 audio=2 data=0 packetMOT=0 invalid=0 version=8
++[DAB/UA] scan complete services=2 components=2 processed=2 failed=0
++[DAB/SPI] confirmed=0 packetMOTUnverified=0 status=not signalled ...
++[DAB/UA] ... type=0x002 (Slideshow) len=2
++[DSRV/UA] raw16_17=0x0002 rev=unverified src=1 sid=00002FB9 cid=00000005
++[SLS] Header TID=4790 length=21460 bytes=0
++[SLS] Saved TID=4790 seg=0 len=2000 bytes=2000/21460
++```
++
++It demonstrates a successful SET acknowledgement and an observed raw 2 matching
++the advertised slideshow application. It contains no GET_PROPERTY readback,
++complete slideshow publication or SPI-positive on-air evidence. The negative
++inventory/UA result is credible; diagnostics do not try to force EPG on.
++The reported errors=1 is unresolved: save its command/result/reason during HW
++regression rather than attributing it to EPG without evidence.
++
++[Skyworks AN649 Rev.2.0](https://www.skyworksinc.com/-/media/Skyworks/SL/documents/public/application-notes/an649.pdf),
++property 0xB400 p.239, documents the **used bits** in 0x0097 as:
++
++| Bit | Rev.2.0 meaning |
++| --- | --- |
++| 0 | DLS_ENABLE |
++| 1 | RFU |
++| 2 | MOT_SLS_ENABLE |
++| 4 | TPEG_ENABLE |
++| 7 | EPG_ENABLE |
++
++Unset bits: 3 BWS, 5 DGPS, 6 TMC, 8 DAB Java, 9 DMB, 10 IPDC,
++11 Voice, 12 Middleware, 13 Journaline, 14 reserved, 15 other applications.
++The DAB command 0x84 response in section 4.3 pp.176–177 calls bytes 16–17
++UATYPE. The same revision's shared section 7.7 Table 19 p.426 still calls them
++RFU. Local Rev.1.9 DAB table p.170/shared Table 19 p.400 also uses RFU; its
++B400 map pp.224–225 defines DLS/MOT/TDC at 0/1/2 and reserves higher bits.
++These differences prevent assigning the complete Rev.2.0 contract to FW6.0.9
++solely from a single matching SLS value. **0x0097 stays unchanged.** An alternative
++mask would require separate hardware/documentation evidence and approval.
++
++Proven in host tests: ordered SET/GET behavior, error handling, diagnostic
++pacing/context and preservation of existing routing/discovery. Interpreted from
++documentation: UATYPE and flag names. Still unverified on the receiver: new
++GET readback, complete UATYPE compatibility, and actual SPI/EPG reception.
++
++## Validation and firmware
++
++Passed strict C++11 host tests (`-Wall -Wextra -Werror -pedantic`): scheduler,
++fm_features, dab_service_switch, dab_user_application, dab_spi_discovery,
++dab_spi_probe, dab_packet_inventory, dab_dsrv_header, dab_diagnostics and
++i2s_audio (production NVS with stubs).
++
++Passed Python integration tests: test_dab_packet_runtime.py,
++test_dab_xpad_integration.py and test_i2s_integration.py.
++The XPAD test compiles the actual boot function and actual DSRV log block,
++injecting read/write failures, timeout, mismatch, UART full, raw 2/7, foreign
++identity, inactive context and generation changes. Source guards verify DAB-only
++boot placement, early/reset invalidation, no live GET, generation rejection
++before DSRV handling, and the unchanged spiPresent GUI binding. Runtime logger
++tests verify success/mismatch/unavailable text and no false match. Fixtures are
++synthetic; transport timing, RF, actual hardware reset and audio are not emulated.
++
++Simulated output from the actual production diagnostic block:
++
++```text
++[DSRV/UA] raw16_17=0x0002 meaning=SLS-candidate src=1 source=PAD sid=00002FB9 cid=00000005 context=audio gen=1 rev=unverified suppressed=1
++[DSRV/UA] raw16_17=0x0007 meaning=SPI-candidate src=1 source=PAD sid=00002FB9 cid=00000005 context=audio gen=1 rev=unverified suppressed=1
++```
++
++The 0x0007 line is **simulated**, not received from the air. Existing tests still
++cover true synthetic UA0x007 confirmation, negative scans and unverified packet MOT.
++Raw values cannot bypass those rules or the old-generation command guard.
++
++`pio run -e esp32dev`: SUCCESS. RAM **62,272 B** (+16 from 62,256); flash
++**3,458,193 B** (+1,044 from 3,457,149). MOT workspace stays **51,200 B**.
++The existing TFT_eSPI TOUCH_CS warning remains. No new delay/busy-wait, runtime
++heap buffer, menu, NVS, I2S or UI change was introduced. DSRV 24-byte header,
++byte count/segment offsets, readCurrentReply calls, buffer choice, event drain,
++legacy SLS/DLS processing and overflow accounting remain unchanged.
++
++Application image: `.pio/build/esp32dev/firmware.bin`, flash address **0x10000**.
++SHA256: `C4F60BE9E9B105E450C381F9188723231FD3387F9A8DD36DB232A8459B8ED242`.
++The merged receiver-complete.bin at 0x0 replaces NVS settings; use the application
++image to retain settings. No upload or physical receiver test was performed.
++
++## Receiver checklist
++
++1. Load the application image, tune the supplied negative mux and enable DEBUG
++   once. Save the XPAD line: separate setResult/getResult, actual readback and
++   match. Expect 0097/0/0/match=1 only if the chip really returns that value.
++2. Confirm uninterrupted audio, dynamic text and completed/new JPEG or PNG SLS.
++   Raw 0002 should remain diagnostic and show the proper audio/PAD context.
++3. Confirm EPG remains grey, confirmed=0, packetMOTUnverified=0. Raw 0007 alone
++   must not light it; a real positive SPI test belongs to a later task.
++4. Switch multiplexes and DAB/FM/DAB, then test standby/recovery as usual.
++   FM must not read B400; the next DAB initialization obtains a fresh record.
++5. Compare CTS timeout/recovery, DSRV overflow and UART dropped/error counters;
++   save the cause of any added error. Test DEBUG off/on and congestion: radio
++   continues while diagnostics may skip lines. No readback polling should appear.
++
++## Files changed
++
++- src/si4684.cpp: boot-only readback, cache reset, paced log/context enrichment.
++- src/si4684.h: compact records and boot function declaration.
++- src/dab_diagnostics.h: new small diagnostic helpers, no router/selector logic.
++- tests/test_dab_diagnostics.cpp: new helper/pacing/context regression fixtures.
++- tests/test_dab_xpad_integration.py: new actual boot/log integration fixtures.
++- tests/test_dab_packet_runtime.py: updated logger fixtures and routing guard.
++- Serial_protocol.md and tests/README.md: current log format and test commands.
++- tests/DAB_XPAD_UATYPE_diagnostics_report.md and .patch: report and review diff.
++
++Vendor library and P/S decoding were not modified by this task.

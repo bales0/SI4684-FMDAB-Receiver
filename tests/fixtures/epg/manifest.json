@@ -1,0 +1,51 @@
+{
+  "preserved_on": "2026-10-24",
+  "format": "Each *_groups.bin is repeated LE uint16 length + CRC-bearing MSC group; no DSRV header. The sender constructs MSC/PAD DSRV headers.",
+  "source_copies": {
+    "_usertesting/device-monitor-261023-160924.log": "device-monitor-261023-160924.log",
+    "Specification/SI4684_MUX11B_EPG_kompletni_dekodovani.zip": "SI4684_MUX11B_EPG_kompletni_dekodovani.zip",
+    ".pio/epg_synthetic_paths/groups.bin": "synthetic_programme_groups.bin",
+    ".pio/epg_acceptance/synthetic_logo_0.png": "synthetic_logo_0.png",
+    ".pio/epg_acceptance/synthetic_logo_1.png": "synthetic_logo_1.png",
+    ".pio/epg_acceptance/hardware_synthetic_logo.json": "hardware_synthetic_logo_20261024.json",
+    ".pio/epg_acceptance/hardware_synthetic_dsrv.json": "hardware_synthetic_dsrv_20261024.json"
+  },
+  "files": {
+    "device-monitor-261023-160924.log": {
+      "bytes": 6860700,
+      "sha256": "dbdbf20d2238ea023d0a699a887256db17be64af89bb57a292096efd668bbc81"
+    },
+    "hardware_synthetic_dsrv_20261024.json": {
+      "bytes": 1105,
+      "sha256": "1453d651f5c5a6dbaf346ec1d7f3d8c12ef17071a946d8b7f86c572aab1f4965"
+    },
+    "hardware_synthetic_logo_20261024.json": {
+      "bytes": 1127,
+      "sha256": "44effdc4649f541128d5415177afd19cd93ebdd91f3a38411dd098a0426c63ed"
+    },
+    "SI4684_MUX11B_EPG_kompletni_dekodovani.zip": {
+      "bytes": 642897,
+      "sha256": "aed762cc1f5076dbda47b63101dfeef6ced4b418c9210e7c3c60ba25cc509d1e"
+    },
+    "synthetic_logo_0.png": {
+      "bytes": 267,
+      "sha256": "17d0369d5ac9af751163e8340652aba9e720fd1d917c918f87e0b41651f8f6a4"
+    },
+    "synthetic_logo_0_groups.bin": {
+      "bytes": 676,
+      "sha256": "c835042d31f4ff725339fcb96006388636ded9db5f0ec9dec8597145b352e942"
+    },
+    "synthetic_logo_1.png": {
+      "bytes": 551,
+      "sha256": "73aef57d7f07a0c4f0ce5c0d44c842a1a59bacf87b498f452c1df4788edf4150"
+    },
+    "synthetic_logo_1_groups.bin": {
+      "bytes": 999,
+      "sha256": "2e4b34fd32d038ab8147f261d64221ed460b7a728928ac7d924f282dc68b091b"
+    },
+    "synthetic_programme_groups.bin": {
+      "bytes": 304,
+      "sha256": "c7f86a788a5057a68c374cd00265ab2e23d4c31749a291e3959099bd6ad044ed"
+    }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "port": "COM4",
+  "kind": "MCU synthetic DSRV, not RF",
+  "results": [
+    {
+      "case": "MSC",
+      "cached": 3,
+      "pass": true
+    },
+    {
+      "case": "PAD",
+      "cached": 3,
+      "pass": true
+    },
+    {
+      "case": "duplicates/cache/packet-isolation/SLS-DLS-handoff",
+      "pass": true
+    },
+    {
+      "case": "unconfirmed-UA",
+      "pass": true
+    },
+    {
+      "case": "foreign-SID",
+      "pass": true
+    },
+    {
+      "case": "foreign-CID",
+      "pass": true
+    },
+    {
+      "case": "DSRV-error",
+      "pass": true
+    },
+    {
+      "case": "short-header",
+      "pass": true
+    },
+    {
+      "case": "bad-MSC-CRC",
+      "pass": true
+    }
+  ],
+  "final": "PAD synthetic 3 programmes",
+  "loop": true,
+  "date": "2026-10-24",
+  "version": "v2.5b",
+  "firmware_sha256": "5C4490F195788A74119322DC65A793FF21689C705095EF5555C44B78EB2B65C7",
+  "flash_verification": "esptool verify_flash digest matched at 0x10000",
+  "visual_confirmation": "User confirmed programme, overview, list and detail work correctly."
+}

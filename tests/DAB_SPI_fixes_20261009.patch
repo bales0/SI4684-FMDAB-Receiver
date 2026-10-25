@@ -1,0 +1,927 @@
+--- a/Serial_protocol.md
++++ b/Serial_protocol.md
+@@ -205,7 +205,8 @@
+ 
+ ### DAB component discovery diagnostics
+ 
+-Enabling `DEBUG` starts a fresh UA discovery pass. `[DAB/SVC]` reports each
++Enabling `DEBUG` queues the current inventory and any completed summary; it
++does not restart or delay the UA discovery pass. `[DAB/SVC]` reports each
+ SID, P/D, component count and list version; `[DAB/COMP]` reports each exact
+ 32-bit CID, TMID, ASCTy/DSCTy, DG, P/S, CA and UA-valid flags. Packet-mode
+ MOT additionally produces an `identity=unverified` candidate line. Neither
+@@ -213,7 +214,7 @@
+ Identical periodic service lists do not repeat the inventory dump; changed
+ version, P/D or CID topology invalidates the pass.
+ 
+-All per-component UA output is queued before the final summary, for example:
++The independently paced summary reports the published result, for example:
+ 
+ ```text
+ [DAB/INV] services=10 components=10 audio=10 data=0 packetMOT=0 invalid=0 version=7
+@@ -236,10 +237,13 @@
+ TMID=3/DSCTy=60 components without confirmed SPI identity. `selected=1` requires
+ an unambiguous endpoint and complete successful discovery. Confirmed presence
+ can therefore coexist with `selected=0` (ambiguous or incomplete). The final
+-asynchronous reply and pending UA/inventory output must finish before publication.
++asynchronous reply must be committed before publication. UART output is
++independent: blocked logging never delays queries, presence or SLS evaluation.
+ 
+ Discovery runs quietly with DEBUG disabled. Diagnostic lines share 100 ms pacing
+-and a 256-byte UART headroom check. Detection repeats throughout the DAB session:
++and a 256-byte UART headroom check. Detailed UA dumps use one best-effort slot;
++while it is pending, newer diagnostic copies are skipped, but every UA answer
++is processed. Retuning/reconfiguration discards stale dumps and summaries. Detection repeats throughout the DAB session:
+ 60 seconds after each completed UA pass, including failed UA passes, another
+ low-priority pass is scheduled. Loss of lock, switching or a tracked SPI probe
+ postpones it until eligible. Invalid service-list structure requires a new valid
+@@ -255,6 +259,17 @@
+ It is hidden in FM and does not assert decoded programme data or schedule coverage.
+ For details and reproducible tests see
+ [the packet-component report](tests/DAB_SPI_packet_components_report.md).
++
++For P/S verification, `CID=01FE0002` must report `PS=primary` (ETSI EN 300 401
++section 6.3.1). CID and all other classification fields remain unchanged.
++A corresponding synthetic `CID=01FC0002` fixture reports `PS=secondary`.
++
++`[DAB/XPAD] value=0x0097 setResult=0 rev=unverified` records successful boot-time
++SET_PROPERTY; -1 means no recorded attempt. Other values are vendor Result errors.
++The value stays unchanged. `[DSRV/UA] raw16_17=0x.... rev=unverified src=...`
++is at most one line per 5 seconds, only with DEBUG and sufficient UART space.
++This raw field is neither SPI evidence nor a routing input. Firmware support
++remains unverified; see [the stabilization report](tests/DAB_SPI_fixes_20261009_report.md).
+ 
+ ### `DEBUG SPI`
+ 
+--- a/src/dab_component_inventory.h
++++ b/src/dab_component_inventory.h
+@@ -19,7 +19,7 @@
+   uint8_t tmid() const { return static_cast<uint8_t>((cid >> 14) & 3U); }
+   uint8_t type() const { return static_cast<uint8_t>((cid >> 18) & 63U); }
+   bool dataGroups() const { return tmid() == 3U && (cid & 0x2000U) != 0U; }
+-  bool primary() const { return (cid & 0x00020000UL) == 0U; }
++  bool primary() const { return (cid & 0x00020000UL) != 0U; }
+   bool ca() const { return (cid & 0x00010000UL) != 0U; }
+   bool uaValid() const { return (cid & 0x01000000UL) != 0U; }
+   uint16_t reference() const {
+--- a/src/dab_spi_discovery.h
++++ b/src/dab_spi_discovery.h
+@@ -77,9 +77,9 @@
+     active = false;
+     return true;
+   }
+-  bool complete(bool commandActive, bool outputPending) const {
++  bool functionalComplete(bool commandActive) const {
+     return enumerated && scheduled == total && processed + failed == total &&
+-           !active && !commandActive && !outputPending;
++           !active && !commandActive;
+   }
+ };
+ enum class Status : uint8_t {
+--- a/src/si4684.cpp
++++ b/src/si4684.cpp
+@@ -1254,7 +1254,12 @@
+     Set_Property(static_cast<uint16_t>(si468x::Property::DAB_EVENT_MIN_SVRLIST_PERIOD), 0x0000);
+     Set_Property(static_cast<uint16_t>(si468x::Property::DAB_EVENT_MIN_SVRLIST_PERIOD_RECONFIG), 0x0000);
+     Set_Property(static_cast<uint16_t>(si468x::Property::DAB_EVENT_MIN_FREQINFO_PERIOD), 0x0000);
+-    Set_Property(static_cast<uint16_t>(si468x::Property::DAB_XPAD_ENABLE), 0x0097);
++    const si468x::Result xpadResult = chip.setProperty(si468x::Property::DAB_XPAD_ENABLE, 0x0097);
++    finishCommandDiagnostics(xpadResult);
++    dabXpadSetResult = static_cast<int8_t>(xpadResult);
++    if (xpadResult != si468x::Result::Ok)
++      DIAG_PRINTF("[RADIO/PROP] set 0xB400=0x0097 failed result=%d\n",
++                  static_cast<int>(xpadResult));
+     Set_Property(static_cast<uint16_t>(si468x::Property::DAB_DRC_OPTION), 0x0002);
+     Set_Property(static_cast<uint16_t>(si468x::Property::DAB_CTRL_DAB_MUTE_ENABLE), 0x0000);
+     const uint16_t interruptSources =
+@@ -3333,7 +3338,8 @@
+       dabSpiIdentities[dabUaCommandIndex] = identity;
+       dabUaScan.commit(dabUaCommandListGeneration, true);
+       // Discovery runs quietly without DEBUG. Detailed UA output is optional.
+-      if (!diagnosticDebug) break;
++      // Best effort single-slot dump: skip a newer diagnostic, never a query.
++      if (!diagnosticDebug || dabUaLogPending) break;
+       if (info.userApplicationBytes)
+         memcpy(dabUaRaw, info.userApplicationRaw, info.userApplicationBytes);
+       memcpy(dabUaLabel, info.label, sizeof(dabUaLabel));
+@@ -3434,6 +3440,19 @@
+       dabSpiProbe.observe(target, header.dataSource, header.serviceStopped(),
+                           header.byteCount > 0U);
+       const uint32_t routeNow = millis();
++      // Raw observation only. Neither RFU nor unverified UATYPE may route data.
++      static uint32_t lastRawUaLogMs = 0;
++      static bool rawUaWasLogged = false;
++      if (diagnosticDebug && (!rawUaWasLogged ||
++          static_cast<uint32_t>(routeNow - lastRawUaLogMs) >= 5000U) &&
++          diagSerial.availableForWrite() >= 256) {
++        rawUaWasLogged = true;
++        lastRawUaLogMs = routeNow;
++        DIAG_PRINTF("[DSRV/UA] raw16_17=0x%04X rev=unverified src=%u sid=%08X cid=%08X\n",
++                    header.rawUatypeOrRfu, header.dataSource,
++                    static_cast<unsigned>(header.serviceId),
++                    static_cast<unsigned>(header.componentId));
++      }
+       const uint8_t routeIndex = static_cast<uint8_t>(target);
+       const bool feedLegacy = dab_probe::feedLegacyDecoder(
+           target, dabSpiProbe.spi.valid,
+@@ -3757,8 +3776,7 @@
+ 
+ bool DAB::resolveDabDataService(void) {
+   if (!dabActiveServiceValid || !dabUaInventoryValid ||
+-      !dabUaScan.complete(dabCommand == DabCommand::ComponentInfo,
+-                          dabUaLogPending || dabUaListLogPending)) return false;
++      !dabUaScan.functionalComplete(dabCommand == DabCommand::ComponentInfo)) return false;
+   dab_spi::SlideshowSelector selector(dabActiveServiceId, dabActiveComponentId);
+   for (uint8_t i = 0; i < dabUaServiceCount; ++i) {
+     const UaService& entry = dabUaServices[i];
+@@ -3981,8 +3999,7 @@
+       static_cast<uint32_t>(now - dabLastLowPriorityCommandMs) >=
+       dab_scheduler::DAB_LOW_PRIORITY_GAP_MS;
+   const bool uaQueryPending = !cleanupPending && dabServiceListReady &&
+-      dabActiveServiceValid && signallock && !dabUaLogPending &&
+-      !dabUaListLogPending && dabUaScan.enumerated &&
++      dabActiveServiceValid && signallock && dabUaScan.enumerated &&
+       (dabSwitch.state == dab_switch::State::Ready ||
+        dabSwitch.state == dab_switch::State::AudioOnly) &&
+       dabUaScanIndex < dabUaComponentCount &&
+@@ -4233,7 +4250,8 @@
+   dabUaScan.begin(dabUaComponentCount, dabServiceListReady && dabUaInventoryValid);
+   dabUaScanIndex = 0;
+   dabUaLogPending = false;
+-  dabUaSummaryStage = 0;
++  dabUaSummaryStage = 3;
++  dabSpiDiscoveryGeneration = 0;
+   dabUaListLogService = 0;
+   dabUaListLogComponent = 0;
+   dabUaListHeaderPending = true;
+@@ -4263,18 +4281,13 @@
+       dabServiceRequestPending ||
+       (dabSwitch.state != dab_switch::State::Ready &&
+        dabSwitch.state != dab_switch::State::AudioOnly))) return;
+-  if (dabUaInventoryValid && !dabUaScan.complete(
+-          dabCommand == DabCommand::ComponentInfo,
+-          dabUaLogPending || dabUaListLogPending)) return;
++  if (dabUaInventoryValid &&
++      !dabUaScan.functionalComplete(dabCommand == DabCommand::ComponentInfo)) return;
+   dab_spi::Selector selector(dabActiveServiceId);
+-  uint16_t packetMot = 0;
+-  uint8_t dataServices = 0;
+   for (uint8_t i = 0; i < dabUaServiceCount; ++i) {
+     const UaService& entry = dabUaServices[i];
+-    if (entry.info1 & 1U) ++dataServices;
+     for (uint16_t j = entry.first; j < entry.first + entry.count; ++j) {
+       const bool mot = dab_inventory::Component{dabUaComponents[j]}.packetMot();
+-      if (mot) ++packetMot;
+       selector.consider(entry.sid, dabUaComponents[j], dabSpiIdentities[j], mot);
+     }
+   }
+@@ -4283,33 +4296,8 @@
+     result.status = dab_spi::Status::Incomplete;
+     result.confirmed = dabSpiDiscovery.confirmed; // last valid evidence, no endpoint
+   }
+-  if (diagnosticDebug) {
+-    const uint32_t now = millis();
+-    if (!dab_scheduler::retryReady(now, dabUaNextLogMs) ||
+-        diagSerial.availableForWrite() < 256) return;
+-    dabUaNextLogMs = now + 100U;
+-    if (dabUaSummaryStage == 0U) {
+-      DIAG_PRINTF("[DAB/INV] services=%u components=%u audio=%u data=%u packetMOT=%u invalid=%u version=%u\n",
+-                  dabUaServiceCount, dabUaComponentCount,
+-                  dabUaServiceCount - dataServices, dataServices, packetMot,
+-                  dabUaInventoryValid ? 0U : 1U, dabUaListVersion);
+-      ++dabUaSummaryStage;
+-      return;
+-    }
+-    if (dabUaSummaryStage == 1U) {
+-      DIAG_PRINTF("[DAB/UA] scan %s services=%u components=%u processed=%u failed=%u\n",
+-                  dabUaInventoryValid ? "complete" : "incomplete",
+-                  dabUaServiceCount, dabUaScan.total, dabUaScan.processed, dabUaScan.failed);
+-      ++dabUaSummaryStage;
+-      return;
+-    }
+-    DIAG_PRINTF("[DAB/SPI] confirmed=%u packetMOTUnverified=%u status=%s selected=%u SID=%08X CID=%08X profile=unknown\n",
+-                result.confirmed, result.packetMotUnverified,
+-                dab_spi::statusName(result.status), result.available() ? 1U : 0U,
+-                static_cast<unsigned>(result.serviceId),
+-                static_cast<unsigned>(result.componentId));
+-  }
+   dabSpiDiscovery = result;
++  dabSpiDiscoveryGeneration = dabUaScan.generation;
+   if (dabUaInventoryValid) dabSpiPresent = result.confirmedPresent();
+   dabSpiDiscoveryDirty = false;
+   // Invalid inventories require a new valid service list, never a UA-only pass.
+@@ -4318,7 +4306,7 @@
+     if (!dabActiveDataServiceValid && resolveDabDataService())
+       requestDabDataServiceEvaluation();
+   }
+-  dabUaSummaryStage = 3U;
++  dabUaSummaryStage = diagnosticDebug ? 0U : 3U;
+ }
+ 
+ void DAB::logDabUserApplications(uint32_t now) {
+@@ -4326,13 +4314,28 @@
+     dabUaDebugWasEnabled = false;
+     dabUaLogPending = false;
+     dabUaListLogPending = false;
++    dabUaSummaryStage = 3U;
++    dabXpadLogPending = false;
+     return;
+   }
+   if (!dabUaDebugWasEnabled) {
+     dabUaDebugWasEnabled = true;
+-    dabUaScanIndex = 0;
+-    dabUaNextQueryMs = now;
+-    resetDabSpiDiscovery(true);
++    // DEBUG affects only diagnostics: never restart an operational scan.
++    dabUaListLogService = dabUaListLogComponent = 0;
++    dabUaListHeaderPending = true;
++    dabUaPacketLogPending = false;
++    dabUaListLogPending = dabUaServiceCount != 0U;
++    dabUaSummaryStage = dabSpiDiscoveryDirty ? 3U : 0U;
++    dabXpadLogPending = true;
++  }
++  if (dabXpadLogPending) {
++    if (!dab_scheduler::retryReady(now, dabUaNextLogMs) ||
++        diagSerial.availableForWrite() < 256) return;
++    dabUaNextLogMs = now + 100U;
++    dabXpadLogPending = false;
++    DIAG_PRINTF("[DAB/XPAD] value=0x0097 setResult=%d rev=unverified\n",
++                static_cast<int>(dabXpadSetResult));
++    return;
+   }
+   if (dabUaListLogPending) {
+     if (!dab_scheduler::retryReady(now, dabUaNextLogMs) ||
+@@ -4369,6 +4372,41 @@
+     }
+     return;
+   }
++  // The published result and inventory are immutable within this generation.
++  // Reset/tune discards the summary before any new inventory can be logged.
++  if (dabUaSummaryStage < 3U &&
++      (dabSpiDiscoveryDirty || dabSpiDiscoveryGeneration != dabUaScan.generation))
++    dabUaSummaryStage = 3U;
++  if (dabUaSummaryStage < 3U) {
++    if (!dab_scheduler::retryReady(now, dabUaNextLogMs) ||
++        diagSerial.availableForWrite() < 256) return;
++    dabUaNextLogMs = now + 100U;
++    if (dabUaSummaryStage == 0U) {
++      uint16_t packetMot = 0;
++      uint8_t dataServices = 0;
++      for (uint8_t i = 0; i < dabUaServiceCount; ++i)
++        if (dabUaServices[i].info1 & 1U) ++dataServices;
++      for (uint16_t i = 0; i < dabUaComponentCount; ++i)
++        if (dab_inventory::Component{dabUaComponents[i]}.packetMot()) ++packetMot;
++      DIAG_PRINTF("[DAB/INV] services=%u components=%u audio=%u data=%u packetMOT=%u invalid=%u version=%u\n",
++                  dabUaServiceCount, dabUaComponentCount,
++                  dabUaServiceCount - dataServices, dataServices, packetMot,
++                  dabUaInventoryValid ? 0U : 1U, dabUaListVersion);
++    } else if (dabUaSummaryStage == 1U) {
++      DIAG_PRINTF("[DAB/UA] scan %s services=%u components=%u processed=%u failed=%u\n",
++                  dabUaInventoryValid ? "complete" : "incomplete",
++                  dabUaServiceCount, dabUaScan.total, dabUaScan.processed, dabUaScan.failed);
++    } else {
++      const dab_spi::Result& result = dabSpiDiscovery;
++      DIAG_PRINTF("[DAB/SPI] confirmed=%u packetMOTUnverified=%u status=%s selected=%u SID=%08X CID=%08X profile=unknown\n",
++                  result.confirmed, result.packetMotUnverified,
++                  dab_spi::statusName(result.status), result.available() ? 1U : 0U,
++                  static_cast<unsigned>(result.serviceId),
++                  static_cast<unsigned>(result.componentId));
++    }
++    ++dabUaSummaryStage;
++    return;
++  }
+   if (!dabUaLogPending || !dab_scheduler::retryReady(now, dabUaNextLogMs)) return;
+   // Leave room for radio/protocol diagnostics. Do not drop half a UA line or
+   // wait for UART space. At most one short queued line every 100 ms.
+@@ -4479,8 +4517,8 @@
+       resetDabSpiDiscovery(true, false);
+       dabUaNextQueryMs = now;
+     }
++    refreshDabSpiDiscovery();
+     logDabUserApplications(now);
+-    refreshDabSpiDiscovery();
+     if (dabSpiProbe.running() &&
+         static_cast<uint32_t>(now - dabSpiProbeLastSummaryMs) >= 5000U) {
+       dabSpiProbeLastSummaryMs = now;
+--- a/src/si4684.h
++++ b/src/si4684.h
+@@ -411,7 +411,10 @@
+     dab_spi::RefreshCycle dabUaRefresh;
+     bool dabSpiPresent = false;
+     bool dabServiceLabelValid = false;
+-    uint8_t dabUaSummaryStage = 0;
++    uint32_t dabSpiDiscoveryGeneration = 0;
++    uint8_t dabUaSummaryStage = 3;
++    int8_t dabXpadSetResult = -1;
++    bool dabXpadLogPending = false;
+     uint8_t dabUaListLogService = 0;
+     uint8_t dabUaListLogComponent = 0;
+     bool dabUaListHeaderPending = true;
+--- a/tests/DAB_SPI_packet_components_report.md
++++ b/tests/DAB_SPI_packet_components_report.md
+@@ -1,3 +1,6 @@
++Current corrections and firmware are documented in [the stabilization report](DAB_SPI_fixes_20261009_report.md).
++The build/hash below records the earlier packet-inventory task.
++
+ # DAB SPI discovery: complete component inventory and packet-MOT distinction
+ 
+ ## Source and scope
+@@ -66,13 +69,13 @@
+ | TMID | raw 16-bit component field bits 15:14 |
+ | ASCTy/DSCTy | component byte 2 bits 7:2 |
+ | DGFlag | TMID=3 and raw bit 13 |
+-| Primary | byte 2 bit 1 is zero; one means secondary |
++| Primary | byte 2 bit 1 is set; zero means secondary (ETSI correction 2026-10-09) |
+ | CA | byte 2 bit 0 |
+ | UA info valid | byte 3 bit 0 |
+ | Reference | raw low 12 bits for TMID=3; otherwise low 6 bits |
+ 
+ The reference is diagnostic; commands continue to receive the complete CID.
+-For example `0x01FE0008` remains `0x01FE0008`; its P/S bit decodes to secondary,
++For example `0x01FE0008` remains `0x01FE0008`; its P/S bit decodes to primary,
+ as in the vendor parser. A packet-MOT candidate requires TMID=3 and DSCTy=60.
+ DG and UA-valid are reported independently and are not SPI identity shortcuts.
+ 
+@@ -140,7 +143,8 @@
+ 
+ Inventory, packet candidates and summaries share `availableForWrite() >= 256`
+ and the existing 100 ms deadline. At most one such line is emitted per scheduler
+-pass. UA completion still waits for the final committed answer and queued output.
++pass. UA completion waits for the final committed answer; queued output is independent
++following the 2026-10-09 stabilization fix.
+ `audio/data` counts services by P/D; it does not count component transport modes.
+ 
+ The following lines were captured from the host harness running the actual
+@@ -152,7 +156,7 @@
+ [DAB/SPI] confirmed=0 packetMOTUnverified=0 status=not signalled selected=0 SID=00000000 CID=00000000 profile=unknown
+ 
+ [DAB/SVC] SID=E1234567 PD=1 components=1 version=7
+-[DAB/COMP] SID=E1234567 i=0 CID=00F2E321 TMID=3 DSCTy=60 DG=1 PS=secondary CA=0 UAvalid=0
++[DAB/COMP] SID=E1234567 i=0 CID=00F2E321 TMID=3 DSCTy=60 DG=1 PS=primary CA=0 UAvalid=0
+ [DAB/SPI] packet-MOT candidate SID=E1234567 CID=00F2E321 identity=unverified
+ [DAB/INV] services=11 components=11 audio=10 data=1 packetMOT=1 invalid=0 version=7
+ [DAB/UA] scan complete services=11 components=11 processed=11 failed=0
+@@ -185,11 +189,11 @@
+ ## Validation
+ 
+ - Strict C++11 policy/inventory suite: PASS for audio/SLS-only; separate unverified
+-  packet-MOT; SPI on a secondary/last CID; mixed confirmed and unknown MOT;
++  packet-MOT; SPI on the last CID; mixed confirmed and unknown MOT;
+   ambiguity; failed UA; malformed/truncated lists; component/service capacity;
+   all 65,536 raw-field values compared to vendor decoding; SLS exclusion cases.
+ - Actual-function host harness: PASS for reply offsets, stable inventories,
+-  last-response/output completion, unchanged UI/retained CID after errors,
++  last-response completion independent of UART output, unchanged UI/retained CID after errors,
+   list-version and audio-reset stale generations, UART headroom/100 ms pacing,
+   zero-component logging and no SLS request from unverified/SPI endpoints.
+ - Existing scheduler, FM features, service-switch, user-application, discovery
+--- a/tests/README.md
++++ b/tests/README.md
+@@ -1,4 +1,13 @@
+ # Host regression tests
++
++Current P/S, UART-independent discovery and raw DSRV diagnostics are documented in
++[the stabilization report](DAB_SPI_fixes_20261009_report.md).
++
++```powershell
++g++ -std=c++11 -Wall -Wextra -Werror -pedantic `
++  tests/test_dab_dsrv_header.cpp -o .pio/test_dab_dsrv_header.exe
++./.pio/test_dab_dsrv_header.exe
++```
+ 
+ Current packet-mode inventory/discovery behavior is documented in
+ [the packet-component report](DAB_SPI_packet_components_report.md). It supersedes
+--- a/tests/test_dab_packet_inventory.cpp
++++ b/tests/test_dab_packet_inventory.cpp
+@@ -67,7 +67,7 @@
+   assert(result.packetMotUnverified == 0);
+   result = classify(list, 0, packetCid);
+   assert(result.status == Status::Incomplete && !result.available());
+-  // Positive SPI is secondary, on the last component, never replaced by unknown MOT.
++  // Positive SPI is on the last component, never replaced by unknown MOT.
+   list = {6, 0, 7, 0, 0, 0, 0, 0};
+   addService(list, 0x2100, false, {0x01FE0008, 0x00F0E111, 0x01F2E222});
+   for (unsigned i = 1; i < 10; ++i)
+@@ -137,10 +137,34 @@
+     assert(!capture.program);
+     assert(expected.componentId == actual.cid && expected.transportModeId == actual.tmid());
+     assert(expected.componentType == actual.type() && expected.dataGroupFlag == actual.dataGroups());
++    assert(actual.primary() == ((cid & 0x00020000UL) != 0));
+     assert(expected.primary == actual.primary() && expected.conditionalAccess == actual.ca());
+     assert(expected.userApplicationInfoValid == actual.uaValid());
+     assert(expected.componentReference == actual.reference());
+     assert(actual.packetMot() == (actual.tmid() == 3 && actual.type() == 60));
++  }
++}
++static void testPrimaryPolarity() {
++  const dab_inventory::Component primary{0x01FE0002};
++  const dab_inventory::Component secondary{0x01FC0002};
++  assert(primary.primary() && !secondary.primary());
++  assert(primary.tmid()==secondary.tmid() && primary.type()==secondary.type());
++  assert(primary.ca()==secondary.ca() && primary.dataGroups()==secondary.dataGroups());
++  assert(primary.uaValid()==secondary.uaValid() && primary.reference()==secondary.reference());
++  for (const uint32_t cid : {primary.cid, secondary.cid}) {
++    Bytes list{6,0,0,0,0,0,0,0}; addService(list,0x2F23,false,{cid});
++    si468x::DabComponentEntry parsed;
++    si468x::DabServiceListSink sink;
++    sink.context=&parsed;
++    sink.onComponent=[](void* ctx,const si468x::DabComponentEntry& c) {
++      *static_cast<si468x::DabComponentEntry*>(ctx)=c;
++    };
++    si468x::DabServiceListParser parser; parser.setSink(sink);
++    assert(parser.feed(list.data(),list.size())==si468x::Result::Ok && parser.complete());
++    assert(parsed.componentId==cid && parsed.primary==(cid==primary.cid));
++    assert(parsed.transportModeId==0 && parsed.componentType==63);
++    assert(!parsed.conditionalAccess && !parsed.dataGroupFlag);
++    assert(parsed.userApplicationInfoValid && parsed.componentReference==2);
+   }
+ }
+ static void testSlideshowIsolation() {
+@@ -166,6 +190,6 @@
+   assert(!multiple.selected());
+ }
+ int main() {
+-  testFixtures(); testBounds(); testVendorAgreement(); testSlideshowIsolation();
++  testFixtures(); testBounds(); testVendorAgreement(); testPrimaryPolarity(); testSlideshowIsolation();
+   std::puts("DAB packet inventory fixtures, bounds, vendor agreement and SLS isolation: PASS");
+ }
+--- a/tests/test_dab_packet_runtime.py
++++ b/tests/test_dab_packet_runtime.py
+@@ -122,16 +122,54 @@
+ }
+ void pump(DAB& radio) {
+   const size_t before = lines.size();
++  radio.refreshDabSpiDiscovery();
+   radio.logDabUserApplications(nowMs);
+-  radio.refreshDabSpiDiscovery();
+   assert(lines.size() <= before+1); // one line maximum, shared throttle
+ }
+ void drain(DAB& radio) {
+-  for (unsigned i=0; i<2000 && (radio.dabUaListLogPending || radio.dabSpiDiscoveryDirty); ++i) {
++  for (unsigned i=0; i<2000 && (radio.dabUaListLogPending || radio.dabSpiDiscoveryDirty || radio.dabUaSummaryStage < 3U || radio.dabUaLogPending || radio.dabXpadLogPending); ++i) {
+     nowMs += 100; pump(radio);
+   }
+ }
+ int main() {
++  // Identical functional result with DEBUG off, UART blocked, or a fast UART.
++  for(unsigned mode=0;mode<3;++mode) {
++    diagnosticDebug=mode!=0; diagSerial.space=mode==1 ? 0 : 512;
++    DAB fixture; settle(fixture);
++    fixture.dabUaDebugWasEnabled=diagnosticDebug;
++    Bytes fixtureList{6,0,33,0,0,0,0,0};
++    addService(fixtureList,0x2100,false,{0x01FE0002,0x00F0E321});
++    load(fixture,fixtureList);
++    commit(fixture,dab_spi::Identity::NotSpi);
++    fixture.refreshDabSpiDiscovery(); assert(fixture.dabSpiDiscoveryDirty);
++    commit(fixture,dab_spi::Identity::Spi);
++    const size_t before=lines.size();
++    fixture.refreshDabSpiDiscovery();
++    assert(lines.size()==before && fixture.dabSpiPresent);
++    assert(fixture.dabSpiDiscovery.status==dab_spi::Status::SelectedService);
++    assert(fixture.dabSpiDiscovery.componentId==0x00F0E321);
++    assert(fixture.dabUaRefresh.deadline==nowMs+60000);
++    if(mode==0) assert(fixture.dabUaSummaryStage==3 && !fixture.dabUaListLogPending);
++    // Same-mux refresh preserves evidence, invalidates replies, settles once.
++    fixture.resetDabSpiDiscovery(true,false);
++    commit(fixture,dab_spi::Identity::NotSpi);
++    commit(fixture,dab_spi::Identity::Failed,false);
++    fixture.refreshDabSpiDiscovery();
++    assert(fixture.dabSpiDiscovery.status==dab_spi::Status::Incomplete);
++    assert(!fixture.dabSpiDiscovery.available());
++  }
++  // Standalone SLS evaluation also ignores pending diagnostics and UART capacity.
++  diagnosticDebug=true; diagSerial.space=0;
++  DAB sls; settle(sls); sls.dabUaDebugWasEnabled=true;
++  Bytes slsList{6,0,33,0,0,0,0,0};
++  addService(slsList,0x2100,false,{0x01FE0008,0x00F0E321}); load(sls,slsList);
++  commit(sls,dab_spi::Identity::NotSpi); commit(sls,dab_spi::Identity::Slideshow);
++  sls.dabUaLogPending=true;
++  sls.refreshDabSpiDiscovery();
++  assert(sls.resolveDabDataService() && sls.evaluationRequests==1);
++  assert(sls.dabDataComponentId==0x00F0E321 && !sls.dabSpiPresent);
++  sls.refreshDabSpiDiscovery(); assert(sls.evaluationRequests==1);
++  diagnosticDebug=false; diagSerial.space=512; lines.clear();
+   // Check actual +1 reply prefix, four status bytes, SIZE, VERSION and service offsets.
+   DAB radio; settle(radio);
+   auto list = audioMux(); load(radio,list);
+@@ -153,7 +191,7 @@
+   addService(list,0xE1234567,true,{0x00F2E321}); load(radio,list);
+   assert(radio.dabUaServices[10].info1 & 1);
+   assert(radio.dabUaComponents[10]==0x00F2E321);
+-  // DEBUG starts a fresh pass, drains inventory at 100 ms, respects UART headroom.
++  // DEBUG queues only diagnostics, drains inventory at 100 ms, respects UART headroom.
+   radio.dabUaDebugWasEnabled=false; radio.logDabUserApplications(nowMs);
+   diagSerial.space=255; const size_t before=lines.size();
+   nowMs+=100; pump(radio); assert(lines.size()==before);
+@@ -167,7 +205,7 @@
+   assert(!radio.resolveDabDataService() && radio.evaluationRequests==0);
+   for (const auto& line : lines) std::fputs(line.c_str(),stdout);
+   lines.clear();
+-  // Last UA reply and pending UART output must finish before publication.
++  // Last UA reply publishes immediately even with DEBUG and a full UART.
+   radio.resetDabSpiDiscovery(false,false);
+   for(unsigned i=0;i<10;++i) commit(radio,dab_spi::Identity::Slideshow);
+   assert(radio.dabUaScan.issue());
+@@ -175,11 +213,51 @@
+   radio.dabSpiIdentities[10]=dab_spi::Identity::Spi;
+   assert(radio.dabUaScan.commit(radio.dabUaScan.generation,true));
+   radio.dabUaListLogPending=true;
+-  radio.refreshDabSpiDiscovery(); assert(!radio.dabSpiPresent);
++  diagSerial.space=0;
++  radio.dabUaLogPending=true; radio.dabUaHeaderPending=true;
++  radio.dabUaRemaining=0; // retained empty UA diagnostic slot
++  const size_t blockedLines=lines.size();
++  radio.refreshDabSpiDiscovery(); assert(radio.dabSpiPresent);
++  assert(!radio.dabSpiDiscoveryDirty && radio.dabUaRefresh.armed);
++  assert(radio.dabSpiDiscoveryGeneration==radio.dabUaScan.generation);
++  const auto published=radio.dabSpiDiscovery;
++  const auto deadline=radio.dabUaRefresh.deadline;
++  for(unsigned i=0;i<5;++i) { nowMs+=1000; pump(radio); }
++  assert(lines.size()==blockedLines && radio.dabSpiPresent);
++  assert(radio.dabUaSummaryStage==0 && radio.dabUaRefresh.deadline==deadline);
++  assert(!radio.dabUaRefresh.ready(deadline-1,true));
++  assert(radio.dabUaRefresh.ready(deadline,true));
+   radio.dabUaListLogPending=false;
++  diagSerial.space=512;
++  for(unsigned stage=0;stage<3;++stage) {
++    nowMs+=100; pump(radio);
++    assert(radio.dabUaSummaryStage==stage+1);
++    assert(radio.dabSpiDiscovery.componentId==published.componentId);
++    assert(radio.dabUaRefresh.deadline==deadline); // no repeated finalization
++  }
+   drain(radio); assert(radio.dabSpiPresent && radio.dabSpiDiscovery.available());
+   assert(radio.dabSpiDiscovery.componentId==0x00F2E321);
+   assert(radio.evaluationRequests==0); // SPI never goes through slideshow START
++
++  // DEBUG toggles neither generation nor completion; completed result logs on demand.
++  const uint32_t completedGeneration=radio.dabUaScan.generation;
++  diagnosticDebug=false; pump(radio);
++  diagnosticDebug=true; diagSerial.space=0; pump(radio);
++  assert(radio.dabUaScan.generation==completedGeneration && radio.dabSpiPresent);
++  // Retune during a partially printed summary discards old diagnostics and answers.
++  radio.dabUaListLogPending=false; radio.dabXpadLogPending=false;
++  radio.dabUaSummaryStage=1;
++  radio.resetDabSpiDiscovery(true,false);
++  assert(radio.dabUaSummaryStage==3 && !radio.dabUaLogPending);
++  const auto newGeneration=radio.dabUaScan.generation;
++  pump(radio); assert(lines.size()>=blockedLines && radio.dabUaScan.generation==newGeneration);
++  // Complete a periodic pass once with no logger progress.
++  for(unsigned i=0;i<10;++i) commit(radio,dab_spi::Identity::Slideshow);
++  commit(radio,dab_spi::Identity::Spi);
++  radio.refreshDabSpiDiscovery(); assert(radio.dabSpiPresent);
++  const auto periodicDeadline=radio.dabUaRefresh.deadline;
++  radio.refreshDabSpiDiscovery(); assert(radio.dabUaRefresh.deadline==periodicDeadline);
++  diagSerial.space=512;
+ 
+   // Short, reserved NUM_COMP and excess-capacity lists keep BOTH valid inventories.
+   const auto oldStation=radio.service[0]; const uint32_t oldCid=radio.dabUaComponents[10];
+@@ -227,6 +305,15 @@
+ for signature in ("void DAB::refreshDabSpiDiscovery(void)", "bool DAB::resolveDabDataService(void)"):
+     assert "START_DIGITAL_SERVICE" not in function(signature)
+ 
++ua_schedule = cpp[cpp.index("  const bool uaQueryPending ="):cpp.index("  const bool lowPriorityPending =")]
++assert "dabUaLogPending" not in ua_schedule and "dabUaListLogPending" not in ua_schedule
++for signature in ("void DAB::refreshDabSpiDiscovery(void)", "bool DAB::resolveDabDataService(void)"):
++    body = function(signature)
++    assert "availableForWrite" not in body and "dabUaLogPending" not in body
++# Raw field may only be printed; it is never passed to the router/legacy decoder.
++assert cpp.count("header.rawUatypeOrRfu") == 1
++assert "chip.setProperty(si468x::Property::DAB_XPAD_ENABLE, 0x0097)" in cpp
++
+ out = root / ".pio/tests_dab_packet"
+ out.mkdir(parents=True, exist_ok=True)
+ file = out / "runtime.cpp"
+--- a/tests/test_dab_spi_discovery.cpp
++++ b/tests/test_dab_spi_discovery.cpp
+@@ -125,18 +125,18 @@
+   for (unsigned i = 0; i < 17; ++i) {
+     assert(scan.issue());
+     assert(!scan.issue());  // one outstanding request only
+-    assert(!scan.complete(true, false));
++    assert(!scan.functionalComplete(true));
+     if (i == 16) {
+       assert(scan.scheduled == scan.total);
+       assert(scan.processed == 16);
+-      assert(!scan.complete(false, false));
++      assert(!scan.functionalComplete(false));
+     }
+     assert(scan.commit(token, true));
+     assert(!scan.commit(token, true));  // no duplicate completion
+-    assert(!scan.complete(false, true));  // UART output still pending
+-  }
+-  assert(scan.complete(false, false));
+-  assert(!scan.complete(true, false));
++    assert(scan.functionalComplete(false) == (i == 16)); // logs are independent
++  }
++  assert(scan.functionalComplete(false));
++  assert(!scan.functionalComplete(true));
+   assert(!scan.issue());
+   assert(scan.processed == 17 && scan.failed == 0);
+ 
+@@ -147,12 +147,12 @@
+   failed.consider(1, 1, Identity::NotSpi);
+   assert(scan.issue() && scan.commit(scan.generation, false));
+   failed.consider(1, 2, Identity::Failed);
+-  assert(scan.complete(false, false));
++  assert(scan.functionalComplete(false));
+   assert(scan.total == scan.processed + scan.failed);
+   assert(scan.processed == 1 && scan.failed == 1);
+   expectUnavailable(failed.finish(), Status::Incomplete);
+ 
+-  // E: changed list/debug restart invalidates even same-SID/CID replies.
++  // E: changed list/periodic restart invalidates even same-SID/CID replies.
+   scan.begin(1, true);
+   assert(scan.issue());
+   const uint32_t stale = scan.generation;
+@@ -162,11 +162,11 @@
+   assert(!scan.commit(stale, false));
+   assert(scan.active && scan.processed == 0 && scan.failed == 0);
+   assert(scan.commit(scan.generation, true));
+-  assert(scan.complete(false, false));
++  assert(scan.functionalComplete(false));
+   scan.begin(0, false);
+-  assert(!scan.complete(false, false) && !scan.issue());
++  assert(!scan.functionalComplete(false) && !scan.issue());
+   scan.begin(0, true);
+-  assert(scan.complete(false, false));
++  assert(scan.functionalComplete(false));
+   scan.generation = 0xFFFFFFFFUL;
+   scan.begin(1, true);
+   assert(scan.generation == 1);
+@@ -200,12 +200,12 @@
+     Selector pending(0x1234);
+     for (unsigned j = 0; j < 3; ++j) pending.consider(0x1234, cids[j], identities[j]);
+     expectUnavailable(pending.finish(), Status::Pending);
+-    assert(!scan.complete(true, false));
++    assert(!scan.functionalComplete(true));
+     identities[i] = dab_spi::identify(i == 2 ? spi : sls, 4, 1);
+     assert(scan.commit(scan.generation, true));
+-    assert(!scan.complete(false, true)); // final UA lines precede summary/result
+-  }
+-  assert(scan.complete(false, false) && scan.processed == 3);
++    assert(scan.functionalComplete(false) == (i == 2)); // no UART condition
++  }
++  assert(scan.functionalComplete(false) && scan.processed == 3);
+   Selector selected(0x1234);
+   for (unsigned j = 0; j < 3; ++j) selected.consider(0x1234, cids[j], identities[j]);
+   assert(selected.finish().available());
+@@ -220,7 +220,7 @@
+   scan.begin(448, true);
+   for (unsigned j = 0; j < 448; ++j)
+     assert(scan.issue() && scan.commit(scan.generation, true));
+-  assert(scan.complete(false, false) && scan.processed == 448);
++  assert(scan.functionalComplete(false) && scan.processed == 448);
+ }
+ 
+ static void testContinuousRefresh() {
+--- a/src/vendor/si468x/Si468x.h
++++ b/src/vendor/si468x/Si468x.h
+@@ -1690,12 +1690,15 @@
+     uint8_t dscType;          // lower six bits of DATA_TYPE in DAB mode
+     uint32_t serviceId;
+     uint32_t componentId;
++    // DAB command table Rev.2.0: UATYPE; Rev.1.9 / common section 7.7: RFU.
++    // Firmware support unverified: diagnostic only, never a routing identity.
++    uint16_t rawUatypeOrRfu;
+     uint16_t byteCount;
+     uint16_t segmentNumber;
+     uint16_t numberOfSegments;
+ 
+     DsrvHeader() : interruptSource(0), buffersRemaining(0), serviceState(0), dataType(0),
+-                   dataSource(0), dscType(0), serviceId(0), componentId(0), byteCount(0),
++                   dataSource(0), dscType(0), serviceId(0), componentId(0), rawUatypeOrRfu(0), byteCount(0),
+                    segmentNumber(0), numberOfSegments(0) {}
+ 
+     bool dataReady() const { return (interruptSource & 0x01u) != 0; }
+@@ -3152,7 +3155,8 @@
+         parseStatus(r,n,o.status);
+         o.interruptSource=r[4]; o.buffersRemaining=r[5]; o.serviceState=r[6]; o.dataType=r[7];
+         o.dataSource=(uint8_t)(r[7]>>6); o.dscType=(uint8_t)(r[7]&0x3Fu);
+-        o.serviceId=readLe32(r+8); o.componentId=readLe32(r+12); o.byteCount=readLe16(r+18);
++        o.serviceId=readLe32(r+8); o.componentId=readLe32(r+12); o.rawUatypeOrRfu=readLe16(r+16);
++        o.byteCount=readLe16(r+18);
+         o.segmentNumber=readLe16(r+20); o.numberOfSegments=readLe16(r+22); return Result::Ok;
+     }
+ 
+@@ -3314,7 +3318,7 @@
+             c.rawComponentField=raw; c.transportModeId=(uint8_t)(raw>>14);
+             c.dataGroupFlag=(c.transportModeId==3u)&&((raw&0x2000u)!=0);
+             c.componentReference=(c.transportModeId==3u)?(uint16_t)(raw&0x0FFFu):(uint16_t)(raw&0x003Fu);
+-            c.componentType=(uint8_t)(_buf[2]>>2); c.primary=(_buf[2]&0x02u)==0;
++            c.componentType=(uint8_t)(_buf[2]>>2); c.primary=(_buf[2]&0x02u)!=0;
+             c.conditionalAccess=(_buf[2]&0x01u)!=0; c.userApplicationInfoValid=(_buf[3]&0x01u)!=0;
+             if (_sink.onComponent) _sink.onComponent(_sink.context,c);
+             ++_componentIndex; if (_componentsRemaining) --_componentsRemaining; _have=0;
+--- /dev/null
++++ b/tests/test_dab_dsrv_header.cpp
+@@ -0,0 +1,55 @@
++#include "../src/vendor/si468x/Si468x.h"
++#include "../src/dab_spi_probe.h"
++#include <cassert>
++#include <cstdio>
++#include <cstring>
++
++int main() {
++  // Synthetic parser fixtures, not evidence of firmware UATYPE support.
++  const uint16_t rawValues[] = {0, 2, 7, 0xABCD};
++  const dab_probe::Endpoint audio(0x2FD9, 0x01FE002A, true);
++  const dab_probe::Endpoint sls(0x12345678, 0x00F0E321, true);
++  const dab_probe::Endpoint spi;
++  for (unsigned source = 0; source < 3; ++source) {
++    for (uint16_t raw : rawValues) {
++      uint8_t reply[27] = {};
++      reply[0] = 0x80;
++      reply[4] = 1; reply[5] = 3; reply[6] = 3;
++      reply[7] = static_cast<uint8_t>((source << 6) | (source == 2 ? 0 : 60));
++      const uint32_t sid = source == 0 ? sls.sid : audio.sid;
++      const uint32_t cid = source == 0 ? sls.cid : 0x2A;
++      for (unsigned i = 0; i < 4; ++i) {
++        reply[8+i] = static_cast<uint8_t>(sid >> (8*i));
++        reply[12+i] = static_cast<uint8_t>(cid >> (8*i));
++      }
++      reply[16] = static_cast<uint8_t>(raw); reply[17] = raw >> 8;
++      reply[18] = 3; reply[20] = 0x34; reply[21] = 0x12;
++      reply[22] = 0x78; reply[23] = 0x56;
++      reply[24] = 0xFF; reply[25] = 0xD8; reply[26] = 0x42;
++      uint8_t saved[sizeof(reply)]; std::memcpy(saved, reply, sizeof(reply));
++      si468x::DsrvHeader header;
++      for (size_t length = 0; length < 24; ++length) {
++        header.rawUatypeOrRfu = 0x9876;
++        assert(si468x::Si468x::parseDsrvHeader(reply, length, header) ==
++               si468x::Result::MalformedReply);
++        assert(header.rawUatypeOrRfu == 0x9876);
++      }
++      assert(si468x::Si468x::parseDsrvHeader(nullptr, 24, header) ==
++             si468x::Result::MalformedReply);
++      assert(si468x::Si468x::parseDsrvHeader(reply, 24, header) == si468x::Result::Ok);
++      assert(header.rawUatypeOrRfu == raw);
++      assert(header.dataSource == source && header.dscType == (source == 2 ? 0 : 60));
++      assert(header.interruptSource == 1 && header.buffersRemaining == 3);
++      assert(header.serviceState == 3 && header.serviceId == sid && header.componentId == cid);
++      assert(header.byteCount == 3 && header.segmentNumber == 0x1234);
++      assert(header.numberOfSegments == 0x5678);
++      assert(std::memcmp(saved, reply, sizeof(reply)) == 0);
++      assert(reply[24] == 0xFF && reply[25] == 0xD8 && reply[26] == 0x42);
++      const auto route = dab_probe::route(header.serviceId, header.componentId,
++                                          header.dataSource, audio, sls, spi);
++      assert(route == (source == 0 ? dab_probe::Route::Sls : dab_probe::Route::Audio));
++      assert(dab_probe::feedLegacyDecoder(route, false, true));
++    }
++  }
++  std::puts("DSRV raw field, short replies, offsets, payload and source routing: PASS");
++}
+--- /dev/null
++++ b/tests/DAB_SPI_fixes_20261009_report.md
+@@ -0,0 +1,152 @@
++# SPI discovery stabilization, 2026-10-09
++
++Changes apply to the current working tree, preserving earlier approved audio,
++SLS/UI and I2S work. The targeted [diff](DAB_SPI_fixes_20261009.patch) compares
++against a copy taken immediately before this approved change, rather than HEAD.
++No firmware was flashed and no RF/hardware test was performed.
++
++## Proven corrections
++
++Both component parsers now interpret P/S=1 as primary. CID 01FE0002 is primary;
++01FC0002 is secondary. Full command IDs and all other metadata are preserved.
++The old AN649-based interpretation was wrong. [ETSI EN 300 401 V2.1.1,
++section 6.3.1, p.46](https://www.etsi.org/deliver/etsi_en/300400_300499/300401/02.01.01_20/en_300401v020101a.pdf)
++specifies this polarity independently of the vendor guide.
++
++Scan::functionalComplete checks the inventory, committed success/failure counts
++and active command, without a diagnostic argument. Query scheduling, result
++publication and standalone SLS evaluation no longer wait for diagnostic queues.
++The complete Result, published generation, presence, dirty state and 60-second
++refresh deadline are committed in foreground before the logger runs. Dirty=false
++prevents repeated finalization. Selection remains conservative: only validated
++UA 0x007 supplies SPI evidence; unknown packet-MOT cannot activate the icon.
++Ambiguity, failures and last-known presence after invalid inventory retain their
++existing semantics. No SPI START or full EPG decoder was added.
++
++DEBUG toggling queues diagnostics only; it no longer restarts queries. Summaries
++reference the immutable published generation, and resets drop unfinished summaries
++and the UA diagnostic slot. Inventory lines use the retained validated inventory.
++One pending UA dump is preserved until drained; newer diagnostic copies are skipped
++while that slot is occupied. Every response still updates functional discovery.
++This intentionally trades exhaustive DEBUG dumps for uninterrupted discovery.
++No dynamic allocation or additional payload buffer was introduced.
++
++## Diagnostic findings and documentation discrepancy
++
++Local **AN649 Rev.1.9**, `Specification/AN649 Programming Guide Rev 1.9.pdf`:
++DAB section 4.3, GET_DIGITAL_SERVICE_DATA response p.170, and common section 7.7,
++Table 19 p.400, identify bytes 16-17 as RFU. These are not FM tables.
++Property 0xB400 spans pp.224-225: bits 0/1/2 enable DLS/MOT/TDC; bits 15:3
++are reserved.
++
++[AN649 Rev.2.0](https://www.skyworksinc.com/-/media/Skyworks/SL/documents/public/application-notes/an649.pdf)
++contains an internal discrepancy: its **DAB section 4.3**, command 0x84 response,
++pp.176-177, names RESP16-17 UATYPE and links it to DAB_XPAD_ENABLE. But common
++**section 7.7, Table 19, p.426**, still names DATA16-17 RFU. The task's claim
++that section 7.7 itself defines UATYPE is therefore inaccurate for this PDF.
++The FM/HD command table also retains RFU; it was not used as DAB evidence.
++
++Rev.2.0 property 0xB400, p.239, assigns bits 0=DLS, 1=RFU, 2=SLS, 3=BWS,
++4=TPEG, 5=DGPS, 6=TMC, 7=EPG, 8=DAB Java, 9=DMB, 10=IPDC, 11=Voice,
++12=Middleware, 13=Journaline, 14=reserved, 15=other applications.
++Thus 0x0097 enables 0,1,2,4,7, with different meanings in the two revisions.
++The configured value is preserved. Its actual SET_PROPERTY result is now
++retained and reported when DEBUG is enabled:
++
++```text
++[DAB/XPAD] value=0x0097 setResult=0 rev=unverified
++```
++
++0 means vendor Result::Ok; -1 means no recorded write attempt. Actual receiver
++success still requires this hardware log; a successful host build cannot prove it.
++
++DsrvHeader exposes only `rawUatypeOrRfu=readLe16(r+16)`. Under DEBUG a raw line
++is allowed once per five seconds with at least 256 bytes of UART headroom:
++
++```text
++[DSRV/UA] raw16_17=0x0002 rev=unverified src=1 sid=00002FD9 cid=0000002A
++```
++
++This example is illustrative. Raw values never influence routing or presence.
++Byte count, segment number, segment count and payload remain at 18/20/22/24.
++The legacy DLS/SLS admission and payload handling, buffersRemaining drain and
++overflow counter are unchanged. No CTS, IRQ, HOST SPI or TFT bus changes.
++
++## Unverified FW 6.0.9 behavior
++
++The local firmware catalog identifies the DAB 6.0.9 image, but no release note or
++captured RESP16-17 data in this project proves its UATYPE contract. The supplied
++UA dumps prove SLS advertisements, not that this raw DSRV field supplies UATYPE.
++Simulated 0/2/7 parser fixtures do not establish firmware capabilities. EPG
++reception and standalone SPI coexistence still need positive on-air testing.
++
++## Verification
++
++Passed with strict host C++11 `-Wall -Wextra -Werror -pedantic`:
++
++- test_scheduler, test_fm_features, test_dab_service_switch.
++- test_dab_user_application, test_dab_spi_discovery, test_dab_spi_probe.
++- test_dab_packet_inventory: independent P/S expectations, both vendor wire
++  fixtures, unchanged fields, exhaustive 65,536 vendor/helper comparisons.
++- test_dab_dsrv_header: 0/2/7/ABCD raw fields, all short lengths/null input,
++  unchanged byte count/segments/payload and sources 0/1/2 using production router.
++- test_i2s_audio with production NVS and its existing host stubs.
++
++Passed Python integration tests:
++
++- test_dab_packet_runtime.py compiles actual parser, reset, publication, logger
++  and SLS resolver bodies. DEBUG off/on, UART zero/fast/255 headroom, immediate
++  last-answer publication, three delayed summary stages, final query failure,
++  generation changes in scan/dump, DEBUG toggling without query restart,
++  60-second deadline and no double finalization, retained invalid inventory,
++  negative mux and packet candidate, blocked-UART SLS evaluation exactly once.
++  A source assertion also checks that the production query scheduler has no
++  diagnostic queue gates. The test manually settles tuner replies; it does not
++  emulate the full radio transport or physical UART timing.
++- test_i2s_integration.py: existing configuration/menu/failure-path regression.
++
++`pio run -e esp32dev`: SUCCESS. RAM **62,256 B** (previous 62,240, +16);
++flash **3,457,149 B** (previous 3,456,561, +588). MOT workspace stays 51,200 B.
++The existing TFT_eSPI warning about undefined TOUCH_CS remains.
++
++Application image: `.pio/build/esp32dev/firmware.bin`, address **0x10000**.
++SHA256: `1260CAA47AABCED48A004C565E413758165988ED68A2D123CE492D94165C8A28`.
++The merged receiver-complete.bin at 0x0 replaces NVS; use the application image
++when retaining settings. No upload was performed.
++
++## Hardware checklist and P/S verification
++
++1. Load the application firmware using the normal receiver flashing procedure.
++   In the 115200 serial console send `DEBUG` if diagnostics are off; wait for
++   `[DEBUG] diagnostics ON`. The command toggles, so do not send it twice.
++2. Find `[DAB/COMP] ... CID=01FE0002 ... PS=primary ...`. Compare the same SID/CID
++   against an earlier log: only P/S interpretation should change. Different
++   receivers/muxes may have different CIDs; any byte-2 bit 1 set means primary.
++   The 01FC0002 secondary counterpart is a host fixture, not an expected station.
++3. Verify continuous audio, dynamic infotext, and a completed/new JPEG or PNG
++   slideshow. Monitor signal while loading and switch stations/multiplexes.
++4. The supplied negative mux should keep EPG grey, `confirmed=0`, `not signalled`.
++   A packet-MOT candidate alone must keep it grey. Confirmed signalling is not
++   decoded EPG; positive on-air testing is still required separately.
++5. Check XPAD setResult and optional raw DSRV lines. Compare CTS timeout/recovery,
++   DSRV overflow and UART dropped counters; healthy runs should add zero.
++6. Leave reception running beyond 60 seconds: one further low-priority UA pass
++   per completed cycle, without doubled periodic queries. Repeat with DEBUG off
++   and on; hardware behavior under UART congestion is not yet measured.
++
++## Files changed by this task
++
++- src/dab_component_inventory.h
++- src/dab_spi_discovery.h
++- src/si4684.h
++- src/si4684.cpp
++- src/vendor/si468x/Si468x.h
++- tests/test_dab_spi_discovery.cpp
++- tests/test_dab_packet_inventory.cpp
++- tests/test_dab_packet_runtime.py
++- tests/test_dab_dsrv_header.cpp (new)
++- Serial_protocol.md
++- tests/README.md
++- tests/DAB_SPI_packet_components_report.md (corrections; old build retained)
++- tests/DAB_SPI_fixes_20261009_report.md (new)
++- tests/DAB_SPI_fixes_20261009.patch (new; targeted review artifact)

@@ -1,0 +1,43 @@
+{
+  "date": "2026-10-24",
+  "scope": "MCU synthetic DSRV, not RF",
+  "results": [
+    {
+      "path": "MSC",
+      "interlace": 0,
+      "bytes": 267,
+      "pass_": true,
+      "drawing": []
+    },
+    {
+      "path": "PAD",
+      "interlace": 0,
+      "bytes": 267,
+      "pass_": true,
+      "drawing": []
+    },
+    {
+      "path": "MSC",
+      "interlace": 1,
+      "bytes": 551,
+      "pass_": true,
+      "drawing": [
+        "[EPG/LOGO] bytes=551 interlace=1 validated=1 stage=ok detail= w=96 h=64 in=494 out=18552 pass=7 row=63 pad=4",
+        "[EPG/LOGO] draw=1"
+      ]
+    },
+    {
+      "path": "PAD",
+      "interlace": 1,
+      "bytes": 551,
+      "pass_": true,
+      "drawing": [
+        "[EPG/LOGO] bytes=551 interlace=1 validated=1 stage=ok detail= w=96 h=64 in=494 out=18552 pass=7 row=63 pad=4",
+        "[EPG/LOGO] draw=1"
+      ]
+    }
+  ],
+  "visual_confirmation": "User confirmed final PAD Adam7 logo is complete and correctly rendered.",
+  "firmware_sha256": "5C4490F195788A74119322DC65A793FF21689C705095EF5555C44B78EB2B65C7",
+  "loop": "PAD Adam7 active"
+}

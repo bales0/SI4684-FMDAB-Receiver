@@ -1,0 +1,890 @@
+diff --git a/src/dab_spi_probe.h b/src/dab_spi_probe.h
+index aee7bdb..9648a16 100644
+--- a/src/dab_spi_probe.h
++++ b/src/dab_spi_probe.h
+@@ -28,16 +28,26 @@ inline bool matchesAudioPad(const Endpoint& audio, uint32_t sid, uint32_t cid) {
+       (cid & 0xFFFF0000UL) == 0U && (audio.cid & 0xFFFFU) == cid;
+ }
+ 
++// FW 6.0.9, Polish MUX 11A: list CID 01F2C00B, standard-data
++// DSRV CID 0000C00B. Accept only a zero-extended packet-mode component
++// with the exact SID. Command ownership retains Endpoint::matches().
++inline bool matchesPacketData(const Endpoint& data, uint32_t sid, uint32_t cid) {
++  return data.valid && data.sid == sid && (data.cid & 0xC000U) == 0xC000U &&
++      (cid & 0xFFFF0000UL) == 0U && (data.cid & 0xFFFFU) == cid;
++}
++
+ // Source 0 = standard data, 1 = PAD, 2 = DLS. Application ownership comes
+ // before any payload interpretation; unknown sources/contexts are drained.
+ inline Route route(uint32_t sid, uint32_t cid, uint8_t source,
+                    const Endpoint& audio, const Endpoint& sls, const Endpoint& spi) {
+   if (source > 2U) return Route::Ignored;
+-  if (spi.matches(sid, cid)) return source < 2U ? Route::Spi : Route::Ignored;
++  if (spi.matches(sid, cid) || (source == 0U && matchesPacketData(spi, sid, cid)))
++    return source < 2U ? Route::Spi : Route::Ignored;
+   if (audio.matches(sid, cid) ||
+       ((source == 1U || source == 2U) && matchesAudioPad(audio, sid, cid)))
+     return Route::Audio;
+-  if (sls.matches(sid, cid)) return source < 2U ? Route::Sls : Route::Ignored;
++  if (sls.matches(sid, cid) || (source == 0U && matchesPacketData(sls, sid, cid)))
++    return source < 2U ? Route::Sls : Route::Ignored;
+   return Route::Ignored;
+ }
+ 
+diff --git a/src/i2s_audio.h b/src/i2s_audio.h
+index b222d0b..a40d3f7 100644
+--- a/src/i2s_audio.h
++++ b/src/i2s_audio.h
+@@ -32,6 +32,8 @@ inline I2sAudioMode cycleI2sAudioMode(I2sAudioMode value, bool forward) {
+ // AN649: keep analog DAC (bit 0) enabled independently of digital I²S (bit 1)
+ // and INTB (bit 15). MASTER is bit 15 of DIGITAL_IO_OUTPUT_SELECT, not PIN_CONFIG.
+ static constexpr uint16_t I2S_AUDIO_MASTER = 0x8000U;
++// Philips I2S: 24-bit samples in 32-bit channel slots, BCK = 64 * Fs.
++static constexpr uint16_t I2S_AUDIO_FORMAT_STANDARD = 0x1870U;
+ inline uint16_t i2sAudioPinConfig(I2sAudioMode mode, bool intb) {
+   return 1U | (i2sAudioSampleRate(mode) != 0U ? 2U : 0U) | (intb ? 0x8000U : 0U);
+ }
+diff --git a/src/si4684.cpp b/src/si4684.cpp
+index eaf70ac..417af2b 100644
+--- a/src/si4684.cpp
++++ b/src/si4684.cpp
+@@ -125,27 +125,46 @@ void DAB::setI2sAudioMode(I2sAudioMode mode) {
+   radioI2sAudioMode = sanitizeI2sAudioMode(mode);
+ }
+ 
+-static void configureI2sAudio(void) {
++// Format is writable only before the first tune (AN649). A reused image may
++// already be tuned: verify its complete configuration without changing it.
++static void configureI2sAudio(bool reuseRunningImage) {
+   radioI2sOutputReady = false;
+   const uint16_t rate = i2sAudioSampleRate(radioI2sAudioMode);
+-  DIAG_PRINTF("[I2S] mode=%s enabled=%u master=%u rate=%u\n",
+-              i2sAudioModeText(radioI2sAudioMode), rate != 0U, rate != 0U, rate);
++  DIAG_PRINTF("[I2S] mode=%s requested=%u rate=%u format=0x%04X reuse=%u\n",
++              i2sAudioModeText(radioI2sAudioMode), rate != 0U, rate,
++              I2S_AUDIO_FORMAT_STANDARD, reuseRunningImage);
+   if (!rate) return;
+   const si468x::Property properties[] = {
+     si468x::Property::DIGITAL_IO_OUTPUT_SELECT,
++    si468x::Property::DIGITAL_IO_OUTPUT_FORMAT,
+     si468x::Property::DIGITAL_IO_OUTPUT_SAMPLE_RATE
+   };
+-  const uint16_t values[] = {I2S_AUDIO_MASTER, rate};
+-  for (uint8_t i = 0; i < 2; ++i) {
+-    const si468x::Result result = chip.setProperty(properties[i], values[i]);
+-    DIAG_PRINTF("[I2S] property=0x%04X value=0x%04X result=%d\n",
+-                static_cast<unsigned>(properties[i]), values[i], static_cast<int>(result));
+-    if (result != si468x::Result::Ok) {
+-      DIAG_PRINTLN("[I2S] configuration failed; digital pins disabled, analog DAC retained");
+-      return; // saved selection is unchanged; existing transport handling owns recovery
++  const uint16_t values[] = {I2S_AUDIO_MASTER, I2S_AUDIO_FORMAT_STANDARD, rate};
++  if (!reuseRunningImage) {
++    for (uint8_t i = 0; i < 3; ++i) {
++      const si468x::Result result = chip.setProperty(properties[i], values[i]);
++      DIAG_PRINTF("[I2S] property=0x%04X value=0x%04X result=%d\n",
++                  static_cast<unsigned>(properties[i]), values[i], static_cast<int>(result));
++      if (result != si468x::Result::Ok) {
++        DIAG_PRINTLN("[I2S] configuration failed; digital pins disabled, analog DAC retained");
++        return;
++      }
++    }
++  }
++  // Check Result even if the output argument happens to contain the expected
++  // value. All three properties must agree before PIN_CONFIG enables I2S.
++  for (uint8_t i = 0; i < 3; ++i) {
++    uint16_t actual = 0;
++    const si468x::Result result = chip.getProperty(properties[i], actual, 250000UL);
++    DIAG_PRINTF("[I2S] readback property=0x%04X result=%d expected=0x%04X actual=0x%04X\n",
++                static_cast<unsigned>(properties[i]), static_cast<int>(result), values[i], actual);
++    if (result != si468x::Result::Ok || actual != values[i]) {
++      DIAG_PRINTLN("[I2S] verification failed; digital pins disabled, analog DAC retained");
++      return;
+     }
+   }
+   radioI2sOutputReady = true;
++  DIAG_PRINTLN("[I2S] verified; digital output ready");
+ }
+ 
+ // Keep INTB as the fast path for real events and retain short, bounded safety
+@@ -1043,8 +1062,9 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
+   chip.setCtsPollIntervalUs(1000);
+   chip.setIdleStatusPollIntervalUs(20000);
+ 
+-  // Every application boot (DAB/FM/recovery): master -> fixed rate -> pins.
+-  configureI2sAudio();
++  // Cold DAB/FM boot: master -> format -> rate -> readback -> pins.
++  // Reused image: readback only; never rewrite format after a possible tune.
++  configureI2sAudio(reuseRunningImage);
+   const uint16_t pinConfig = audioPinConfig(intbOutputEnabled);
+   si468x::Result pinConfigResult = chip.setProperty(
+       si468x::Property::PIN_CONFIG_ENABLE, pinConfig);
+@@ -1229,7 +1249,6 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
+ 
+   DIAG_PRINTLN("[RADIO] shared properties begin");
+   // Shared audio/front-end setup retained from the proven DAB configuration.
+-  Set_Property(0x0202, 0x1600);
+   Set_Property(0x1710, 0xFC4A);
+   Set_Property(0x1711, 0x00F8);
+   DIAG_PRINTLN("[RADIO] shared properties done");
+diff --git a/tests/README.md b/tests/README.md
+index 46e67fd..079f8bf 100644
+--- a/tests/README.md
++++ b/tests/README.md
+@@ -1,5 +1,14 @@
+ # Host regression tests
+ 
++The 2026-10-22 I2S framing/readback and packet-mode DSRV CID corrections
++are documented in [the I2S/SPI repair report](I2S_SPI_20261022_report.md).
++Run the I2S commands below and `test_dab_spi_probe.cpp` from the C++11 suite.
++The I2S harness now injects every write/read failure and mismatch, tests
++read-only running-image reuse, and retains analog/INTB pins on failure.
++The probe fixture covers the Polish MUX 11A short CID through the unchanged
++DSRV parser, source/TMID/SID bounds, exact command ownership and late-data quarantine.
++The report supersedes older short-packet-CID rejection and 0x1600 format descriptions.
++
+ Current XPAD readback and bounded raw UATYPE diagnostics are documented in
+ [the XPAD/UATYPE report](DAB_XPAD_UATYPE_diagnostics_report.md).
+ 
+diff --git a/tests/test_i2s_audio.cpp b/tests/test_i2s_audio.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test_i2s_audio.cpp
+@@ -0,0 +1,77 @@
++#include "../src/i2s_audio.h"
++#include "../src/nvs_storage.h"
++#include <cassert>
++#include <iostream>
++
++namespace nvs_mock {
++std::map<std::string, std::vector<uint8_t> > records;
++std::vector<std::string> writes;
++bool failWrites = false;
++}
++
++int main() {
++  static_assert(I2S_AUDIO_FORMAT_STANDARD == 0x1870U, "24-bit I2S / 32-bit slots");
++  static_assert(sizeof(I2sAudioMode) == 1, "compact mode");
++  static_assert(I2S_AUDIO_OFF == 0 && I2S_AUDIO_32K == 1 &&
++                I2S_AUDIO_44K1 == 2 && I2S_AUDIO_48K == 3 &&
++                I2S_AUDIO_MODE_COUNT == 4, "four contiguous modes without migration");
++  const uint16_t rates[] = {0, 32000, 44100, 48000};
++  const char* labels[] = {"OFF", "32 kHz", "44.1 kHz", "48 kHz"};
++  for (unsigned i = 0; i < 256; ++i) {
++    const I2sAudioMode mode = sanitizeI2sAudioMode(i);
++    assert(mode == (i < 4 ? i : 3));
++    assert(i2sAudioSampleRate(mode) == rates[mode]);
++    assert(std::strcmp(i2sAudioModeText(mode), labels[mode]) == 0);
++    for (bool intb : {false, true}) {
++      const uint16_t pins = i2sAudioPinConfig(mode, intb);
++      assert((pins & 1) == 1);
++      assert((pins & 2) == (mode == I2S_AUDIO_OFF ? 0 : 2));
++      assert((pins & 0x8000) == (intb ? 0x8000 : 0));
++      assert((pins & ~0x8003) == 0);
++    }
++    assert(cycleI2sAudioMode(cycleI2sAudioMode(mode, true), false) == mode);
++    assert(cycleI2sAudioMode(mode, true) == (mode + 1) % 4);
++    assert(cycleI2sAudioMode(mode, false) == (mode + 3) % 4);
++  }
++  using namespace nvs_mock;
++  // Seed a complete legacy installation, including unrelated scan records.
++  records["settings"] = std::vector<uint8_t>(EE_PRESETS_FREQ_START - 1, 0x42);
++  records["dab_presets"] = std::vector<uint8_t>(EE_PRESETS_CNT * 22, 0x23);
++  records["fm_presets"] = std::vector<uint8_t>(EE_PRESETS_CNT * (4 + EE_FM_PRESET_NAME_LENGTH), 0x31);
++  records["ir_profile"] = std::vector<uint8_t>(EE_IR_CONFIG_SIZE, 0x17);
++  records["dab_scan"] = {7, 8, 9};
++  records["fm_scan"] = {1, 2, 3};
++  const auto legacy = records;
++  NvsStorage oldInstallation;
++  assert(oldInstallation.begin());
++  assert(oldInstallation.getI2sAudioMode() == I2S_AUDIO_48K);
++  assert(records == legacy && writes.empty());
++  for (unsigned mode = 0; mode < I2S_AUDIO_MODE_COUNT; ++mode) {
++    oldInstallation.setI2sAudioMode(mode);
++    assert(oldInstallation.commit());
++    assert(writes.back() == "i2s_audio");
++    for (const auto& record : legacy) assert(records[record.first] == record.second);
++    NvsStorage reboot;
++    assert(reboot.begin());
++    assert(reboot.getI2sAudioMode() == mode);
++  }
++  // Invalid persisted values are repaired independently of the old image.
++  records["i2s_audio"] = {255};
++  NvsStorage corrupted;
++  assert(corrupted.begin());
++  assert(corrupted.getI2sAudioMode() == I2S_AUDIO_48K);
++  assert(records["i2s_audio"][0] == I2S_AUDIO_48K);
++  corrupted.setI2sAudioMode(I2S_AUDIO_OFF);
++  failWrites = true;
++  assert(!corrupted.commit());
++  assert(records["i2s_audio"][0] == I2S_AUDIO_48K);
++  failWrites = false;
++  assert(corrupted.commit()); // dirty flag survives a write failure
++  assert(records["i2s_audio"][0] == I2S_AUDIO_OFF);
++  corrupted.setI2sAudioMode(I2S_AUDIO_48K); // factory-default operation
++  assert(corrupted.commit());
++  for (const auto& record : legacy) assert(records[record.first] == record.second);
++  writes.clear();
++  assert(corrupted.commit() && writes.empty());
++  std::cout << "I2S mapping, pins, cycling, menu indices and production NVS: PASS\n";
++}
+diff --git a/tests/test_i2s_integration.py b/tests/test_i2s_integration.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_i2s_integration.py
+@@ -0,0 +1,196 @@
++"""Compile actual radio configuration against a fault-injecting transport.
++
++Usage: python tests/test_i2s_integration.py [path-to-g++]
++No ESP32 hardware is accessed. Generated files live under ignored .pio/.
++"""
++from pathlib import Path
++import subprocess
++import sys
++import re
++import struct
++
++ROOT = Path(__file__).resolve().parents[1]
++source = (ROOT / "src/si4684.cpp").read_text(encoding="utf-8")
++start = source.index("static I2sAudioMode radioI2sAudioMode")
++end = source.index("// Keep INTB", start)
++actual = source[start:end]
++# Compile the enum from its GUI owner without importing TFT/Arduino on the host.
++gui_header = (ROOT / "src/gui.h").read_text(encoding="utf-8")
++menu_enum = re.search(r"enum SettingsMenuItem : uint8_t \{.*?\};", gui_header, re.S).group(0)
++menu_assertions = """
++static_assert(MENU_LANGUAGE == 0 && MENU_BRIGHTNESS == 1 && MENU_THEME == 2 &&
++              MENU_AUTO_SLIDESHOW == 3 && MENU_SIGNAL_UNIT == 4 &&
++              MENU_SLEEP_TIMER == 5 && MENU_RADIO_MODE == 6 && MENU_FM_REGION == 7 &&
++              MENU_GPIO12 == 8 && MENU_I2S_AUDIO == 9 && MENU_IR_REMOTE == 10 &&
++              MENU_FM_SEEK == 11 && MENU_FM_AF == 12 && MENU_ABOUT == 13 &&
++              MENU_ITEM_COUNT == 14, "existing menu order");
++"""
++prefix = r'''
++#include "i2s_audio.h"
++#include <cassert>
++#include <vector>
++#include <utility>
++#include <string>
++#include <cstdio>
++#include <cstdarg>
++static std::string logText;
++static void logLine(const char* format, ...) {
++  char buffer[512];
++  va_list args; va_start(args, format);
++  vsnprintf(buffer, sizeof(buffer), format, args);
++  va_end(args); logText += buffer;
++}
++#define DIAG_PRINTF(...) logLine(__VA_ARGS__)
++#define DIAG_PRINTLN(text) logLine("%s\n", text)
++namespace si468x {
++enum class Property : uint16_t {
++  DIGITAL_IO_OUTPUT_SELECT = 0x0200,
++  DIGITAL_IO_OUTPUT_SAMPLE_RATE = 0x0201,
++  DIGITAL_IO_OUTPUT_FORMAT = 0x0202
++};
++enum class Result { Ok, Error };
++}
++struct Chip {
++  std::vector<std::pair<uint16_t, uint16_t> > writes;
++  std::vector<uint16_t> reads;
++  uint16_t values[3] = {};
++  int failAt = -1, readFailAt = -1, mismatchAt = -1;
++  si468x::Result setProperty(si468x::Property p, uint16_t value) {
++    const uint16_t id = static_cast<uint16_t>(p);
++    writes.push_back({id, value});
++    if (static_cast<int>(writes.size()) == failAt) return si468x::Result::Error;
++    values[id - 0x0200] = value;
++    return si468x::Result::Ok;
++  }
++  si468x::Result getProperty(si468x::Property p, uint16_t& value, uint32_t timeout) {
++    assert(timeout == 250000UL);
++    const uint16_t id = static_cast<uint16_t>(p);
++    reads.push_back(id);
++    value = values[id - 0x0200];
++    if (static_cast<int>(reads.size()) == mismatchAt) value ^= 0x10;
++    // Deliberately leave the expected value even on failure: Result is mandatory.
++    return static_cast<int>(reads.size()) == readFailAt ? si468x::Result::Error : si468x::Result::Ok;
++  }
++} chip;
++class DAB { public: void setI2sAudioMode(I2sAudioMode); };
++'''
++suffix = r'''
++int main() {
++  DAB radio;
++  const uint16_t ids[] = {0x0200, 0x0202, 0x0201};
++  for (unsigned cycle = 0; cycle < 3; ++cycle) {
++    for (unsigned value = 0; value < I2S_AUDIO_MODE_COUNT; ++value) {
++      const I2sAudioMode mode = sanitizeI2sAudioMode(value);
++      radio.setI2sAudioMode(mode);
++      const uint16_t expected[] = {0x8000, 0x1870, i2sAudioSampleRate(mode)};
++      for (bool reuse : {false, true}) {
++        for (unsigned fault = 0; fault < 10; ++fault) {
++          chip = Chip{}; logText.clear();
++          chip.failAt = fault >= 1 && fault <= 3 ? fault : -1;
++          chip.readFailAt = fault >= 4 && fault <= 6 ? fault - 3 : -1;
++          chip.mismatchAt = fault >= 7 ? fault - 6 : -1;
++          if (reuse) { // An already tuned image: only verify, no writes allowed.
++            chip.values[0] = 0x8000;
++            chip.values[1] = i2sAudioSampleRate(mode);
++            chip.values[2] = 0x1870;
++          }
++          radioI2sOutputReady = true; // stale success must not survive any failure
++          configureI2sAudio(reuse);
++          const bool writeFailed = !reuse && chip.failAt != -1;
++          const bool enabled = mode != I2S_AUDIO_OFF && !writeFailed &&
++                               chip.readFailAt == -1 && chip.mismatchAt == -1;
++          assert(radioI2sOutputReady == enabled);
++          if (mode == I2S_AUDIO_OFF) {
++            assert(chip.writes.empty() && chip.reads.empty());
++          } else {
++            const unsigned written = reuse ? 0U : writeFailed ? chip.failAt : 3U;
++            assert(chip.writes.size() == written);
++            for (unsigned i = 0; i < written; ++i) {
++              assert(chip.writes[i].first == ids[i]);
++              assert(chip.writes[i].second == expected[i]);
++            }
++            const unsigned read = writeFailed ? 0U : chip.readFailAt != -1 ?
++                chip.readFailAt : chip.mismatchAt != -1 ? chip.mismatchAt : 3U;
++            assert(chip.reads.size() == read);
++            for (unsigned i = 0; i < read; ++i) assert(chip.reads[i] == ids[i]);
++            assert(logText.find(enabled ? "digital output ready" : "analog DAC retained") != std::string::npos);
++            if (read >= 2) assert(logText.find("expected=0x1870") != std::string::npos);
++          }
++          assert(audioPinConfig(false) == (enabled ? 0x0003 : 0x0001));
++          assert(audioPinConfig(true) == (enabled ? 0x8003 : 0x8001));
++          assert(radioI2sAudioMode == mode);
++        }
++      }
++    }
++  }
++  // ESP32-only restart over an older receiver configuration: do not repair
++  // a potentially tuned chip in place, and do not claim readiness.
++  radio.setI2sAudioMode(I2S_AUDIO_44K1);
++  for (uint16_t oldFormat : {uint16_t(0x1600), uint16_t(0x1800), uint16_t(0x1870)}) {
++    chip = Chip{};
++    chip.values[0] = 0x8000; chip.values[1] = 48000; chip.values[2] = oldFormat;
++    configureI2sAudio(true);
++    assert(chip.writes.empty() && !radioI2sOutputReady);
++    assert(audioPinConfig(true) == 0x8001);
++  }
++  radio.setI2sAudioMode(static_cast<I2sAudioMode>(255));
++  assert(radioI2sAudioMode == I2S_AUDIO_48K);
++}
++'''
++output = ROOT / ".pio/tests_i2s"
++output.mkdir(parents=True, exist_ok=True)
++cpp = output / "radio_configuration.cpp"
++cpp.write_text(prefix + menu_enum + menu_assertions + actual + suffix, encoding="utf-8")
++exe = output / "radio_configuration.exe"
++compiler = sys.argv[1] if len(sys.argv) > 1 else "g++"
++subprocess.run([compiler, "-std=c++11", "-Wall", "-Wextra", "-Werror", "-pedantic",
++                "-I", str(ROOT / "src"), str(cpp), "-o", str(exe)], check=True)
++subprocess.run([str(exe)], check=True)
++
++# Wiring checks complement the behavior test; the full target build checks types.
++boot = source[source.index("bool DAB::begin("):source.index('DIAG_PRINTLN("[RADIO] shared properties done")')]
++assert boot.count("configureI2sAudio(reuseRunningImage);") == 1
++assert boot.index("configureI2sAudio(reuseRunningImage);") < boot.index("si468x::Property::PIN_CONFIG_ENABLE")
++assert "Set_Property(0x0202" not in source
++assert source.count("si468x::Property::DIGITAL_IO_OUTPUT_FORMAT") == 1
++assert 'Set_Property(0x1710, 0xFC4A);' in boot
++assert 'Set_Property(0x1711, 0x00F8);' in boot
++assert "audioPinConfig(intbOutputEnabled)" in boot
++assert "audioPinConfig(false)" in boot  # failed AUTO probe
++fallback = source[source.index("static void useRuntimePollingFallback"):]
++assert "audioPinConfig(false)" in fallback
++gui = (ROOT / "src/gui.cpp").read_text(encoding="utf-8")
++assert gui.count("case MENU_I2S_AUDIO:") == 4
++assert gui.count("menuitem == MENU_IR_REMOTE") == 4
++assert gui.count("menuitem == MENU_ABOUT) return;") == 2
++for name in ("MenuUp", "MenuDown"):
++    start = gui.index("void " + name + "(void)")
++    end = gui.index("\nvoid ", start + 1)
++    body = gui[start:end]
++    assert "cycleI2sAudioMode(requestedI2sAudioMode," in body
++    assert "setI2sAudioMode" not in body and "SwitchRadioMode" not in body
++ino = (ROOT / "SI4684-DAB-Receiver.ino").read_text(encoding="utf-8")
++assert "Storage.setI2sAudioMode(I2S_AUDIO_48K);" in ino
++assert "SwitchRadioMode(requestedRadioMode, i2sChanged)" in ino
++assert "trysetserviceComponentValid = restoreLiveDab;" in ino
++assert "else Storage.get(EE_UINT32_SERVICEID, _serviceID);" in ino
++exit_body = ino[ino.index("void ExitSettingsMenu(void) {"):ino.index("void CycleTuneMode(void) {")]
++assert exit_body.index("i2sChanged && !FlushEeprom()") < exit_body.index("radio.setI2sAudioMode")
++assert exit_body.index("radio.setI2sAudioMode") < exit_body.index("SwitchRadioMode")
++print("I2S production configuration: all rates, OFF, cold/reuse init, all write/read failures and mismatches: PASS")
++print("I2S boot/fallback/menu/apply/factory-default wiring: PASS")
++
++# The existing binary fonts must contain the superscript and every rate glyph.
++fonts = (ROOT / "src/font.h").read_text(encoding="utf-8")
++for name in ("FONT16", "FONT28"):
++    array = fonts.split("const uint8_t " + name + "[] PROGMEM = {", 1)[1].split("};", 1)[0]
++    data = bytes(int(value, 16) for value in re.findall(r"0x([0-9A-Fa-f]{2})", array))
++    count = struct.unpack_from(">I", data)[0]
++    glyphs = {struct.unpack_from(">7i", data, 24 + i * 28)[0]:
++              struct.unpack_from(">7i", data, 24 + i * 28) for i in range(count)}
++    for char in "I\u00b2S AudioOFF324.18kHz":
++        assert char == " " or ord(char) in glyphs, (name, char)
++    for label in ("OFF", "32 kHz", "44.1 kHz", "48 kHz"):
++        width = sum(glyphs[ord(char)][3] if char != " " else 10 for char in label)
++        assert width < 270, (name, label, width)
++print("I2S existing font glyphs and popup value widths: PASS")
+diff --git a/tests/test_dab_spi_probe.cpp b/tests/test_dab_spi_probe.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test_dab_spi_probe.cpp
+@@ -0,0 +1,292 @@
++#include <assert.h>
++#include <stdio.h>
++#include "../src/dab_spi_probe.h"
++#include "../src/vendor/si468x/Si468x.h"
++
++using dab_probe::Endpoint;
++using dab_probe::Probe;
++using dab_probe::Route;
++using dab_probe::State;
++
++static const Endpoint audio(10, 1);
++static const Endpoint sls(20, 2);
++static const Endpoint spi(30, 3);
++
++static void testRouter() {
++  for (uint8_t source = 0; source < 2; ++source) {
++    assert(dab_probe::route(20, 2, source, audio, sls, spi) == Route::Sls);
++    assert(dab_probe::route(30, 3, source, audio, sls, spi) == Route::Spi);
++  }
++  assert(dab_probe::route(10, 1, 1, audio, sls, spi) == Route::Audio);
++  assert(dab_probe::route(10, 1, 2, audio, sls, spi) == Route::Audio);
++  assert(dab_probe::route(20, 2, 2, audio, sls, spi) == Route::Ignored);
++  assert(dab_probe::route(30, 3, 2, audio, sls, spi) == Route::Ignored);
++  assert(dab_probe::route(10, 2, 1, audio, sls, spi) == Route::Ignored);
++  assert(dab_probe::route(20, 1, 1, audio, sls, spi) == Route::Ignored);
++  assert(dab_probe::route(40, 4, 1, audio, sls, spi) == Route::Ignored);
++  assert(dab_probe::route(10, 1, 3, audio, sls, spi) == Route::Ignored);
++  assert(dab_probe::route(10, 1, 255, audio, sls, spi) == Route::Ignored);
++  assert(dab_probe::route(10, 1, 1, Endpoint{}, sls, spi) == Route::Ignored);
++  assert(dab_probe::route(20, 2, 1, audio, Endpoint{}, spi) == Route::Ignored);
++  // New audio context rejects old audio/PAD packets; Transport ID never enters
++  // the router, so equal TIDs on unrelated SID/CID cannot alias an application.
++  assert(dab_probe::route(10, 1, 1, Endpoint(11, 1), sls, spi) == Route::Ignored);
++}
++
++static void testLegacyReceptionGate() {
++  const Route targets[] = {Route::Ignored, Route::Audio, Route::Sls, Route::Spi};
++  for (Route target : targets) {
++    // Station teardown must still suppress all payloads, with or without SPI.
++    assert(!dab_probe::feedLegacyDecoder(target, false, false));
++    assert(!dab_probe::feedLegacyDecoder(target, true, false));
++    assert(dab_probe::feedLegacyDecoder(target, false, true) == (target != Route::Spi));
++    assert(dab_probe::feedLegacyDecoder(target, true, true) ==
++           (target == Route::Audio || target == Route::Sls));
++  }
++  const Endpoint noSpi;
++  // Reproduce the regression: a DSRV identity differs from the service-list
++  // identity, while confirmed audio is running and no SPI was ever started.
++  const Route mismatch = dab_probe::route(10, 0x10001, 2, audio, sls, noSpi);
++  assert(mismatch == Route::Ignored);
++  assert(dab_probe::feedLegacyDecoder(mismatch, noSpi.valid, true));
++  const Route padMismatch = dab_probe::route(10, 0x10001, 1, audio, sls, noSpi);
++  assert(dab_probe::feedLegacyDecoder(padMismatch, noSpi.valid, true));
++  // A reserved/unknown source follows the old decoder's own checks outside
++  // probing, but is never admitted by strict probe ownership.
++  const Route unknown = dab_probe::route(10, 1, 3, audio, sls, noSpi);
++  assert(dab_probe::feedLegacyDecoder(unknown, false, true));
++  assert(!dab_probe::feedLegacyDecoder(unknown, true, true));
++  // Cleanup failure retains spi.valid: keep quarantine despite running()==false.
++  Probe cleanup;
++  cleanup.spi = spi;
++  cleanup.state = State::CleanupFailed;
++  assert(!cleanup.running());
++  assert(!dab_probe::feedLegacyDecoder(mismatch, cleanup.spi.valid, true));
++  assert(!dab_probe::feedLegacyDecoder(Route::Spi, cleanup.spi.valid, true));
++}
++
++static void testCapturedAudioPadIdentity() {
++  const Endpoint capturedAudio(0x00002FD9U, 0x01FE002AU);
++  const Endpoint data(0x00002FD9U, 0x013CC02AU);
++  const Endpoint programmeInfo(0x00002FD9U, 0x013CC02BU);
++  for (uint8_t source = 1; source <= 2; ++source) {
++    // Exact values captured on hardware for both non-DLS PAD and DLS PAD.
++    const Route target = dab_probe::route(0x2FD9U, 0x2AU, source,
++                                         capturedAudio, data, programmeInfo);
++    assert(target == Route::Audio);
++    assert(dab_probe::feedLegacyDecoder(target, true, true));
++    assert(dab_probe::route(0x2FD9U, 0x01FE002AU, source,
++                            capturedAudio, data, programmeInfo) == Route::Audio);
++    // Matching low bits alone cannot admit another service, component or
++    // nonzero upper half. The full 16-bit field is compared, including TMId.
++    assert(dab_probe::route(0x2FD8U, 0x2AU, source,
++                            capturedAudio, data, programmeInfo) == Route::Ignored);
++    assert(dab_probe::route(0x2FD9U, 0x2BU, source,
++                            capturedAudio, data, programmeInfo) == Route::Ignored);
++    assert(dab_probe::route(0x2FD9U, 0x02FE002AU, source,
++                            capturedAudio, data, programmeInfo) == Route::Ignored);
++    assert(dab_probe::route(0x2FD9U, 0xC02AU, source,
++                            capturedAudio, data, programmeInfo) == Route::Ignored);
++    assert(dab_probe::route(0x2FD9U, 0x2AU, source,
++                            Endpoint{}, data, programmeInfo) == Route::Ignored);
++    assert(dab_probe::route(0x2FD9U, 0x2AU, source,
++                            Endpoint(0x2FD9U, 0x013CC02AU), data,
++                            programmeInfo) == Route::Ignored);
++  }
++  // Audio fallback stays PAD/DLS-only; packet data uses its own TMID=3 match.
++  assert(dab_probe::route(0x2FD9U, 0x2AU, 0,
++                          capturedAudio, data, programmeInfo) == Route::Ignored);
++  assert(dab_probe::route(0x2FD9U, 0x2AU, 3,
++                          capturedAudio, data, programmeInfo) == Route::Ignored);
++  assert(dab_probe::route(0x2FD9U, 0xC02AU, 0,
++                          capturedAudio, data, programmeInfo) == Route::Sls);
++  assert(dab_probe::route(0x2FD9U, 0xC02BU, 0,
++                          capturedAudio, data, programmeInfo) == Route::Spi);
++  assert(dab_probe::route(0x2FD9U, 0x013CC02AU, 0,
++                          capturedAudio, data, programmeInfo) == Route::Sls);
++  assert(dab_probe::route(0x2FD9U, 0x013CC02BU, 0,
++                          capturedAudio, data, programmeInfo) == Route::Spi);
++  // Wire-command ownership retains the original complete service-list CID.
++  assert(capturedAudio.cid == 0x01FE002AU);
++  assert(capturedAudio.matches(0x2FD9U, 0x01FE002AU));
++  assert(!capturedAudio.matches(0x2FD9U, 0x2AU));
++}
++
++static void testCapturedPacketIdentity() {
++  const uint32_t sid = 0xE231B3FEU, full = 0x01F2C00BU, shortCid = 0xC00BU;
++  const Endpoint packet(sid, full);
++  // The unchanged production parser must retain the incoming short CID;
++  // normalization belongs only to routing, never to the wire parser.
++  uint8_t reply[24] = {};
++  reply[0] = 0x80; reply[4] = 1; reply[6] = 3; reply[7] = 60;
++  si468x::writeLe32(reply + 8, sid);
++  si468x::writeLe32(reply + 12, shortCid);
++  si468x::writeLe16(reply + 18, 512);
++  si468x::DsrvHeader header;
++  assert(si468x::Si468x::parseDsrvHeader(reply, sizeof(reply), header) == si468x::Result::Ok);
++  assert(header.serviceId == sid && header.componentId == shortCid && header.byteCount == 512);
++  assert(dab_probe::route(header.serviceId, header.componentId, header.dataSource,
++                          audio, sls, packet) == Route::Spi);
++  assert(packet.matches(sid, full) && !packet.matches(sid, shortCid));
++  for (unsigned source = 0; source < 256; ++source) {
++    const Route abbreviated = dab_probe::route(sid, shortCid, source, audio, sls, packet);
++    assert(abbreviated == (source == 0 ? Route::Spi : Route::Ignored));
++    // Preserve existing exact-CID semantics: source 0/1 allowed, DLS/reserved rejected.
++    assert(dab_probe::route(sid, full, source, audio, sls, packet) ==
++           (source < 2 ? Route::Spi : Route::Ignored));
++  }
++  assert(dab_probe::route(sid + 1, shortCid, 0, audio, sls, packet) == Route::Ignored);
++  assert(dab_probe::route(sid, shortCid + 1, 0, audio, sls, packet) == Route::Ignored);
++  assert(dab_probe::route(sid, 0x02F2C00BU, 0, audio, sls, packet) == Route::Ignored);
++  assert(dab_probe::route(sid, shortCid, 0, audio, sls, Endpoint(sid, full, false)) == Route::Ignored);
++  for (uint32_t tmid = 0; tmid < 3; ++tmid) {
++    const uint32_t cid = 0x0100000BU | (tmid << 14);
++    assert(!dab_probe::matchesPacketData(Endpoint(sid, cid), sid, cid & 0xFFFFU));
++    assert(dab_probe::route(sid, cid & 0xFFFFU, 0, audio, sls, Endpoint(sid, cid)) == Route::Ignored);
++  }
++  assert(dab_probe::route(sid, shortCid, 0, audio, packet, Endpoint{}) == Route::Sls);
++  // SPI keeps priority over overlapping audio/SLS contexts.
++  assert(dab_probe::route(sid, shortCid, 0, Endpoint(sid, shortCid), packet, packet) == Route::Spi);
++  // Same SID as packet SPI does not steal audio PAD or DLS.
++  const Endpoint sharedAudio(sid, 0x01FE000BU);
++  for (uint8_t source = 1; source <= 2; ++source)
++    assert(dab_probe::route(sid, 0xBU, source, sharedAudio, sls, packet) == Route::Audio);
++
++  Probe probe;
++  assert(probe.request(audio, sls, packet, 9, 0));
++  assert(probe.spi.matches(sid, full) && !probe.spi.matches(sid, shortCid));
++  probe.advance(5000, true);
++  probe.state = State::Starting;
++  probe.started(5001, true, false);
++  const Route target = dab_probe::route(sid, shortCid, 0, audio, sls, probe.spi);
++  probe.observe(target, 0, false);
++  assert(probe.after.spi == 1 && probe.after.ignored == 0);
++  assert(!dab_probe::feedLegacyDecoder(target, probe.spi.valid, true));
++  probe.advance(6000, false); // switch cancels observation, retaining full STOP ownership
++  assert(probe.state == State::StopRequested && probe.spi.matches(sid, full));
++  for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
++    probe.state = State::Stopping;
++    probe.stopAttempts = attempt;
++    probe.stopped(6001, false);
++  }
++  assert(probe.state == State::CleanupFailed && probe.spi.matches(sid, full));
++  const Route late = dab_probe::route(sid, shortCid, 0, Endpoint(11, 1), sls, probe.spi);
++  assert(late == Route::Spi && !dab_probe::feedLegacyDecoder(late, probe.spi.valid, true));
++  // After cleanup/tune, old packet identity has no matching current endpoint.
++  probe.stopped(7000, true);
++  assert(dab_probe::route(sid, shortCid, 0, audio, sls, probe.spi) == Route::Ignored);
++  assert(dab_probe::route(sid, shortCid, 0, audio, sls, Endpoint(sid + 1, full)) == Route::Ignored);
++}
++
++static Probe observing(uint32_t now = 100) {
++  Probe probe;
++  assert(probe.request(audio, sls, spi, 9, now));
++  probe.observe(Route::Sls, 1, false);
++  probe.observe(Route::Audio, 1, false);
++  probe.advance(now + 4999, true);
++  assert(probe.state == State::Baseline);
++  probe.advance(now + 5000, true);
++  assert(probe.state == State::StartRequested);
++  probe.state = State::Starting;
++  probe.started(now + 5001, true, false);
++  assert(probe.state == State::Observing);
++  return probe;
++}
++
++static void testWindowAndEvidence() {
++  Probe probe = observing();
++  probe.observe(Route::Spi, 0, false);
++  probe.observe(Route::Sls, 1, false);
++  probe.observe(Route::Audio, 2, false);
++  probe.observe(Route::Audio, 1, false);
++  probe.observe(Route::Ignored, 1, false);
++  assert(probe.before.sls == 1 && probe.before.pad == 1 && probe.before.spi == 0);
++  assert(probe.after.spi == 1 && probe.after.sls == 1 && probe.after.audio == 2);
++  assert(probe.after.pad == 1 && probe.after.ignored == 1);
++  probe.observe(Route::Sls, 0, true, false);  // zero-byte STOP notification
++  assert(probe.after.slsStopped && probe.after.sls == 1);
++  probe.advance(35100, true);
++  assert(probe.state == State::Observing);
++  probe.advance(35101, true);
++  assert(probe.state == State::StopRequested);
++  probe.state = State::Stopping;
++  probe.stopAttempts = 1;
++  probe.stopped(35102, true);
++  assert(probe.state == State::Idle && !probe.spi.valid);
++  assert(probe.after.spi == 1);  // retained final evidence
++}
++
++static void testRefusalAndCancellation() {
++  Probe probe;
++  assert(!probe.request(Endpoint{}, sls, spi, 9, 0));
++  assert(!probe.request(audio, sls, Endpoint{}, 9, 0));
++  assert(!probe.request(audio, sls, audio, 9, 0));
++  assert(!probe.request(audio, sls, sls, 9, 0));
++  assert(probe.request(audio, sls, spi, 9, 0));
++  assert(!probe.request(audio, sls, spi, 9, 0));
++  probe.advance(20, false);
++  assert(probe.state == State::Idle && !probe.spi.valid);
++
++  assert(probe.request(audio, sls, spi, 9, 0));
++  probe.advance(5000, true);
++  probe.stop(5000);
++  assert(probe.state == State::Idle);  // no START was submitted
++
++  assert(probe.request(audio, sls, spi, 9, 0));
++  probe.state = State::Starting;
++  probe.stop(5);  // station switch while START waits for CTS
++  probe.started(10, true, false);
++  assert(probe.state == State::StopRequested && probe.spi.valid);
++
++  probe = observing();
++  probe.advance(6000, false);
++  assert(probe.state == State::StopRequested && probe.spi.valid);
++}
++
++static void testFailuresAndWraparound() {
++  Probe probe = observing();
++  probe.stop(0xFFFFFFF0U);
++  assert(dab_probe::due(0xFFFFFFF0U, probe.nextActionMs));
++  for (uint8_t attempt = 1; attempt <= 3; ++attempt) {
++    probe.state = State::Stopping;
++    probe.stopAttempts = attempt;
++    probe.stopped(0xFFFFFFF0U, false);
++    if (attempt < 3) {
++      assert(probe.state == State::StopRequested);
++      assert(!dab_probe::due(0xFFFFFFF0U, probe.nextActionMs));
++      probe.advance(0, false);  // cancellation must not defeat STOP backoff
++      assert(!dab_probe::due(0, probe.nextActionMs));
++      assert(dab_probe::due(484, probe.nextActionMs));
++    }
++  }
++  assert(probe.state == State::CleanupFailed && probe.spi.valid);
++  assert(!probe.running() && !probe.request(audio, sls, spi, 9, 0));
++
++  probe = Probe{};
++  assert(probe.request(audio, sls, spi, 9, 0));
++  probe.state = State::Starting;
++  probe.started(1, false, true);  // unanswered START may have reached hardware
++  assert(probe.state == State::StopRequested && probe.spi.valid);
++  probe.started(1, false, false);  // explicit device rejection
++  assert(probe.state == State::Idle && !probe.spi.valid);
++
++  probe = observing(0xFFFFFF00U);
++  probe.advance(34744U, true);
++  assert(probe.state == State::Observing);
++  probe.advance(34745U, true);
++  assert(probe.state == State::StopRequested);
++  uint32_t counter = UINT32_MAX;
++  dab_probe::increment(counter);
++  assert(counter == UINT32_MAX);
++}
++
++int main() {
++  testRouter();
++  testLegacyReceptionGate();
++  testCapturedAudioPadIdentity();
++  testCapturedPacketIdentity();
++  testWindowAndEvidence();
++  testRefusalAndCancellation();
++  testFailuresAndWraparound();
++  puts("DAB SPI probe/router tests passed");
++}
+diff --git a/tests/I2S_SPI_20261022_report.md b/tests/I2S_SPI_20261022_report.md
+new file mode 100644
+--- /dev/null
++++ b/tests/I2S_SPI_20261022_report.md
+@@ -0,0 +1,158 @@
++# I2S framing and packet-mode DSRV CID repair — 2026-10-22
++
++Implemented locally after user approval from
++`Specification/Codex_zadani_SI4684_I2S_SPI_2026-10-22.md`.
++Starting HEAD: `1fa47b36499d79b6e90778b6cbaedda8ca57d0b7` (matches specification).
++No commit, GitHub operation, upload or receiver measurement was performed.
++The pre-existing `_usertesting/` inputs were read without modification.
++
++## Changes and rationale
++
++- `src/i2s_audio.h`: single named format constant `I2S_AUDIO_FORMAT_STANDARD=0x1870`.
++- `src/si4684.cpp`: fresh DAB/FM boot writes typed SELECT=0x8000, FORMAT=0x1870,
++  SAMPLE_RATE=32000/44100/48000 in that order before enabling digital pins and
++  before tuning. Reads all three properties back with bounded 250 ms timeouts;
++  readiness requires both successful Result and exact expected value for each.
++  The later FORMAT=0x1600 write is removed entirely; 0x1710/0x1711 are retained.
++- `src/dab_spi_probe.h`: same-SID, zero-extended 16-bit CID fallback for TMID=3
++  endpoints only, and only for source=0, at SPI/SLS routing. Exact 32-bit
++  Endpoint::matches, command IDs, probe state machine and audio PAD matching
++  are unchanged. Exact full-CID SPI/SLS matching still permits source=0/1;
++  source=2/reserved is rejected. SPI retains priority over audio, then SLS.
++- `tests/test_i2s_audio.cpp`: compile-time format assertion; retains real NVS,
++  all mode mappings, defaults, pin masks and menu tests.
++- `tests/test_i2s_integration.py`: compiles actual production configuration
++  against a fault-injecting mock. Tests OFF and every active rate, repeat init,
++  cold/reused images, all three write failures, all three read failures with
++  expected output values, all three mismatches and stale readiness. Checks
++  analog/INTB preservation, diagnostics and existing boot/menu wiring.
++- `tests/test_dab_spi_probe.cpp`: captured MUX 11A SID/CID, unchanged vendor
++  DSRV parser into route, every source byte, wrong SID/CID/high bits/TMID,
++  invalid endpoints, separate packet SLS, shared-SID audio PAD/DLS, routing
++  priority, full START/STOP ownership, cancellation/late data/CleanupFailed.
++  Existing cleanup retry/window/wrap tests remain.
++- `tests/README.md`: links current report and test coverage in existing workflow.
++- This report and `I2S_SPI_20261022.patch`: handover and exact review diff.
++
++## Running-image reuse / failure behavior
++
++AN649's pre-first-tune restriction is also documented at the vendored typed
++DIGITAL_IO_OUTPUT_FORMAT declaration. An ESP32-only restart cannot establish
++whether an already running receiver has tuned. Therefore reused DAB/FM images
++receive no I2S SELECT/FORMAT/RATE writes. All three are read and compared with
++current selection instead. Existing boot/reset/TFT logic is retained.
++
++If any write/read fails, or any readback differs, readiness remains false.
++The existing subsequent PIN_CONFIG write applies 0x0001 (analog/polling) or
++0x8001 (analog/INTB); digital bit 1 is disabled. If this pin write itself fails,
++existing begin() fails rather than reporting success. OFF skips all digital
++property access and uses the same analog/INTB masks.
++
++A reused old 0x1600/0x1800 format or a mismatching sample rate deliberately
++continues with analog only. A full receiver power cycle or the existing
++reset/reload path is needed to apply the requested digital configuration.
++A matching reused image is accepted without risky post-tune format writes.
++Cold DAB/FM mode changes and I2S menu changes use the existing reset/reload path;
++menu/NVS/defaults, analog volume, IRQ selection and runtime scheduler are untouched.
++No I2S readback is added to Update() or an active reception loop.
++
++## Validation results
++
++All commands ran from repository root; host compiler was
++`C:/msys64/ucrt64/bin/g++.exe`, flags `-std=c++11 -Wall -Wextra -Werror -pedantic`.
++
++PASS: compile and execute each of:
++`scheduler`, `fm_features`, `dab_service_switch`, `dab_user_application`,
++`dab_spi_discovery`, `dab_spi_probe`, `dab_packet_inventory`, `dab_dsrv_header`,
++`dab_diagnostics`, `i2s_audio`.
++Commands (replace NAME with each listed suffix):
++
++```powershell
++g++ -std=c++11 -Wall -Wextra -Werror -pedantic tests/test_NAME.cpp -o .pio/test_NAME.exe
++./.pio/test_NAME.exe
++# i2s_audio additionally needs -I tests/stubs/nvs and src/nvs_storage.cpp.
++python tests/test_i2s_integration.py C:/msys64/ucrt64/bin/g++.exe
++python tests/test_dab_packet_runtime.py C:/msys64/ucrt64/bin/g++.exe
++python tests/test_dab_xpad_integration.py C:/msys64/ucrt64/bin/g++.exe
++pio run -e esp32dev
++```
++
++PASS: all three Python integration suites, including existing production
++inventory/discovery/generation/UART/EPG and XPAD/DSRV diagnostic regressions.
++Updated packet and I2S fixtures were recompiled and rerun after their last edit.
++PASS: firmware esp32dev release build. DEBUG is runtime gated; this same binary
++contains both diagnostic and normal paths. Actual DEBUG-on/off timing is HW unverified.
++The only build warning was the existing TFT_eSPI missing TOUCH_CS warning.
++
++Build size: static RAM **62,272 / 327,680 B**, flash **3,458,437 / 4,128,768 B**.
++No new runtime heap allocation, large buffer, DSRV log, delay or busy loop was added.
++Runtime free DRAM and audio continuity must still be measured on hardware.
++Application file `.pio/build/esp32dev/firmware.bin`: **3,459,056 bytes**,
++flash offset **0x10000** (preserves existing NVS).
++SHA256: `57DCEBA75447B61E30DC14B6F05E57DEC3DAAD5EEF7EF4E8107C787DB7A4CBB6`.
++Do not confuse the application with generated `receiver-complete.bin` at 0x0,
++which replaces NVS settings.
++
++## Expected diagnostic examples (illustrative, not new HW captures)
++
++For each selected active rate, successful verification includes:
++
++```text
++[I2S] readback property=0x0200 result=0 expected=0x8000 actual=0x8000
++[I2S] readback property=0x0202 result=0 expected=0x1870 actual=0x1870
++[I2S] readback property=0x0201 result=0 expected=0xBB80 actual=0xBB80
++[I2S] verified; digital output ready
++```
++
++Rate values: 32 kHz=0x7D00, 44.1 kHz=0xAC44, 48 kHz=0xBB80.
++Expected BCK at 64*Fs: respectively 2.048, 2.8224 and 3.072 MHz; not measured.
++Mismatch, including reused old-format firmware:
++
++```text
++[I2S] readback property=0x0202 result=0 expected=0x1870 actual=0x1600
++[I2S] verification failed; digital pins disabled, analog DAC retained
++```
++
++On GET failure, result is nonzero, actual is initialized to zero (unless the
++transport wrote another value), readiness remains false even if actual=expected,
++and the same analog-only failure line follows. A failed SET prints its property,
++value and result followed by `configuration failed; ...` instead.
++
++On Polish MUX 11A, after explicit `DEBUG SPI` (also enables DEBUG):
++
++```text
++[DAB/SPI/TEST] START result=0 reason=00; no SLS STOP issued
++[DSRV/ROUTE] route=3 src=0 sid=E231B3FE cid=0000C00B dscty=60 bytes=512 ...
++[DAB/SPI/TEST] STOP result=0 reason=00 attempt=1
++```
++
++`route=3` means Route::Spi. During observation, SPI counters should grow without
++feeding legacy SLS/DLS; START/STOP still send full CID 01F2C00B. Baseline remains
++5 seconds, observation 30 seconds, bounded cleanup unchanged. No permanent SPI
++service, payload dump or MOT/EPG decoder is introduced. Presence still requires
++validated UAType=0x007, independent of probe counters or DSCTy alone.
++
++## HW evidence and remaining receiver checks
++
++Provided reference A/B files under `_usertesting/moje-pliki.zip` support Andrzej's
++original observations: old routing ignored 460 events; reference patch routed
++440 SPI events with zero ignored, without disrupting completed SLS/audio as
++reported in the assignment. These counts describe events, not decoded SPI objects.
++The reference `_usertesting/si4684.cpp` also supplied the 0x1870 hardware result;
++its unchecked readiness and second format write were not copied.
++**The new implementation has NOT been tested on physical hardware.**
++
++Verify PCM5102A on OFF/32/44.1/48 kHz, cold DAB/FM, DAB-FM-DAB, menu rate reload,
++ESP32-only restart with matching and mismatching running-image properties, and
++confirm clean audio plus measured BCK/LRCK. Verify analog audio and INTB remain
++available on OFF/failure. Repeat DEBUG off/on, infotext, new JPEG/PNG completion,
++EPG negative/positive indication, same-mux station changes and cross-mux reset.
++Run manual SPI probe on 11A; confirm short-CID SPI counts, full-ID START/STOP,
++new slideshow completion, no added CTS timeouts/overflow/UART drops, and safe
++cleanup when switching station/mux. Runtime free/largest heap remains HW unverified.
++
++The repository already ignores untracked tests under `tests/`. The patch includes
++updated ignored test sources as complete new-file additions relative to HEAD,
++so they are not silently omitted by ordinary git diff. No gitignore/index changes
++were made. Existing local test stubs/dependencies remain prerequisites for the
++full host suite as documented in tests/README.md.
