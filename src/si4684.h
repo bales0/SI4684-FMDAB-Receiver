@@ -30,6 +30,7 @@
 #include "dab_spi_probe.h"
 #include "dab_diagnostics.h"
 #include "i2s_audio.h"
+#include "epg_time.h"
 
 struct DABFrequencyLabel_DAB {
   uint32_t frequency;
@@ -147,6 +148,7 @@ class DAB {
     int16_t getRSSI(void);
     uint32_t signalSampleGeneration(void) const { return rfSampleGeneration; }
     uint32_t timeSampleGeneration(void) const { return dabTimeGeneration; }
+    const epg::BroadcastClockSample& broadcastClock(void) const { return dabEpgClock; }
     uint16_t samplerate;
     uint16_t Year;
     uint32_t getFreq(uint8_t freq);
@@ -233,9 +235,11 @@ class DAB {
     // Advertised SPI presence in this multiplex, not decoded programme data.
     bool spiPresent(void) const { return dabSpiPresent; }
     bool xpadSpiPresent(void) const;
+    void logEpgTransportPage(uint8_t page);
+    dab_spi::Identity xpadSpiIdentity(void) const;
     // Configure the next Si4684 application boot; never reconfigure live audio.
     void setI2sAudioMode(I2sAudioMode mode);
-    bool requestSpiProbe(void);
+    bool requestSpiProbe(bool production=false);
     void stopSpiProbe(void);
     bool isDabServiceMetadataReady(void) const;
     bool isDabServiceStartPending(void) const;
@@ -265,7 +269,7 @@ class DAB {
       SignalStatus,
       ServiceListHeader,
       EnsembleInfo,
-      Time,
+      Time, TimeUtc, TimeLocalConfirm,
       ServiceType,
       AudioInfo,
       CurrentSubchannelInfo,
@@ -292,6 +296,9 @@ class DAB {
     uint32_t dabSignalTimer;
     uint32_t rfSampleGeneration = 0;
     uint32_t dabTimeGeneration = 0;
+    epg::BroadcastClockSample dabEpgClock;
+    uint32_t dabLocalClockEpoch=0, dabLocalClockMs=0;
+    bool dabUtcRefreshPending=false, dabClockConfirmPending=false;
     int16_t dabRssi10;
     uint8_t fmPsSeenMask;
     uint8_t fmPsConfirmedMask;

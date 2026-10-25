@@ -2,6 +2,7 @@
 // Bounded, platform-neutral packet MOT/SPI core. ETSI EN 301 234 / TS 102 371.
 #include <stdint.h>
 #include <stddef.h>
+#include "epg_time.h"
 
 namespace epg {
 static const size_t kObjectBytes = 12288, kDirectoryBytes = 4096;
@@ -62,21 +63,28 @@ uint32_t crc32(Bytes p, size_t n);
 uint32_t epoch(int year, unsigned month, unsigned day, unsigned hour=0, unsigned minute=0, unsigned second=0);
 void calendar(uint32_t seconds, int& year, unsigned& month, unsigned& day);
 bool parseIso(const char* text, uint32_t& utc, int16_t& offsetMinutes);
+bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& offsetMinutes, bool& ltoPresent);
 bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& offsetMinutes);
 bool bearerValue(Bytes p, size_t n, uint64_t& out);
+
+// Read-only MSC envelope validation shared by admission, diagnostics and Core.
+struct GroupEnvelope {uint16_t tid=0,segment=0;uint8_t type=0,repetition=0;size_t offset=0,length=0;};
+enum class GroupCheck:uint8_t { Valid, Invalid, Crc };
+GroupCheck inspectGroup(Bytes p,size_t n,GroupEnvelope& header);
 
 struct Programme {
   uint64_t bearer = 0;
   uint32_t start=0, duration=0, actual=0, actualDuration=0, id=0;
   uint16_t version=0;
   int16_t lto=0;
-  bool event=false, uncertain=false;
+  bool event=false, uncertain=false, ltoPresent=false, actualLtoPresent=false;
+  int16_t actualLto=0;
   uint8_t rejectedTime[7]={}, rejectedTimeLength=0;
   char name[128]={}, medium[64]={}, shortName[32]={}, description[512]={}, crid[64]={};
 };
 struct Service {
   uint64_t bearer=0;
-  char name[48]={}, logo[32]={};
+  char name[48]={}, logo[32]={}, shortName[17]={};
   bool conflict=false, png=false;
 };
 struct Entry {
@@ -85,14 +93,15 @@ struct Entry {
   uint16_t tid=0, subtype=0, epoch=0;
   int16_t startLto=0, stopLto=0;
   uint8_t type=0;
-  bool seen=false;
+  bool seen=false, startLtoPresent=false, stopLtoPresent=false;
   char name[32]={};
 };
 struct CachedProgramme {
   uint32_t start=0, duration=0, actual=0, actualDuration=0, id=0;
   uint16_t title=0, description=0, version=0;
   int16_t lto=0;
-  bool uncertain=false;
+  int16_t actualLto=0;
+  uint8_t uncertain:1, ltoPresent:1, actualLtoPresent:1;
   uint8_t context=0;
 };
 struct Stats {
@@ -108,6 +117,11 @@ struct Observer {
   void (*service)(void*, uint16_t, const Service&)=nullptr;
   void (*object)(void*, uint16_t, uint8_t, Bytes, size_t)=nullptr;
 };
+enum class Availability : uint8_t {
+  NoSpi, WaitDirectory, DirectoryEmpty, PendingIdentity, SiOnly,
+  PiLoading, PiDateStale, ReadyLive, IdentityConflict, TimeUnknown
+};
+const char* availabilityName(Availability state);
 enum class Feed : uint8_t { Accepted, Busy, Rejected };
 struct Assembly {
   uint16_t tid=0, stride=0, last=0xffff, lengths[32]={};
@@ -148,6 +162,20 @@ class Core {
   int16_t offset() const { return offset_; }
   const Service* station() const;
   bool ambiguous() const;
+  uint64_t findStation(uint32_t sid,uint16_t eid,uint8_t ecc,int scids,bool& conflict) const;
+  bool hasPI() const;
+  bool hasSI() const { return station()!=nullptr; }
+  bool scheduleRange(uint32_t& start,uint32_t& end) const;
+  bool scheduleDateValid() const;
+  Availability availability(bool spiPresent) const;
+  void setLive(bool live) { liveMode_=live; }
+  void setClockTrusted(bool valid) { if(clockTrusted_!=valid) {clockTrusted_=valid;++revision;} }
+  bool clockTrusted() const { return clockTrusted_; }
+  bool transportFresh() const {return transportSeen_ && uint32_t(monotonicMs_-transportTouched_)<=900000U;}
+  bool archivePreview(uint32_t localDay); // 0 disables; never changes UTC or PI
+  bool archivePreview() const { return archiveDay_!=0; }
+  bool archived() const { return liveMode_ && !scheduleDateValid() && hasPI(); }
+  uint32_t clockLocalDay() const { return clockDay_*86400U; }
   Feed feed(Bytes data, size_t size, uint32_t nowMs);
   void pump(unsigned budget=48);
   void expire(uint32_t nowMs);
@@ -159,7 +187,7 @@ class Core {
   int current(bool* overlapping=nullptr) const;
   int next() const;
   Bytes logo() const { return logoSize() ? Bytes(logo_) : Bytes(); }
-  size_t logoSize() const { return logoBearer_==selected_ ? logoBytes_ : 0; }
+  size_t logoSize() const { return logoBearer_==selected_ && !ambiguous() ? logoBytes_ : 0; }
   bool fresh() const { return contexts_[context_].haveData && uint32_t(monotonicMs_-contexts_[context_].touched)<=900000U; }
   bool limited=false, identityConflict=false;
   uint32_t revision=0;
@@ -191,7 +219,12 @@ class Core {
   int16_t offset_=0;
   int browseOffset_=0;
   uint16_t cacheEpoch_=1, nextEpoch_=1, focus_=0;
-  uint16_t wanted() const;
+  uint16_t wanted();
+  bool liveMode_=false, clockTrusted_=true, transportSeen_=false;
+  uint32_t transportTouched_=0;
+  uint32_t clockDay_=0, archiveDay_=0, acquisitionAt_=0;
+  uint16_t acquisitionTid_=0, acquisitionSkip_=0;
+  uint32_t selectionDay(uint64_t bearer,uint32_t utc,int16_t offset) const;
   struct Level { size_t end; uint8_t tag; } stack_[24];
   struct Token { uint16_t offset=0, length=0; } tokens_[32];
   size_t position_=0, objectLength_=0;

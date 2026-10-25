@@ -483,3 +483,47 @@ Preserved real EPG capture, reference archive, synthetic programme/logo streams,
 PNGs and hashes: [fixtures/epg/README.md](fixtures/epg/README.md).
 The reusable logo hardware client is `tests/epg/synthetic_logo_test.py`;
 `--verify-fixtures` validates the saved inputs offline without opening UART.
+
+
+EPG LIVE time/metadata/archive regression (25 October 2026):
+`test_dab_clock.py` executes the real serialized LOCAL/UTC/LOCAL command cases
+and vendor parser across DST boundaries. `test_epg_live.py` checks fixed binary
+timePoint vectors, half-hour offsets, stale/unknown clocks, the separate 27-byte
+empty Directory fixture, real Kraków/OFF SI-only logos, historical Trójka,
+conflicting PR24/Chopin identity, reordered carousel and replacement with current
+PI without reset. Both are included in `run_epg_tests.py`, as is the SPI probe
+router/cleanup regression. Full hardware RF/stack/audio acceptance remains
+separate; see docs/EPG_LIVE_TIME_REPORT_20261025.md and EPG_ANDRZEJ_20261025.md.
+
+The legacy reference JSON had the same time bit-offset bug as the old parser.
+`epg_time_oracle.py` independently reads original binary programme time bytes;
+RAW replay still checks all 1,087 records, identities, titles, descriptions,
+durations, 70 objects and byte-identical PNGs. The original ZIP is unmodified.
+Synthetic stream fixtures ending `_v2.bin` use corrected time encoding; the
+original snapshots are retained with their SHA-256 in fixtures/epg/manifest.json.
+
+
+MUX 11A packet/X-PAD coexistence regression (25 October 2026):
+`test_epg_coexistence.py` executes the full actual DsrvHeader case, current UA
+query/publication, discovery and runtime/Core together. A–F cover the exact
+27-byte captured empty packet group vs full PAD programme using the same TID,
+PAD-only, SI+own Adam7 PNG without PI, packet+SLS/DLS handoff, first-PAD read/CRC/
+envelope failure, owner changes, transient unusable/failed UA, service/frequency/
+FM isolation, negative headers, replay quarantine, paced diagnostic backpressure
+and zero unexpected resets. Chip SPI, UART, heap, clock and display are mocked;
+SLS/DLS content decoding and real RF/audio remain separate checks. Included in
+`run_epg_tests.py`; reports go to `.pio/epg_coexistence/results.json`.
+Persistent results and limitations: [transport report](../docs/EPG_MUX11A_XPAD_REPORT_20261025.md).
+Actual 11A X-PAD is unverified: [Czech RF procedure](../docs/EPG_MUX11A_XPAD_RF_TEST_CZ.md).
+
+
+PI priority / explicit 500-ms production baseline acceptance (25 October 2026):
+`test_epg_priority.py` uses the saved v2 Adam7 programme stream through the real
+Core, tests PI-before-SI, focus, SI/PNG completion, no foreign/zero/conflicting
+PI, archival fallback, repeated carousel, stalled partial PI fallback, rollover
+and DEBUG timestamp state. It inspects private acquisition targets only in the
+host harness. `test_epg_transport.py` executes exact 499/500 and 4999/5000
+boundaries and matching log text plus baseline cancellation guards. Coexistence
+now includes three packet STOP/START cycles while PAD remains Ready; UI tests
+record t7 only after actual overview drawing. The full runner includes priority.
+T01–T16 mapping, scope and HW NOT TESTED: [report](../docs/EPG_PI_PRIORITY_REPORT_20261025.md).

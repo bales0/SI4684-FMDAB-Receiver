@@ -21,6 +21,7 @@ r=subprocess.run([str(exe),str(out/'frames.bin'),str(objs)],capture_output=True,
 print(r.stderr); r.check_returncode()
 (out/'programmes.tsv').write_text(r.stdout)
 from datetime import datetime
+from epg_time_oracle import programme_times
 with zipfile.ZipFile(a.reference) as z:
  assert hashlib.sha256(a.reference.read_bytes()).hexdigest()=='aed762cc1f5076dbda47b63101dfeef6ced4b418c9210e7c3c60ba25cc509d1e'
  reference=json.loads(z.read('decoded.json'))
@@ -37,21 +38,20 @@ with zipfile.ZipFile(a.reference) as z:
   assert bool(int(png))==(expected['medias'][-1]['mimeValue']=='image/png')
  print('SI: 55 service records, exact bearer/name/MIME/logo metadata: PASS')
  index={(x['tid'],x['shortId']):x for x in oracle}
- rejected=[]
+ binary_times={}
+ corrected_legacy_times=0
  truncated=0
  for row in rows:
   _,tid,bearer,start,duration,lto,pid,version,medium,title,desc,rejected_time=row
   expected=index[tid,int(pid)];t=expected['time'][0]
   assert bearer==expected['sid'],(tid,pid,'bearer')
-  if not rejected_time:
-   assert int(start)==int(datetime.fromisoformat(t['time']['utc']).timestamp()),(tid,pid,'time')
-  else:
-   raw=bytes.fromhex(rejected_time)
-   minute=(raw[3]>>1)&63
-   assert int(start)==0 and minute==60,(tid,pid,'bad time',raw.hex())
-   rejected.append((tid,int(pid),rejected_time))
+  if tid not in binary_times:binary_times[tid]=programme_times((objs/f'4_{tid}.bin').read_bytes())
+  expected_start,expected_lto,_=binary_times[tid][int(pid)]
+  assert not rejected_time,(tid,pid,'valid broadcast time rejected')
+  assert int(start)==expected_start,(tid,pid,'binary UTC')
+  assert int(lto)==expected_lto,(tid,pid,'binary LTO')
+  if expected_start!=int(datetime.fromisoformat(t['time']['utc']).timestamp()):corrected_legacy_times+=1
   assert int(duration)==t['duration'],(tid,pid,'duration')
-  if not rejected_time: assert int(lto)==int(t['time']['offset_hours']*60),(tid,pid,'LTO')
   assert bytes.fromhex(medium).decode()==expected['mediumName'],(tid,pid,'medium')
   expected_title=expected['longName'] or expected['mediumName'] or expected['shortName']
   assert bytes.fromhex(title).decode()==expected_title,(tid,pid,'title')
@@ -59,8 +59,8 @@ with zipfile.ZipFile(a.reference) as z:
   actual=bytes.fromhex(desc).decode()
   assert actual==expected_desc or (len(actual.encode())>=508 and expected_desc.startswith(actual)),(tid,pid,'description',actual,expected_desc)
   if actual!=expected_desc: truncated+=1
- assert len(rejected)==3, rejected
- print('Rejected minute=60, oracle normalizes invalid broadcast time:',rejected)
+ assert corrected_legacy_times>0
+ print('Legacy JSON time corrections against independent binary oracle:',corrected_legacy_times)
  print('Bounded descriptions truncated:',truncated)
  assert (objs/'6_F651.bin').read_bytes()==z.read('MOT_Directory_F651.bin')
  for name in z.namelist():

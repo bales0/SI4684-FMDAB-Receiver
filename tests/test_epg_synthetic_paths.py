@@ -27,6 +27,7 @@ void livePayload(const uint8_t* p,size_t n){
  while(syntheticCore.busy())syntheticCore.pump();
 }
 void livePadPayload(const uint8_t* p,size_t n){livePayload(p,n);}
+void livePadData(uint32_t sid,uint32_t cid,const uint8_t* p,size_t n){livePadEndpoint(sid,cid);livePadPayload(p,n);}
 }
 '''+prefix[b:]
 a=prefix.index('struct Chip {');b=prefix.index('} chip;',a)+len('} chip;')
@@ -45,6 +46,10 @@ a=radio.index('bool DAB::xpadSpiPresent(void) const {');b=radio.index('{',a)+1;d
 while depth:
  depth+=(radio[b]=='{')-(radio[b]=='}');b+=1
 pad_query=radio[a:b]
+a=radio.index('dab_spi::Identity DAB::xpadSpiIdentity(void) const {');b=radio.index('{',a)+1;depth=1
+while depth:depth+=(radio[b]=='{')-(radio[b]=='}');b+=1
+pad_query=radio[a:b]+'\n'+pad_query
+prefix=prefix.replace(' bool ServiceStart=true,dabUaInventoryValid=true;','').replace(' dab_spi::Identity xpadSpiIdentity() const{return xpadConfirmed?dab_spi::Identity::Spi:dab_spi::Identity::NotSpi;}','')
 prefix=prefix.replace('bool isFm(){return fm;}','bool isFm() const{return fm;}')
 prefix=prefix.replace('bool xpadSpiPresent() const{return xpadConfirmed;}',r'''
  bool ServiceStart=true,dabUaInventoryValid=true;
@@ -54,6 +59,9 @@ prefix=prefix.replace('bool xpadSpiPresent() const{return xpadConfirmed;}',r'''
  dab_spi::Identity dabSpiIdentities[1]={dab_spi::Identity::NotSpi};
  uint16_t dabUaComponentCount=1;
  uint8_t dabUaServiceCount=1;
+ enum class DabCommand {None,ComponentInfo};DabCommand dabCommand=DabCommand::None;
+ dab_spi::Scan dabUaScan;
+ dab_spi::Identity xpadSpiIdentity(void) const;
  bool xpadSpiPresent(void) const;
 ''')
 a=radio.index('      if (header.byteCount > 0U)',radio.index('case DabCommand::DsrvHeader:'))

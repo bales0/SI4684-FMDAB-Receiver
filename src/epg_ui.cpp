@@ -8,11 +8,25 @@ namespace {
 bool visible=false, suspended=false, dirty=true, fallback=false;
 unsigned page=0, selected=0, scroll=0, maxScroll=0;
 uint32_t revision=0, renderedMinute=0;
+epg::Availability renderedState=epg::Availability::NoSpi;
 unsigned renderedPage=3, renderedSelected=0, renderedFirst=0, renderedLanguage=8;
 int renderedDay=0;
 constexpr int listX=8, listTop=34, rowHeight=20;
 constexpr int titleX=64, titleWidth=232;
 const char* text(EpgText id) { return epgText[language<8?language:0][id]; }
+EpgText stateText(epg::Availability state) {
+  switch(state) {
+    case epg::Availability::NoSpi:return EPG_UNAVAILABLE;
+    case epg::Availability::WaitDirectory:return EPG_WAIT_DIRECTORY;
+    case epg::Availability::DirectoryEmpty:return EPG_DIRECTORY_EMPTY;
+    case epg::Availability::PendingIdentity:return EPG_WAIT_SI;
+    case epg::Availability::SiOnly:return EPG_SI_ONLY;
+    case epg::Availability::PiDateStale:return EPG_ARCHIVE;
+    case epg::Availability::IdentityConflict:return EPG_AMBIGUOUS;
+    case epg::Availability::TimeUnknown:return EPG_CLOCK_UNCERTAIN;
+    default:return EPG_WAIT_PROGRAM;
+  }
+}
 void restore(int x,int y,int width,int height,const uint16_t* background) {
   for(int row=0;row<height;++row)
     tft.pushImage(x,y+row,width,1,background+(y+row)*320+x);
@@ -80,7 +94,7 @@ void clockText(uint32_t utc,int16_t offset,char* out,size_t n) {
 }
 void interval(const epg::Core& c,size_t index,char* out,size_t n) {
   char first[8],last[8]; const auto& p=c.at(index);
-  clockText(p.start,p.lto,first,sizeof(first)); clockText(p.start+p.duration,p.lto,last,sizeof(last));
+  clockText(p.start,p.lto,first,sizeof(first)); clockText(uint32_t(uint64_t(p.start)+p.duration),p.lto,last,sizeof(last));
   const bool overnight=(int64_t(p.start)+p.lto*60)/86400!=(int64_t(p.start)+p.duration+p.lto*60)/86400;
   snprintf(out,n,"%s - %s%s / %u min%s",first,last,overnight?"+1":"",unsigned(p.duration/60),p.uncertain?" ?":"");
 }
@@ -147,6 +161,9 @@ void EpgMove(int step,bool second) {
 void EpgDraw(bool force) {
   if(!visible || menu) return;
   epg::Core* c=epg::runtime();
+  const auto state=epg::availability();
+  const bool stateChanged=state!=renderedState;
+  if(stateChanged) dirty=true;
   if(!force && !dirty && renderedLanguage==language && (!c || (revision==c->revision && renderedMinute==c->now()/60))) return;
   // Keep volume stable; its closing path requests one complete EPG repaint.
   if(setvolume) { dirty=true; return; }
@@ -154,10 +171,10 @@ void EpgDraw(bool force) {
   if(!force && uint32_t(millis()-renderedAt)<150U) return;
   renderedAt=millis();
   const bool full=force || page!=1 || renderedPage!=page || renderedLanguage!=language;
-  const bool dataChanged=!c || revision!=c->revision || renderedDay!=c->dayOffset();
+  const bool dataChanged=stateChanged || !c || revision!=c->revision || renderedDay!=c->dayOffset();
   const bool footerChanged=full || dataChanged || (c && renderedMinute!=c->now()/60);
   const unsigned oldSelected=renderedSelected, oldFirst=renderedFirst;
-  dirty=false; fallback=false;
+  dirty=false; fallback=false; renderedState=state;
   if(c) { revision=c->revision; renderedMinute=c->now()/60; if(selected>=c->count()) selected=c->count()?unsigned(c->count()-1):0; }
   const uint16_t* bg=EpgBackground(page==1);
   if(full) {
@@ -172,18 +189,20 @@ void EpgDraw(bool force) {
   renderedSelected=selected; renderedFirst=selected/9*9;
   if(c) renderedDay=c->dayOffset();
   const epg::Service* station=c?c->station():nullptr;
-  const char* name=station?station->name:epg::replayActive()?text(EPG_WAIT_SI):_serviceName;
+  const char* name=station && !station->conflict?station->name:epg::replayActive()?text(EPG_WAIT_SI):_serviceName;
   char info[128];
+  const bool archive=c && !epg::replayActive() && (c->archived() || c->archivePreview());
   if(c) {
     int year; unsigned month,day; epg::calendar(c->localDay(),year,month,day);
-    snprintf(info,sizeof(info),"%s %02u.%02u.%04d%s%s%s%s",epg::replayActive()?"TEST":"EPG",day,month,year,c->limited?" ":"",c->limited?text(EPG_LIMIT):"",c->ambiguous()?" ":"",c->ambiguous()?text(EPG_AMBIGUOUS):"");
+    snprintf(info,sizeof(info),"%s %02u.%02u.%04d%s%s%s%s",epg::replayActive()?"TEST":archive?text(c->archivePreview()?EPG_ARCHIVE_PREVIEW:EPG_ARCHIVE):"EPG",day,month,year,c->limited?" ":"",c->limited?text(EPG_LIMIT):"",c->ambiguous()?" ":"",c->ambiguous()?text(EPG_AMBIGUOUS):"");
   } else snprintf(info,sizeof(info),"%s",text(EPG_MEMORY));
-  if(c && !c->now()) snprintf(info,sizeof(info),"%s / %s",epg::replayActive()?"TEST":"EPG",text(EPG_NO_TIME));
+  if(c && !c->localDay()) snprintf(info,sizeof(info),"%s / %s",epg::replayActive()?"TEST":"EPG",text(EPG_NO_TIME));
   if(footerChanged) {
     if(!full) restore(0,220,320,20,bg);
     line(info,8,222,304,SecondaryColor);
   }
   if(!c) { waiting(text(EPG_MEMORY)); return; }
+  if(c->ambiguous()) {waiting(text(EPG_AMBIGUOUS));return;}
   if(page==1) {
     const unsigned first=selected/9*9;
     // Reuse FONT16 loaded at startup: the main screen shares this sprite.
@@ -206,7 +225,7 @@ void EpgDraw(bool force) {
       }
       FullLineSprite.pushSprite(listX,y);
     }
-    if(!c->count() && (full || dataChanged || first!=oldFirst)) waiting(text(c->ambiguous()?EPG_AMBIGUOUS:EPG_WAIT_PROGRAM));
+    if(!c->count() && (full || dataChanged || first!=oldFirst)) waiting(text(stateText(state)));
   } else if(page==2) {
     line(name,12,36,200,SecondaryColor);
     if(c->count()) {
@@ -215,25 +234,28 @@ void EpgDraw(bool force) {
       snprintf(info,sizeof(info),"%02u.%02u.%04d",day,month,year); line(info,218,36,90,SecondaryColor);
       interval(*c,selected,info,sizeof(info)); line(info,12,58,296,ActiveColor);
       const bool actualPresent=c->at(selected).actual!=0;
-      if(actualPresent) { char actual[8]; clockText(c->at(selected).actual,c->at(selected).lto,actual,sizeof(actual)); snprintf(info,sizeof(info),text(EPG_ACTUAL),actual); line(info,12,78,296,SecondaryColor); }
+      if(actualPresent) { char actual[8]; clockText(c->at(selected).actual,c->at(selected).actualLto,actual,sizeof(actual)); snprintf(info,sizeof(info),text(EPG_ACTUAL),actual); line(info,12,78,296,SecondaryColor); }
       char detail[640]; snprintf(detail,sizeof(detail),"%s\n%s",c->title(selected),c->description(selected));
       const unsigned rows=actualPresent?5:6;
       const unsigned total=wrapped(detail,scroll,rows,actualPresent?100:80,PrimaryColor);
       maxScroll=total>rows?total-rows:0;
-    } else waiting(text(EPG_WAIT_PROGRAM));
+    } else waiting(text(stateText(state)));
   } else {
     line(name,118,38,190,PrimaryColor);
-    char clock[8]; clockText(c->now(),c->offset(),clock,sizeof(clock)); line(c->now()?clock:text(EPG_NO_TIME),118,63,190,SecondaryColor);
-    if(c->logo()) DrawEpgLogo(c->logo(),c->logoSize(),12,34,100,70);
+    char clock[8]; clockText(c->now(),c->offset(),clock,sizeof(clock)); line(c->now() && c->clockTrusted()?clock:text(EPG_CLOCK_UNCERTAIN),118,63,190,SecondaryColor);
+    if(c->logo() && !c->ambiguous()) DrawEpgLogo(c->logo(),c->logoSize(),12,34,100,70);
     bool overlap=false; const int current=c->current(&overlap), next=c->next();
-    line(text(c->ambiguous()?EPG_AMBIGUOUS:overlap?EPG_OVERLAP:EPG_NOW),12,110,296,ActiveColor);
+    line(text(state!=epg::Availability::ReadyLive?stateText(state):overlap?EPG_OVERLAP:EPG_NOW),12,110,296,ActiveColor);
     if(current>=0) {
       wrapped(c->title(current),0,2,130,PrimaryColor);
       interval(*c,current,info,sizeof(info)); line(info,12,171,200,SecondaryColor);
       const auto& p=c->at(current); const unsigned percent=unsigned((uint64_t(c->now()-p.start)*100)/p.duration);
       tft.drawRect(222,174,85,7,SecondaryColor); tft.fillRect(223,175,int(percent*83/100),5,ActiveColor);
-    } else if(!c->count()) waiting(text(c->ambiguous()?EPG_AMBIGUOUS:EPG_WAIT_PROGRAM));
+    } else if(state==epg::Availability::SiOnly || state==epg::Availability::DirectoryEmpty || state==epg::Availability::PiDateStale || state==epg::Availability::TimeUnknown) {
+      wrapped(text(stateText(state)),0,3,132,PrimaryColor);
+    } else if(!c->count()) waiting(text(stateText(state)));
     else line(text(c->fresh()?EPG_UNAVAILABLE:EPG_STALE),12,134,296,PrimaryColor);
+    if(!epg::replayActive() && state==epg::Availability::ReadyLive && (current>=0 || next>=0))epg_acq::trace().mark(epg_acq::trace().owner,7,millis());
     if(next>=0) { char time[8]; clockText(c->at(next).start,c->at(next).lto,time,sizeof(time)); snprintf(info,sizeof(info),"%s %s  %s",text(EPG_NEXT),time,c->title(next)); line(info,12,198,296,ActiveColor); }
   }
   if(fallback) line("~",306,222,8,SecondaryColor);

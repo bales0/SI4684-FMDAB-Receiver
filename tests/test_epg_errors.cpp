@@ -28,14 +28,14 @@ static void put(uint8_t* p,unsigned at,unsigned n,uint32_t v){for(unsigned i=0;i
 static void timeTests(){
   for(bool longForm:{false,true})for(int offset:{-60,0,60,120}){
     uint8_t b[7]={};const uint32_t expected=epg::epoch(2024,3,31,1,30,longForm?59:0);
-    put(b,1,17,expected/86400+40587);put(b,18,1,longForm);put(b,19,1,1);put(b,20,5,1);put(b,25,6,30);
-    if(longForm)put(b,31,6,59);
+    put(b,1,17,expected/86400+40587);put(b,20,1,longForm);put(b,19,1,1);put(b,21,5,1);put(b,26,6,30);
+    if(longForm)put(b,32,6,59);
     b[longForm?6:4]=uint8_t((offset<0?32:0)+(offset<0?-offset:offset)/30);
     uint32_t decoded=0;int16_t lto=0;assert(epg::timePoint(b,longForm?7:5,decoded,lto)&&decoded==expected&&lto==offset);
     int y;unsigned m,d;epg::calendar(uint32_t(int64_t(decoded)+lto*60),y,m,d);assert(y==2024&&m==3&&d==31);
     assert(!epg::timePoint(b,longForm?6:4,decoded,lto));
   }
-  const uint8_t impossible[]={0x3b,0x34,0x95,0x78,0x02};uint32_t utc=0;int16_t off=0;
+  const uint8_t impossible[]={0x3b,0x34,0x96,0x00,0x02};uint32_t utc=0;int16_t off=0;
   assert(!epg::timePoint(impossible,sizeof(impossible),utc,off));
   uint64_t id=0;const uint8_t data[]={0x50,0xe2,0x31,0x53,0x12,0x34,0x56,0x78};
   assert(epg::bearerValue(data,sizeof(data),id)&&id==0x50e2315312345678ULL);

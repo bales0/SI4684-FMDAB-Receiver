@@ -84,7 +84,7 @@ struct Scan {
 };
 enum class Status : uint8_t {
   Pending, NotSignalled, SelectedService, SelectedEnsemble, Ambiguous, Incomplete,
-  PacketMotUnverified
+  PacketMotUnverified, PadOnly
 };
 
 inline Identity identify(const uint8_t* raw, size_t bytes, uint8_t count) {
@@ -122,6 +122,7 @@ inline const char* statusName(Status status) {
     case Status::Ambiguous: return "ambiguous";
     case Status::Incomplete: return "discovery incomplete";
     case Status::PacketMotUnverified: return "packet MOT unverified";
+    case Status::PadOnly: return "confirmed/PAD; no packet";
   }
   return "unknown";
 }
@@ -133,7 +134,7 @@ inline const char* statusName(Status status) {
 // policy, not proof that its schedule covers every audio service.
 class Selector {
  public:
-  explicit Selector(uint32_t currentService) : currentService_(currentService) {}
+  explicit Selector(uint32_t currentService,bool packetOnly=false) : currentService_(currentService),packetOnly_(packetOnly) {}
 
   void consider(uint32_t sid, uint32_t cid, Identity identity, bool packetMot = false) {
     if (identity == Identity::Unqueried) pending_ = true;
@@ -143,6 +144,7 @@ class Selector {
       return;
     }
     if (confirmed_ != UINT16_MAX) ++confirmed_;
+    if(packetOnly_ && !packetMot) return;
     add(all_, allCount_, sid, cid);
     if (sid == currentService_) add(local_, localCount_, sid, cid);
   }
@@ -164,7 +166,8 @@ class Selector {
       result.componentId = all_.componentId;
       result.status = Status::SelectedEnsemble;
     } else {
-      result.status = packetMotUnverified_ ? Status::PacketMotUnverified : Status::NotSignalled;
+      result.status = packetMotUnverified_ ? Status::PacketMotUnverified :
+          confirmed_?Status::PadOnly:Status::NotSignalled;
     }
     return result;
   }
@@ -180,6 +183,7 @@ class Selector {
     }
   }
   uint32_t currentService_;
+  bool packetOnly_;
   Result all_;
   Result local_;
   uint8_t allCount_ = 0;

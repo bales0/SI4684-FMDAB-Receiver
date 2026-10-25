@@ -46,6 +46,46 @@
     "synthetic_programme_groups.bin": {
       "bytes": 304,
       "sha256": "c7f86a788a5057a68c374cd00265ab2e23d4c31749a291e3959099bd6ad044ed"
+    },
+    "synthetic_programme_groups_v2.bin": {
+      "bytes": 304,
+      "sha256": "b0c0c144af0d07e80411f15fb5a033b072496f35c5bfd9b1b7171bbe52652b85"
+    },
+    "synthetic_logo_0_groups_v2.bin": {
+      "bytes": 676,
+      "sha256": "91e4e35d202f2b4ca2fe832ad540b209373bf306429da737a0d6e8ed20eaafac"
+    },
+    "synthetic_logo_1_groups_v2.bin": {
+      "bytes": 999,
+      "sha256": "52e6f81385ed6edb6d2246aa889e0833762fdb9a5d881648699f1c3c7126e6c8"
+    },
+    "time_source/clock_vectors.json": {
+      "bytes": 731,
+      "sha256": "a80d366e5a222bfa958477fc808b10a98b6dccfaef5aa165f4a1e3551c245290"
+    },
+    "time_source/empty_directory_11a.bin": {
+      "bytes": 27,
+      "sha256": "b258df2aff9bbcf3783dde2d16b7e4a77b4dc4cc483e23d544524a8b908c3057"
+    },
+    "time_source/timepoint_vectors.json": {
+      "bytes": 2451,
+      "sha256": "32ab6e94bebd433dba9d875ed0f42a8ff83955d16439a78cc7922b8ae6e0d4bd"
+    },
+    "mux11a_empty_group.bin": {
+      "bytes": 27,
+      "sha256": "1e8637387ce32511c77786788681dab1c4cb596235629d9cd98927559b119fa8"
+    },
+    "mux11a_empty_directory.bin": {
+      "bytes": 16,
+      "sha256": "5d27e1d62584913226b6b902aeba9b634c9a6fc04ff2980e729b4d0b1de8a4de"
+    },
+    "mux11a_capture_analysis.json": {
+      "bytes": 784,
+      "sha256": "7c9e7dee5b1c9952e720fd2efd9879e5a1b66f8678ed199f8fabb7025f33c44b"
     }
-  }
+  },
+  "v2_added_on": "2026-10-25",
+  "v2_note": "Correct short timePoint encoding (hour at bit21, minute26); original v1 fixtures and reference ZIP unchanged.",
+  "mux11a_added_on": "2026-10-25",
+  "mux11a_provenance": "EPG_DSRV_dumps_and_files.zip/log_11A.txt; exact first complete CRC-valid SPI/RAW group, body extracted at byte9. Analysis contains archive/entry hashes and no local account paths."
 }

@@ -92,7 +92,7 @@ $M=SLIDESHOW=0
 While the connection is disabled, `ENABLE` is the only regular protocol
 command that is processed. Other commands containing `=` are silently ignored.
 The service commands `DEBUG`, `DEBUG SLSV`/`DEBUG VERBOSE`, `DEBUG SPI`,
-`DEBUG SPI STOP`, all `EPG TEST ...` commands and E1/E2 fragments remain
+`DEBUG SPI STOP`, all `EPG TEST ...` / `EPG ARCHIVE ...` commands and E1/E2 fragments remain
 available without an active connection. `ENABLE=0` does not stop an EPG test.
 
 ## Commands
@@ -261,9 +261,10 @@ confirmed icon color and do not repeat an unchanged inventory dump.
 
 The main display shows only `EPG` below the codec. Grey means EPG has not
 been detected. Cyan means validated SPI presence was found, but the selected
-station/day has no fresh unambiguous cached programme. Green means that
-programme data for the selected station/day is cached and fresh (15 minutes).
-Green can remain during an RF outage while the cached programme is still valid.
+station/day has no fresh unambiguous cached programme. Green requires fresh cached programme data for a matching schedule date and
+a trusted clock (virtual in TEST, broadcast UTC plus confirmed current offset
+in LIVE). SI-only metadata, a logo or freshly received historical PI is not
+Ready. Loss of trusted clock/lock removes Ready even if programme data remains.
 The detector retains known presence during routine rescans and clears on retune
 or a valid topology/version change. In UART replay, presence follows the
 validated test directory and readiness follows the test station/day cache.
@@ -662,6 +663,7 @@ requires uppercase `T`/`Z`. Replies use `EPG ...`, not `#0`/`#1`.
 |---|---|
 | `EPG TEST HELP` | Lists supported commands: `EPG OK HELP: ...`. Does not allocate Core. |
 | `EPG TEST STATUS` | Reports LIVE/TEST and all diagnostics below. Allocates Core if needed; can return a memory error. |
+| `EPG TEST TRANSPORT` | Queues paced, separate PACKET/PAD diagnostics, identity, reset reasons and health. Works without Core allocation; see transport diagnostics below. |
 | `EPG TEST DEMO` | Starts the built-in historical MSC recording, opens EPG and replies `EPG OK DEMO source=actual-MUX11B MSC directory+F64C+F629; TEST historical data`. |
 | `EPG TEST START` | Starts an empty E1 session for packet identity E23153FE/01F2C00C and opens EPG. |
 | `EPG TEST START SID FULLCID` | As above with explicit hexadecimal input identity; the CID must have packet-mode bits `(CID & 0xC000) == 0xC000`. |
@@ -795,8 +797,8 @@ precede command-specific validation because Core is allocated on demand.
 
 ### STATUS and asynchronous object diagnostics
 
-STATUS has no final end marker. It normally emits these six lines in order,
-plus `EPG INJECT` as a seventh line during injection:
+STATUS has no final end marker. It emits the original six lines followed by
+`EPG STATE` and `EPG CLOCK`, plus `EPG INJECT` as the last line during injection:
 
 ```text
 EPG OK STATUS mode=LIVE|TEST frames=N crcBad=N invalid=N dup=N conflict=N incomplete=N busy=N
@@ -805,6 +807,8 @@ EPG RX unmapped=N oversize=N timeout=N fresh=0|1 continuityJumps=N unsupported=N
 EPG RAM arena=N free=N min=N largest=N audio=0|1 SLS=0|1 UARTdrop=N rxCRC=N rxOrder=N rxIdentity=N
 EPG LOGO bytes=N interlace=0|1
 EPG POOLS free8=N largest8=N free32=N largest32=N
+EPG STATE state=NAME transportFresh=0|1 scheduleDateValid=0|1 serviceHasPI=0|1 serviceHasSI=0|1 clockValid=0|1 sourceStart=N sourceEnd=N archive=0|1
+EPG CLOCK encoding=0|1|2 valid=0|1 offsetKnown=0|1 offset=N utc=N local=N generation=N age=N
 EPG INJECT path=MSC|PAD ua=0|1 accepted=N legacy=N rejected=N blocked=N
 ```
 
@@ -822,7 +826,9 @@ or -1 if unavailable. Fields mean:
 | `EPG POOLS` | Free/largest blocks for INTERNAL\|8BIT DRAM and INTERNAL\|32BIT\|EXEC IRAM. Aggregate free heap alone does not establish allocatability. |
 | `EPG INJECT` | Simulated UA confirmation and accepted, legacy-handoff, rejected and packet-blocked group counts for the injection session. |
 
-The Core arena on the tested ESP32 is 50,800 bytes. Capacity is shared across
+The current Core arena for ESP32 is 51,096 bytes (compiler layout check;
+current RF firmware has not been hardware-tested). The preceding tested build
+used 50,800 bytes. Object/image/text buffers retain their sizes. Capacity is shared across
 station/day cache contexts; the decoder intentionally does not retain every
 programme/logo in a multiplex. `cached`, `fresh` and readiness apply to the
 selected context. They are not proof of complete programme coverage.
@@ -925,3 +931,271 @@ loaded the correct PNG with zero CRC/invalid/UART errors. Both Adam7 paths
 reported successful validation/drawing, and the user confirmed the final PAD
 Adam7 logo on the display. This EPG test does not constitute a separate test
 of reception/display through the slideshow collector.
+
+
+### LIVE availability, trustworthy time and archive browsing (25 October 2026)
+
+`EPG STATE` separates recent transport reception from PI date validity, SI/PI
+presence and clock certainty. `EPG RX fresh` remains the selected PI cache age;
+`EPG STATE transportFresh` describes valid MOT group arrival independently.
+`sourceStart/sourceEnd` delimit original schedule-local calendar values from
+Directory scope (epoch-style calendar arithmetic, **not UTC instants**); they
+are zero when unavailable. PI start/actual instants stay unchanged UTC.
+`archive=1` means explicit archive preview was requested. Standard LIVE can
+also show original historical lists, clearly labelled Archive, without preview.
+
+State priorities: conflict; no SPI; waiting for Directory; empty Directory;
+pending identity; SI-only without PI; uncertain clock; historical/archive PI;
+then ready or programme loading. Inspect the separate flags for simultaneous
+conditions. Valid state names are:
+
+| State | Meaning |
+|---|---|
+| NO_SPI | No confirmed SPI presence. |
+| SPI_PRESENT_WAIT_DIR | SPI present, no valid complete Directory yet. |
+| DIRECTORY_EMPTY | Valid Directory declares zero objects. |
+| PENDING_IDENTITY | Current service not yet mapped unambiguously to SI/PI. |
+| SI_ONLY | Station metadata available; no PI declared for this service. Own logo can still be received. |
+| PI_DECLARED_LOADING | A matching PI is declared but a usable current view is not ready; this also covers expired transport freshness. |
+| PI_DATE_STALE | Historical PI or explicit archive view; not a live NOW/NEXT promise. |
+| READY_LIVE | Fresh programme with validated date/clock and NOW or NEXT. In mode=TEST, this uses the explicit virtual clock. |
+| IDENTITY_CONFLICT | Conflicting SI/bearer; no arbitrary programme/logo selection. |
+| TIME_UNKNOWN | PI exists but clock/offset is uncertain; NOW/NEXT and progress disabled. |
+
+`EPG CLOCK encoding` is 0 Unknown, 1 Local, 2 UTC for the broadcast sample.
+`valid` reports resolved UTC validity, while STATE clockValid additionally
+requires confirmed current offset. `offset` is signed minutes, `age` is the
+sample's monotonic age in milliseconds. These fields report the broadcast
+clock even during TEST; STATE clockValid then refers to the virtual test clock.
+
+AN649 defines DAB_GET_TIME type=0 as local and type=1 as UTC. The receiver keeps
+main-screen radio fields local and queues a UTC read, followed by a confirming
+local read. A bounded pair within 2 seconds supplies current half-hour offset
+without using historical PI, EID/ECC timezone guesses or a global TZ variable.
+Invalid/missing pairs, lost lock and clock samples at least 300 seconds old
+cannot establish Ready. After lock loss, a new clock generation is required.
+DEBUG logs bounded raw calendar bytes as `[DAB/CLOCK] type=0|1 ...` and the
+confirmation's UTC/local/offset. The type=1 contract is documented and covered
+by mocks; it still requires RF verification on the installed chip firmware.
+
+PI timePoint preserves whether LTO was explicitly present; per TS 102 371,
+absent LTO means schedule-local time is UTC, not an inferred CET +60. Original
+PI LTO is used for historical programme display. The current broadcast offset
+is used for current radio time. No 2024-to-2026 date/year mapping is performed.
+
+Explicit archive browsing is available without ENABLE or DEBUG:
+
+```text
+EPG ARCHIVE 2024-11-12
+EPG TEST STATUS
+EPG ARCHIVE OFF
+```
+
+This requires an allocated Core in LIVE, not TEST. The date is exactly
+YYYY-MM-DD and is an original schedule-local calendar day. It opens EPG with
+ARCHIVE / SIMULATION marking, keeps broadcast UTC and all original PI instants,
+and disables NOW/NEXT/progress. It does not simulate today's time of day on
+that archive day. OFF restores standard LIVE date selection; historical data
+still remains Archive if no current PI is broadcast. This feature is off by
+default and resets with TEST/STOP/tune context changes. Replies/errors:
+
+```text
+EPG OK ARCHIVE preview; original dates; NOW disabled
+EPG OK ARCHIVE OFF
+EPG ERROR ARCHIVE requires LIVE data
+EPG ERROR ARCHIVE use YYYY-MM-DD or OFF
+EPG ERROR ARCHIVE date
+```
+
+The existing DEMO/E1/E2 test clock and TEST label remain available. New synthetic
+fixtures use `tests/fixtures/epg/*_v2.bin`; older synthetic inputs are retained
+as snapshots of the old erroneous encoder. Example:
+
+```powershell
+python -u tools/epg_synthetic.py --port COM4 --input tests/fixtures/epg/synthetic_programme_groups_v2.bin --loop
+```
+
+The original RAW capture and reference ZIP have not been altered. The reference
+JSON's time values had the old bit-offset error, so the regression now verifies
+UTC/LTO independently from original binary objects while retaining all other
+reference comparisons. See [the LIVE report](docs/EPG_LIVE_TIME_REPORT_20261025.md)
+and [Andrzej's manual checks](docs/EPG_ANDRZEJ_20261025.md).
+
+
+### Separate packet and X-PAD transport diagnostics (25 October 2026)
+
+`EPG TEST TRANSPORT` is read-only and available without ENABLE or DEBUG, in
+LIVE and TEST. It does not start replay, query the chip, change ownership,
+allocate Core, or clear programme data. STATUS still describes the active Core;
+TRANSPORT additionally reports observations of the other transport.
+
+```text
+EPG TEST TRANSPORT
+EPG OK TRANSPORT queued
+EPG AUDIO ...
+EPG PACKET ...
+EPG RADIO ...
+EPG OWNER ...
+EPG TRANSPORT path=PACKET ...
+EPG MOTPATH path=PACKET ...
+EPG REJECT path=PACKET ...
+EPG TRANSPORT path=PAD ...
+EPG MOTPATH path=PAD ...
+EPG REJECT path=PAD ...
+EPG RESETS ...
+EPG HEALTH ...
+EPG TRANSPORT END
+```
+
+An active request returns `EPG OK TRANSPORT pending` instead of starting a
+second output. Admission needs 64 bytes of UART headroom; below that the command
+is handled silently and the client must retry. Pages wait for at least 512 bytes
+of headroom and are emitted at most once per 100 ms, normally taking about 1.3 s.
+There is no continuous HEX dump. A context epoch/reset change terminates output
+with `EPG TRANSPORT CANCELLED context changed`; retry after tuning settles.
+Pages are successive observations, not an atomic snapshot. Counters can advance
+between lines. UART backpressure may extend the duration indefinitely.
+
+| Record | Meaning |
+|---|---|
+| AUDIO | Current audio SID/full CID; raw UA identity, generation/publication and inventory completeness/failure; operational `usable` separately. |
+| PACKET | Selected packet endpoint and discovery status, confirmed/unverified advertisements, tracked endpoint and probe phase. `confirmed/PAD; no packet` is a valid state. |
+| RADIO | FM/DAB, requested tuner index/frequency in kHz, EID/ECC, lock, tune/switching, CTS/overflow/errors and cached XPAD set/get/match diagnostics. During tuning the requested frequency is not proof of lock there. |
+| OWNER | LIVE/TEST and actual NONE/PACKET/PAD/TEST owner, UI channelIndex, epoch, actual Core resets/last reason, logical availability transitions and malformed-header count. |
+| TRANSPORT | Per-path canonical endpoint, source-class header counts, SPI candidates/admissions/blocks, legacy handoffs, latest candidate raw header identity and metadata, wait/idle durations and Directory observation reason. |
+| MOTPATH | Groups/envelope validity/CRC, type4/type6, verified complete Directories, bounded unique/repeat history, empties, last TID/body size/object count and owner-decoded SI/PI/PNG/programme count. |
+| REJECT | Separate rejection counters, listed below. |
+| RESETS | Actual runtime Core::reset calls by reason, listed below. |
+| HEALTH | Heap-capability free/largest blocks, minimum free heap, dropped UART bytes, audio/SLS flags and active Core cache/error counters. |
+
+`headers=a/b/c/d` means DATA_SRC 0/1/2/3. PACKET records source0; PAD records
+source1/2 plus reserved source3 observations. Source0 is standard data, source1
+is non-DLS PAD, source2 is DLS. Raw UA=0007 is an X-PAD SPI candidate **only on
+source1**. Actual admission also requires verified current audio UA, matching
+SID/CID/generation, valid state/physical metadata and payload bounds. Raw UA=0007
+on source0 or source2 alone does not prove X-PAD SPI. Source1 Slideshow UA=0002
+and DLS still go through their legacy paths. `last` preserves the latest SPI
+candidate when candidates exist; legacy traffic does not overwrite it.
+Full command CID and short DSRV CID are reported separately; only the router's
+specific verified representations are accepted, not arbitrary global masking.
+
+Audio `ua` is confirmed / unknown / failed / not-signalled. Raw `identity` is
+0 Unqueried, 1 NotSpi, 2 Spi, 3 Failed, 4 Slideshow, 5 SpiAndSlideshow.
+An unusable audio context or failed/incomplete scan does not revoke an already
+confirmed PAD owner. A complete valid negative UA result does. Packet selection
+retains a distinct packet endpoint even when the audio component advertises SPI.
+`confirmed` counts SPI advertisements, including audio, not just packet endpoints.
+
+Transport `admitted` counts groups accepted by the owner Core; it does not mean
+Ready. `blocked` counts groups excluded from Core by ownership/replay. `legacy`
+counts handoffs to the existing DLS/SLS path, not successfully decoded images.
+Other-transport groups are observed without entering or resetting the active
+Core. Observations of valid empty packet Directory therefore cannot clear PAD
+SI/PI, even when the two streams use the same TID.
+
+`dirs` means a complete validated Directory, not each type6 fragment. Without a
+second reassembly buffer, the unowned path can directly validate a single-group
+empty Directory or a known complete repeat; new nonempty/fragmented unowned
+Directories remain undecoded. `unique`/`repeats` use a four-fingerprint bounded
+history; `historyLimited=1` reports overflow, so these are not an unlimited count
+of all distinct Directories ever seen. Packet empty 11A fixture: group 27 bytes,
+Directory body 16 bytes, objects=0, TID=8CC2.
+
+`reason` values are `not-owned` (no canonical endpoint), `waiting-data`,
+`incomplete-directory`, `directory-timeout` (no verified Directory after 300 s),
+`directory-known`, `empty-directory`. A signalled PAD with no Directory remains
+WAIT_DIR even if packet keeps sending empty Directory. Timeout is diagnostic;
+it does not automatically switch away from the PAD owner. DIRECTORY_EMPTY and
+SI_ONLY UI messages explicitly describe the selected carousel, not the whole
+multiplex. Time validity, archive and identity rules documented above still apply.
+
+REJECT keys: `ua` unconfirmed/negative identity; `generation` stale/incomplete
+context; `sid`/`cid` mismatch; `inactive` unusable audio; `dscty` unsupported data
+type; `state` bad service state; `physical` chip error; `length` bounds;
+`read` failed exact payload read; `replay` live data quarantined by TEST;
+`owner` different active transport; `data` invalid first envelope or Core rejection;
+`no-endpoint` no eligible packet context; `busy` another receiver operation.
+Some failures occur before group observation, so header/rejection totals need not
+match group totals. CRC diagnostics count inspected group CRC failures separately.
+
+RESETS keys: `tune`, `service`, `packet-endpoint`, `packet->PAD`, `PAD->packet`,
+`pad-endpoint`, `ua-revoked`, `replay-start`, `replay-stop`, `PAD-acquire`.
+They count actual runtime Core::reset calls, not every duplicate signal or cache
+replacement. NONE-to-PAD uses PAD-acquire. Reason counters are lifetime totals;
+path counters are scoped to the context epoch and canonical endpoint. A new
+endpoint clears only its path evidence; tune/STOP context clears both paths.
+Counters saturate at UINT32_MAX. `stateChanges` counts logical availability
+changes, not TFT redraws. In TEST, live frames remain excluded from the test Core.
+
+HEALTH `core=0` means Core is not allocated; `arena` is its required Core-plus-buffers size,
+not an assertion of allocation. `free8/largest8` and `free32/largest32` are the
+separate heap capability classes, not quantities to sum as total memory.
+`UARTdrop` counts lost diagnostic bytes, not lost RF packets. Audio/SLS flags do
+not establish uninterrupted playback or visual correctness. Verify those on RF.
+
+The bounded evidence registry occupies 516 bytes on the ESP32 target. There is
+still one Core and no additional MOT/PNG framebuffer. Host A–F tests and a Czech
+RF procedure are linked from [the transport report](docs/EPG_MUX11A_XPAD_REPORT_20261025.md)
+and [RF instructions](docs/EPG_MUX11A_XPAD_RF_TEST_CZ.md).
+
+
+### EPG acquisition timing and startup baseline (25 October 2026)
+
+Automatic production packet acquisition explicitly requests a **500 ms**
+baseline. Manual `DEBUG SPI` explicitly keeps **5000 ms** followed by its
+30-second observation window. Both use the same cooperative START/STOP and
+cleanup state machine. Log lines report the actual mode and baseline, for example:
+
+```text
+[DAB/SPI/TEST] mode=LIVE baseline=500 ms then START SID=... CID=...; observe=continuous; audio/SLS kept
+[DAB/SPI/TEST] mode=DEBUG baseline=5000 ms then START SID=... CID=...; observe=30s; audio/SLS kept
+```
+
+The 500 ms deadline is the earliest eligibility for START, not a guaranteed
+command submission time: pending radio work, lock/context validation and the
+serialized scheduler still take precedence. X-PAD needs no separate packet START.
+
+While `DEBUG` diagnostics are ON, bounded `EPG ACQ` records report first observed
+acquisition milestones for each transport. No new command or ENABLE is required.
+Turn DEBUG on **before** selecting the test station to capture the start.
+
+```text
+EPG ACQ path=PACKET sid=........ cid=........ base=first-observed t0=... t1=... t2=... t3=... t4=... t5=... t6=... t7=... t8=...
+```
+
+All numeric values are milliseconds from that path's first captured milestone;
+subtract two known values to obtain a stage interval. `N/A` means unobserved or
+not applicable, never zero delay. Unsigned timestamp subtraction is safe across
+`millis()` rollover for the measured acquisition window. Each milestone is
+captured only once per audio/endpoint context; lines can update as later stages
+arrive. Paths are PACKET and XPAD with canonical transport SID/full CID.
+
+| Point | First captured event |
+|---|---|
+| t0 | Audio switch reaches Ready or AudioOnly (settled service context). |
+| t1 | Current validated transport endpoint published/validated for request. |
+| t2 | Packet probe created; baseline begins. |
+| t3 | Serialized packet START requested. |
+| t4 | Packet START succeeds. Timeout/failure leaves this N/A. |
+| t5 | Owner Core validates its first complete MOT Directory. |
+| t6 | A complete selected PI yields cached programmes for the selected day, with no ambiguous identity. |
+| t7 | EPG overview actually draws valid LIVE NOW or NEXT. Until opened/rendered this stays N/A. |
+| t8 | Selected SI and own PNG logo are available together. SI-only can reach t8 with t6/t7 N/A. |
+
+XPAD t2/t3/t4 are N/A because that transport rides the audio component. TEST
+replay does not produce this LIVE timeline. Capturing can miss earlier events
+when DEBUG was enabled late; no timestamps are backfilled from guesses. A tune,
+service-context change, endpoint change or DEBUG off/on starts new evidence.
+Changing only the browsed EPG station is not a new RF acquisition; interpret
+selected-programme stages with the current STATUS station identity.
+
+Output needs 320 bytes of UART queue headroom and emits at most one changed
+path record per 250 ms. Unchanged records do not repeat. Trace storage is 124
+bytes on ESP32, with no heap allocation or extra MOT/image buffer. CPU, FIFO and
+audio effects still require live RF verification.
+
+Relative to the old five-second production baseline, the expected startup
+baseline reduction is **4500 ms**. The preceding local version already used
+500 ms, so this refactoring does not claim an additional 4500 ms gain over it.
+Total DIR/PI/UI latency depends on the broadcast carousel and has not been
+measured on hardware for this version. See [the acquisition report](docs/EPG_PI_PRIORITY_REPORT_20261025.md).

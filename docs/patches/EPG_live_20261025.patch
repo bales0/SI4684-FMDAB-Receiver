@@ -1,0 +1,2328 @@
+diff --git a/Serial_protocol.md b/Serial_protocol.md
+index 708adf3..252f31a 100644
+--- a/Serial_protocol.md
++++ b/Serial_protocol.md
+@@ -92,7 +92,7 @@ $M=SLIDESHOW=0
+ While the connection is disabled, `ENABLE` is the only regular protocol
+ command that is processed. Other commands containing `=` are silently ignored.
+ The service commands `DEBUG`, `DEBUG SLSV`/`DEBUG VERBOSE`, `DEBUG SPI`,
+-`DEBUG SPI STOP`, all `EPG TEST ...` commands and E1/E2 fragments remain
++`DEBUG SPI STOP`, all `EPG TEST ...` / `EPG ARCHIVE ...` commands and E1/E2 fragments remain
+ available without an active connection. `ENABLE=0` does not stop an EPG test.
+ 
+ ## Commands
+@@ -261,9 +261,10 @@ confirmed icon color and do not repeat an unchanged inventory dump.
+ 
+ The main display shows only `EPG` below the codec. Grey means EPG has not
+ been detected. Cyan means validated SPI presence was found, but the selected
+-station/day has no fresh unambiguous cached programme. Green means that
+-programme data for the selected station/day is cached and fresh (15 minutes).
+-Green can remain during an RF outage while the cached programme is still valid.
++station/day has no fresh unambiguous cached programme. Green requires fresh cached programme data for a matching schedule date and
++a trusted clock (virtual in TEST, broadcast UTC plus confirmed current offset
++in LIVE). SI-only metadata, a logo or freshly received historical PI is not
++Ready. Loss of trusted clock/lock removes Ready even if programme data remains.
+ The detector retains known presence during routine rescans and clears on retune
+ or a valid topology/version change. In UART replay, presence follows the
+ validated test directory and readiness follows the test station/day cache.
+@@ -795,8 +796,8 @@ precede command-specific validation because Core is allocated on demand.
+ 
+ ### STATUS and asynchronous object diagnostics
+ 
+-STATUS has no final end marker. It normally emits these six lines in order,
+-plus `EPG INJECT` as a seventh line during injection:
++STATUS has no final end marker. It emits the original six lines followed by
++`EPG STATE` and `EPG CLOCK`, plus `EPG INJECT` as the last line during injection:
+ 
+ ```text
+ EPG OK STATUS mode=LIVE|TEST frames=N crcBad=N invalid=N dup=N conflict=N incomplete=N busy=N
+@@ -805,6 +806,8 @@ EPG RX unmapped=N oversize=N timeout=N fresh=0|1 continuityJumps=N unsupported=N
+ EPG RAM arena=N free=N min=N largest=N audio=0|1 SLS=0|1 UARTdrop=N rxCRC=N rxOrder=N rxIdentity=N
+ EPG LOGO bytes=N interlace=0|1
+ EPG POOLS free8=N largest8=N free32=N largest32=N
++EPG STATE state=NAME transportFresh=0|1 scheduleDateValid=0|1 serviceHasPI=0|1 serviceHasSI=0|1 clockValid=0|1 sourceStart=N sourceEnd=N archive=0|1
++EPG CLOCK encoding=0|1|2 valid=0|1 offsetKnown=0|1 offset=N utc=N local=N generation=N age=N
+ EPG INJECT path=MSC|PAD ua=0|1 accepted=N legacy=N rejected=N blocked=N
+ ```
+ 
+@@ -822,7 +825,9 @@ or -1 if unavailable. Fields mean:
+ | `EPG POOLS` | Free/largest blocks for INTERNAL\|8BIT DRAM and INTERNAL\|32BIT\|EXEC IRAM. Aggregate free heap alone does not establish allocatability. |
+ | `EPG INJECT` | Simulated UA confirmation and accepted, legacy-handoff, rejected and packet-blocked group counts for the injection session. |
+ 
+-The Core arena on the tested ESP32 is 50,800 bytes. Capacity is shared across
++The current Core arena for ESP32 is 51,096 bytes (compiler layout check;
++current RF firmware has not been hardware-tested). The preceding tested build
++used 50,800 bytes. Object/image/text buffers retain their sizes. Capacity is shared across
+ station/day cache contexts; the decoder intentionally does not retain every
+ programme/logo in a multiplex. `cached`, `fresh` and readiness apply to the
+ selected context. They are not proof of complete programme coverage.
+@@ -925,3 +930,92 @@ loaded the correct PNG with zero CRC/invalid/UART errors. Both Adam7 paths
+ reported successful validation/drawing, and the user confirmed the final PAD
+ Adam7 logo on the display. This EPG test does not constitute a separate test
+ of reception/display through the slideshow collector.
++
++
++### LIVE availability, trustworthy time and archive browsing (25 October 2026)
++
++`EPG STATE` separates recent transport reception from PI date validity, SI/PI
++presence and clock certainty. `EPG RX fresh` remains the selected PI cache age;
++`EPG STATE transportFresh` describes valid MOT group arrival independently.
++`sourceStart/sourceEnd` delimit original schedule-local calendar values from
++Directory scope (epoch-style calendar arithmetic, **not UTC instants**); they
++are zero when unavailable. PI start/actual instants stay unchanged UTC.
++`archive=1` means explicit archive preview was requested. Standard LIVE can
++also show original historical lists, clearly labelled Archive, without preview.
++
++State priorities: conflict; no SPI; waiting for Directory; empty Directory;
++pending identity; SI-only without PI; uncertain clock; historical/archive PI;
++then ready or programme loading. Inspect the separate flags for simultaneous
++conditions. Valid state names are:
++
++| State | Meaning |
++|---|---|
++| NO_SPI | No confirmed SPI presence. |
++| SPI_PRESENT_WAIT_DIR | SPI present, no valid complete Directory yet. |
++| DIRECTORY_EMPTY | Valid Directory declares zero objects. |
++| PENDING_IDENTITY | Current service not yet mapped unambiguously to SI/PI. |
++| SI_ONLY | Station metadata available; no PI declared for this service. Own logo can still be received. |
++| PI_DECLARED_LOADING | A matching PI is declared but a usable current view is not ready; this also covers expired transport freshness. |
++| PI_DATE_STALE | Historical PI or explicit archive view; not a live NOW/NEXT promise. |
++| READY_LIVE | Fresh programme with validated date/clock and NOW or NEXT. In mode=TEST, this uses the explicit virtual clock. |
++| IDENTITY_CONFLICT | Conflicting SI/bearer; no arbitrary programme/logo selection. |
++| TIME_UNKNOWN | PI exists but clock/offset is uncertain; NOW/NEXT and progress disabled. |
++
++`EPG CLOCK encoding` is 0 Unknown, 1 Local, 2 UTC for the broadcast sample.
++`valid` reports resolved UTC validity, while STATE clockValid additionally
++requires confirmed current offset. `offset` is signed minutes, `age` is the
++sample's monotonic age in milliseconds. These fields report the broadcast
++clock even during TEST; STATE clockValid then refers to the virtual test clock.
++
++AN649 defines DAB_GET_TIME type=0 as local and type=1 as UTC. The receiver keeps
++main-screen radio fields local and queues a UTC read, followed by a confirming
++local read. A bounded pair within 2 seconds supplies current half-hour offset
++without using historical PI, EID/ECC timezone guesses or a global TZ variable.
++Invalid/missing pairs, lost lock and clock samples at least 300 seconds old
++cannot establish Ready. After lock loss, a new clock generation is required.
++DEBUG logs bounded raw calendar bytes as `[DAB/CLOCK] type=0|1 ...` and the
++confirmation's UTC/local/offset. The type=1 contract is documented and covered
++by mocks; it still requires RF verification on the installed chip firmware.
++
++PI timePoint preserves whether LTO was explicitly present; per TS 102 371,
++absent LTO means schedule-local time is UTC, not an inferred CET +60. Original
++PI LTO is used for historical programme display. The current broadcast offset
++is used for current radio time. No 2024-to-2026 date/year mapping is performed.
++
++Explicit archive browsing is available without ENABLE or DEBUG:
++
++```text
++EPG ARCHIVE 2024-11-12
++EPG TEST STATUS
++EPG ARCHIVE OFF
++```
++
++This requires an allocated Core in LIVE, not TEST. The date is exactly
++YYYY-MM-DD and is an original schedule-local calendar day. It opens EPG with
++ARCHIVE / SIMULATION marking, keeps broadcast UTC and all original PI instants,
++and disables NOW/NEXT/progress. It does not simulate today's time of day on
++that archive day. OFF restores standard LIVE date selection; historical data
++still remains Archive if no current PI is broadcast. This feature is off by
++default and resets with TEST/STOP/tune context changes. Replies/errors:
++
++```text
++EPG OK ARCHIVE preview; original dates; NOW disabled
++EPG OK ARCHIVE OFF
++EPG ERROR ARCHIVE requires LIVE data
++EPG ERROR ARCHIVE use YYYY-MM-DD or OFF
++EPG ERROR ARCHIVE date
++```
++
++The existing DEMO/E1/E2 test clock and TEST label remain available. New synthetic
++fixtures use `tests/fixtures/epg/*_v2.bin`; older synthetic inputs are retained
++as snapshots of the old erroneous encoder. Example:
++
++```powershell
++python -u tools/epg_synthetic.py --port COM4 --input tests/fixtures/epg/synthetic_programme_groups_v2.bin --loop
++```
++
++The original RAW capture and reference ZIP have not been altered. The reference
++JSON's time values had the old bit-offset error, so the regression now verifies
++UTC/LTO independently from original binary objects while retaining all other
++reference comparisons. See [the LIVE report](docs/EPG_LIVE_TIME_REPORT_20261025.md)
++and [Andrzej's manual checks](docs/EPG_ANDRZEJ_20261025.md).
+diff --git a/docs/EPG_IMPLEMENTATION_REPORT.md b/docs/EPG_IMPLEMENTATION_REPORT.md
+index 4d75ee4..a77f6fb 100644
+--- a/docs/EPG_IMPLEMENTATION_REPORT.md
++++ b/docs/EPG_IMPLEMENTATION_REPORT.md
+@@ -570,3 +570,11 @@ synthetic_logo_1.png, hardware_synthetic_logo.json a .log.
+ Jde nadále o syntetickou DSRV injekci, nikoli ověření příjmu z éteru.
+ 
+ Uživatel potvrdil, že závěrečné PAD Adam7 logo je celé a správně vykreslené.
++
++
++## EPG LIVE UTC/LTO, SI-only a archiv (25. 10. 2026)
++
++Lokální opravy, plná hostitelská sada a esp32dev build PASS; nový firmware
++nebyl nahrán ani HW testován. Podrobné změny, T01–T18, paměť a aktuální hash:
++[EPG_LIVE_TIME_REPORT_20261025.md](EPG_LIVE_TIME_REPORT_20261025.md).
++Historické výsledky výše zůstávají vázané na své původní buildy.
+diff --git a/src/dab_spi_probe.h b/src/dab_spi_probe.h
+index 9648a16..765b312 100644
+--- a/src/dab_spi_probe.h
++++ b/src/dab_spi_probe.h
+@@ -113,6 +113,8 @@ class Probe {
+     return true;
+   }
+ 
++  void productionBaseline(uint32_t now) { if(state==State::Baseline) nextActionMs=now+500U; }
++
+   void stop(uint32_t now) {
+     cancel_ = true;
+     if (state == State::Baseline || state == State::StartRequested) finish();
+diff --git a/src/epg_core.cpp b/src/epg_core.cpp
+index 9daf677..db6627a 100644
+--- a/src/epg_core.cpp
++++ b/src/epg_core.cpp
+@@ -68,17 +68,20 @@ bool parseIso(const char* text, uint32_t& utc, int16_t& offset) {
+ static uint32_t bits(Bytes p, unsigned offset, unsigned count) {
+   uint32_t v=0; for(unsigned i=0;i<count;++i) v=(v<<1)|((p[(offset+i)/8]>>(7-(offset+i)%8))&1); return v;
+ }
+-bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& off) {
++bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& off, bool& ltoPresent) {
+   if(n<4) return false;
+-  const bool longForm=bits(p,18,1), lto=bits(p,19,1);
++  const bool longForm=bits(p,20,1), lto=bits(p,19,1);
+   const unsigned len=longForm?6:4;
+   if(n!=len+(lto?1:0) || (lto && (p[len]&31)>28)) return false;
+-  const uint32_t mjd=bits(p,1,17); const unsigned h=bits(p,20,5), m=bits(p,25,6), s=longForm?bits(p,31,6):0;
+-  if(mjd<40587 || h>23 || m>59 || s>59) return false;
++  const uint32_t mjd=bits(p,1,17); const unsigned h=bits(p,21,5), m=bits(p,26,6), s=longForm?bits(p,32,6):0;
++  if(mjd<40587 || mjd>99999 || h>23 || m>59 || s>59) return false;
+   const uint64_t seconds=uint64_t(mjd-40587)*86400+h*3600+m*60+s;
+   if(seconds>UINT32_MAX) return false;
+   off=lto?int16_t((p[len]&31)*30*((p[len]&32)?-1:1)):0;
+-  utc=uint32_t(seconds); return true;
++  utc=uint32_t(seconds); ltoPresent=lto; return true;
++}
++bool timePoint(Bytes p,size_t n,uint32_t& utc,int16_t& off) {
++  bool present=false;return timePoint(p,n,utc,off,present);
+ }
+ bool bearerValue(Bytes p, size_t n, uint64_t& out) {
+   // DAB ID: top two flags, SCIdS, ECC, EId, 16/32-bit SId (TS 102 371 fig.4).
+@@ -232,23 +235,49 @@ void Core::clearCache() {
+   context_=0; activateContext();
+ }
+ void Core::reset() {
+-  identityConflict=false;
++  identityConflict=false; transportSeen_=false; transportTouched_=0; archiveDay_=clockDay_=0; acquisitionTid_=acquisitionSkip_=0; acquisitionAt_=0;
+   stats=Stats{}; entryCount_=serviceCount_=0; directoryHash_=0; browseOffset_=0; focus_=0;
+   dirAssembly_.reset(); bodyAssembly_.reset(); phase_=0; clearCache();
+ }
++uint32_t Core::selectionDay(uint64_t bearer,uint32_t utc,int16_t off) const {
++  int64_t civil=int64_t(utc)+int32_t(off)*60;
++  uint32_t day=utc && civil>=0?uint32_t(civil/86400):day_;
++  if(archiveDay_) return archiveDay_/86400;
++  if(liveMode_) {
++    bool covers=false; uint32_t first=UINT32_MAX;
++    for(size_t i=0;i<entryCount_;++i) {
++      const Entry& e=entries_[i];
++      if(e.type!=7 || e.subtype!=1 || e.bearer!=bearer || !e.start) continue;
++      const int64_t start=int64_t(e.start)+int32_t(e.startLto)*60;
++      const int64_t end=e.stop?int64_t(e.stop)+int32_t(e.stopLto)*60:start+86400;
++      if(start<0) continue;
++      if(start/86400<first) first=uint32_t(start/86400);
++      if(start<int64_t(day+1)*86400 && end>int64_t(day)*86400) covers=true;
++    }
++    // Browse original archive dates, while now_ remains the real clock.
++    if(!covers && first!=UINT32_MAX) day=first;
++  }
++  return day;
++}
+ void Core::select(uint64_t bearer, uint32_t utc, int16_t off) {
+   if(bearer!=selected_) browseOffset_=0;
+-  const uint32_t day=uint32_t((int64_t(utc)+int32_t(off)*60)/86400+browseOffset_);
+-  if(bearer!=selected_ || day!=day_) { selected_=bearer; day_=day; activateContext(); }
+-  now_=utc; offset_=off;
++  if(utc && int64_t(utc)+int32_t(off)*60>=0) clockDay_=uint32_t((int64_t(utc)+int32_t(off)*60)/86400);
++  const int64_t base=selectionDay(bearer,utc,off);
++  const int64_t target=base+browseOffset_;
++  const uint32_t day=target>=0 && target<=UINT32_MAX/86400?uint32_t(target):uint32_t(base);
++  if(bearer!=selected_ || day!=day_) { selected_=bearer; day_=day; acquisitionTid_=acquisitionSkip_=0; activateContext(); }
++  if(utc) now_=utc;
++  offset_=off;
+ }
+ void Core::setTime(uint32_t utc, int16_t off) { browseOffset_=0; select(selected_,utc,off); }
+ void Core::browseDay(int delta) {
+   const int next=browseOffset_+delta;
+   if(next < -7 || next > 7 || !delta) return;
+-  browseOffset_=next;
+-  day_=uint32_t((int64_t(now_)+int32_t(offset_)*60)/86400+browseOffset_);
+-  activateContext();
++  browseOffset_=next; select(selected_,now_,offset_);
++}
++bool Core::archivePreview(uint32_t date) {
++  if(date && date%86400) return false;
++  archiveDay_=date; browseOffset_=0; select(selected_,now_,offset_); ++revision; return true;
+ }
+ bool Core::selectSid(uint32_t sid) {
+   uint64_t match=0;
+@@ -284,7 +313,9 @@ bool Core::header(Bytes p, size_t n, Entry& e, size_t& used) const {
+     if((tag&63)==0x27) bearerValue(p+pos,length,e.bearer);
+     if((tag&63)==0x25 || (tag&63)==0x26) {
+       uint32_t value=0; int16_t lto=0;
+-      if(timePoint(p+pos,length,value,lto)) { if((tag&63)==0x25) { e.start=value; e.startLto=lto; } else { e.stop=value; e.stopLto=lto; } }
++      bool present=false;
++      if(timePoint(p+pos,length,value,lto,present)) { if((tag&63)==0x25) { e.start=value; e.startLto=lto; e.startLtoPresent=present; } else { e.stop=value; e.stopLto=lto; e.stopLtoPresent=present; } }
++      else return false;
+     }
+     pos+=length;
+   }
+@@ -307,7 +338,7 @@ bool Core::directory(Bytes p, size_t n) {
+   for(size_t i=0;i<count;++i) { Entry e; size_t used=0; e.tid=be16(p+pos); header(p+pos+2,n-pos-2,e,used); entries_[i]=e; pos+=2+used; }
+   for(size_t i=0;i<count;++i) if(entries_[i].start && !entries_[i].stop)
+     for(size_t j=0;j<count;++j) if(entries_[j].bearer==entries_[i].bearer && entries_[j].start>entries_[i].start &&
+-       (!entries_[i].stop || entries_[j].start<entries_[i].stop)) { entries_[i].stop=entries_[j].start; entries_[i].stopLto=entries_[j].startLto; }
++       (!entries_[i].stop || entries_[j].start<entries_[i].stop)) { entries_[i].stop=entries_[j].start; entries_[i].stopLto=entries_[j].startLto; entries_[i].stopLtoPresent=entries_[j].startLtoPresent; }
+   const uint32_t period=(uint32_t(p[6])<<16)|(uint32_t(p[7])<<8)|p[8];
+   const uint64_t timeout=uint64_t(period)*300+60000;
+   assemblyTimeoutMs_=period?uint32_t(timeout>1800000?1800000:timeout<120000?120000:timeout):300000;
+@@ -339,22 +370,94 @@ static bool pngValid(Bytes p,size_t n) {
+   }
+   return false;
+ }
+-uint16_t Core::wanted() const {
+-  if(focus_) return focus_;
+-  // Acquire one relevant object across carousel turns. Other bodies are drained,
+-  // not allowed to evict missing segments of the requested object.
+-  if(!serviceCount_) for(size_t i=0;i<entryCount_;++i) if(entries_[i].type==7 && entries_[i].subtype==0 && entries_[i].epoch!=cacheEpoch_ &&
+-      (!entries_[i].start || !now_ || (entries_[i].start<=now_ && entries_[i].stop>now_))) return entries_[i].tid;
++bool Core::hasPI() const {
++  for(size_t i=0;i<entryCount_;++i) if(entries_[i].type==7 && entries_[i].subtype==1 && entries_[i].bearer==selected_) return true;
++  return false;
++}
++bool Core::scheduleRange(uint32_t& first,uint32_t& last) const {
++  first=UINT32_MAX; last=0;
++  for(size_t i=0;i<entryCount_;++i) {
++    const Entry& e=entries_[i];
++    if(e.type!=7 || e.subtype!=1 || e.bearer!=selected_ || !e.start) continue;
++    const int64_t start=int64_t(e.start)+int32_t(e.startLto)*60;
++    const int64_t stop=e.stop?int64_t(e.stop)+int32_t(e.stopLto)*60:start+86400;
++    if(start<0 || stop<=0 || stop>UINT32_MAX) continue;
++    if(uint32_t(start)<first) first=uint32_t(start);
++    if(uint32_t(stop)>last) last=uint32_t(stop);
++  }
++  return last>first;
++}
++bool Core::scheduleDateValid() const {
++  if(!now_) return false;
++  const int64_t start=int64_t(clockDay_)*86400, end=start+86400;
+   for(size_t i=0;i<entryCount_;++i) {
+     const Entry& e=entries_[i];
+-    if(e.type==7 && e.subtype==1 && e.bearer==selected_ && e.epoch!=cacheEpoch_ &&
+-       (!e.start || (int64_t(e.start)+int32_t(e.startLto)*60<int64_t(day_+1)*86400 &&
+-                    (!e.stop || int64_t(e.stop)+int32_t(e.stopLto)*60>int64_t(day_)*86400)))) return e.tid;
++    if(e.type==7 && e.subtype==1 && e.bearer==selected_ && e.start &&
++       int64_t(e.start)+int32_t(e.startLto)*60<end &&
++       (!e.stop || int64_t(e.stop)+int32_t(e.stopLto)*60>start)) return true;
+   }
++  // Unscoped PI: prove date coverage from the cached original intervals.
++  for(size_t i=0;i<viewCount_;++i) {
++    const auto& p=at(i);const int64_t local=int64_t(p.start)+int32_t(p.lto)*60;
++    if(!p.uncertain && local<end && local+p.duration>start) return true;
++  }
++  return false;
++}
++uint64_t Core::findStation(uint32_t sid,uint16_t eid,uint8_t ecc,int scids,bool& conflict) const {
++  conflict=false; uint64_t match=0;
++  auto consider=[&](uint64_t b,bool bad) {
++    if(!b || b>0xffffffffffffULL || (uint8_t(b>>40)&0x10) || uint16_t(b)!=sid ||
++       uint16_t(b>>16)!=eid || uint8_t(b>>32)!=ecc || (scids>=0 && int((b>>48)&15)!=scids)) return;
++    if(bad || (match && match!=b)) conflict=true;
++    match=b;
++  };
++  for(size_t i=0;i<entryCount_;++i) consider(entries_[i].bearer,false);
++  for(size_t i=0;i<serviceCount_;++i) consider(services_[i].bearer,services_[i].conflict);
++  return conflict?0:match;
++}
++Availability Core::availability(bool present) const {
++  if(ambiguous()) return Availability::IdentityConflict;
++  if(!present) return Availability::NoSpi;
++  if(!stats.directories) return Availability::WaitDirectory;
++  if(!entryCount_) return Availability::DirectoryEmpty;
++  if(!selected_) return Availability::PendingIdentity;
++  if(!hasPI()) return hasSI()?Availability::SiOnly:Availability::PendingIdentity;
++  if(!clockTrusted_) return Availability::TimeUnknown;
++  if(archiveDay_ || (liveMode_ && !scheduleDateValid())) {
++    for(size_t i=0;i<entryCount_;++i) if(entries_[i].bearer==selected_ && entries_[i].type==7 && entries_[i].subtype==1 && entries_[i].seen) return Availability::PiDateStale;
++    return Availability::PiLoading;
++  }
++  if(fresh() && (current()>=0 || next()>=0)) return Availability::ReadyLive;
++  return Availability::PiLoading;
++}
++const char* availabilityName(Availability state) {
++  static const char* const names[]={"NO_SPI","SPI_PRESENT_WAIT_DIR","DIRECTORY_EMPTY","PENDING_IDENTITY","SI_ONLY","PI_DECLARED_LOADING","PI_DATE_STALE","READY_LIVE","IDENTITY_CONFLICT","TIME_UNKNOWN"};
++  return names[unsigned(state)];
++}
++uint16_t Core::wanted() {
++  if(focus_) return focus_;
++  if(bodyAssembly_.active && uint32_t(monotonicMs_-bodyAssembly_.touched)<=5000U) return bodyAssembly_.tid;
++  // PI first, but a missing object cannot starve SI/logo on every rotation.
++  // One bounded assembly; after five seconds without completion rotate priority.
++  unsigned best=80;int bestScore=100;
+   const Service* s=station();
+-  if(s && !s->conflict && s->png && !logoSize())
+-    for(size_t i=0;i<entryCount_;++i) if(entries_[i].type==2 && entries_[i].subtype==3 && !strcmp(entries_[i].name,s->logo)) return entries_[i].tid;
+-  return 0;
++  for(size_t j=0;j<entryCount_;++j) {
++    const size_t i=(j+acquisitionSkip_)%entryCount_;const Entry& e=entries_[i];
++    if(e.type&128 || e.size>kObjectBytes || (e.seen && e.epoch==cacheEpoch_)) continue;
++    int score=100;
++    if(e.type==7 && e.subtype==1 && e.bearer==selected_ && !ambiguous()) {
++      const bool matches=!e.start || (int64_t(e.start)+int32_t(e.startLto)*60<int64_t(day_+1)*86400 && (!e.stop || int64_t(e.stop)+int32_t(e.stopLto)*60>int64_t(day_)*86400));
++      if(matches) score=0;
++    }
++    if(e.type==7 && e.subtype==0) score=1;
++    if(e.type==2 && e.subtype==3 && s && !s->conflict && s->png && !logoSize() && !strcmp(e.name,s->logo)) score=2;
++    if(e.tid==acquisitionTid_ && uint32_t(monotonicMs_-acquisitionAt_)>5000U) score=99;
++    if(score<bestScore) {best=unsigned(i);bestScore=score;}
++  }
++  const uint16_t tid=best<entryCount_ && bestScore<99?entries_[best].tid:0;
++  if(!tid && acquisitionTid_) { acquisitionTid_=0; acquisitionAt_=monotonicMs_; acquisitionSkip_=uint16_t((acquisitionSkip_+1)% (entryCount_?entryCount_:1)); bodyAssembly_.reset(); return wanted(); }
++  if(tid!=acquisitionTid_) {acquisitionTid_=tid;acquisitionAt_=monotonicMs_;}
++  return tid;
+ }
+ Feed Core::feed(Bytes p, size_t n, uint32_t now) {
+   if(busy()) { ++stats.busy; return Feed::Busy; }
+@@ -379,6 +482,7 @@ Feed Core::feed(Bytes p, size_t n, uint32_t now) {
+   stats.lastMotRepetition=p[pos]>>5;
+   const size_t length=be16(p+pos)&8191; pos+=2;
+   if(length!=n-2-pos || !length) { ++stats.invalid; return Feed::Rejected; }
++  transportSeen_=true;transportTouched_=now;
+   Assembly& a=type==6?dirAssembly_:bodyAssembly_;
+   Buffer buffer=type==6?directory_:body_; const size_t cap=type==6?kDirectoryBytes:kObjectBytes;
+   size_t index=0;
+@@ -392,7 +496,13 @@ Feed Core::feed(Bytes p, size_t n, uint32_t now) {
+       if(!fresh()) ++revision;
+       contexts_[context_].touched=now;
+     }
+-    if(tid!=wanted()) return Feed::Accepted;
++    if(tid!=wanted()) {
++      const Entry& e=entries_[index];const Service* s=station();
++      const bool si=e.type==7 && e.subtype==0;
++      const bool logo=e.type==2 && e.subtype==3 && s && !s->conflict && s->png && !strcmp(s->logo,e.name) && !logoSize();
++      // Consume available metadata while the preferred PI has not begun.
++      if(focus_ || bodyAssembly_.active || (!si && !logo)) return Feed::Accepted;
++    }
+     if(entries_[index].seen && entries_[index].epoch==cacheEpoch_) { ++stats.duplicate; return Feed::Accepted; }
+   }
+   const int result=a.add(tid,segment&32767,(segment&32768)!=0,p+pos,uint16_t(length),buffer,cap,now,stats);
+@@ -473,8 +583,8 @@ void Core::cache(const Programme& p) {
+   }
+   rebuildView();
+   if(count_==kMaxProgrammes || titleBytes>kTextBytes-textUsed_) { limited=true; return; }
+-  CachedProgramme c; c.start=p.start; c.duration=p.duration; c.actual=p.actual;
+-  c.actualDuration=p.actualDuration; c.id=p.id; c.version=p.version; c.lto=p.lto; c.uncertain=p.uncertain || !p.duration;
++  CachedProgramme c{}; c.start=p.start; c.duration=p.duration; c.actual=p.actual;
++  c.actualDuration=p.actualDuration; c.id=p.id; c.version=p.version; c.lto=p.lto; c.uncertain=p.uncertain || !p.duration; c.ltoPresent=p.ltoPresent; c.actualLto=p.actualLto; c.actualLtoPresent=p.actualLtoPresent;
+   c.context=context_;
+   c.title=store(p.name); c.description=store(p.description);
+   if(!c.title) return;
+@@ -485,10 +595,14 @@ void Core::cache(const Programme& p) {
+   ++revision;
+ }
+ void Core::service(const Service& s) {
+-  if(!s.bearer || !s.name[0]) return;
++  if(!s.bearer || (!s.name[0] && !s.shortName[0])) return;
+   if(observer.service) observer.service(observer.user,entries_[objectIndex_].tid,s);
+   for(size_t i=0;i<serviceCount_;++i) if(services_[i].bearer==s.bearer) {
+-    if(strcmp(services_[i].name,s.name)) { services_[i].conflict=true; if(s.bearer==selected_) clearCache(); }
++    if(strcmp(services_[i].name,s.name)) { services_[i].conflict=true; if(s.bearer==selected_) {logoBytes_=0;viewCount_=0;++revision;} }
++    if(!services_[i].conflict) {
++      if(strcmp(services_[i].logo,s.logo) && selected_==s.bearer) {logoBytes_=0;++revision;}
++      services_[i]=s;
++    }
+     return;
+   }
+   if(serviceCount_==16) { limited=true; return; }
+@@ -497,7 +611,7 @@ void Core::service(const Service& s) {
+   if(s.bearer==selected_) for(size_t i=0;i<entryCount_;++i) if(!strcmp(entries_[i].name,s.logo)) entries_[i].epoch=0;
+ }
+ void Core::close(uint8_t tag) {
+-  if(tag==0x28 && rootService_) service(service_);
++  if(tag==0x28 && rootService_) {if(!service_.name[0]) snprintf(service_.name,sizeof(service_.name),"%s",service_.shortName);service(service_);}
+   if(tag==0x1c || tag==0x2e) {
+     Programme& p=programme_[tag==0x2e?1:0];
+     if(!p.name[0]) snprintf(p.name,sizeof(p.name),"%s",p.medium[0]?p.medium:p.shortName);
+@@ -527,12 +641,12 @@ void Core::attribute(uint8_t tag,Bytes p,size_t n) {
+   }
+   if(parent==0x2c || parent==0x2f) {
+     if(tag==0x80 || tag==0x82) {
+-      uint32_t seconds=0; int16_t offset=0;
+-      bool valid=parent==0x2c?timePoint(p,n,seconds,offset):(n<=4 && programmeDepth_==2 && programme_[0].start && value<=604800);
++      uint32_t seconds=0; int16_t offset=0; bool present=false;
++      bool valid=parent==0x2c?timePoint(p,n,seconds,offset,present):(n<=4 && programmeDepth_==2 && programme_[0].start && value<=604800);
+       if(valid) {
+-        if(parent==0x2f) { seconds=programme_[0].start+value; offset=programme_[0].lto; }
+-        if(tag==0x82) prog.actual=seconds;
+-        else { if(prog.start && prog.start!=seconds) prog.uncertain=true; else { prog.start=seconds; prog.lto=offset; } }
++        if(parent==0x2f) { const uint64_t relative=uint64_t(programme_[0].start)+value; if(relative>UINT32_MAX) {prog.uncertain=true;return;} seconds=uint32_t(relative); offset=programme_[0].lto; present=programme_[0].ltoPresent; }
++        if(tag==0x82) {prog.actual=seconds;prog.actualLto=offset;prog.actualLtoPresent=present;}
++        else { if(prog.start && prog.start!=seconds) prog.uncertain=true; else { prog.start=seconds; prog.lto=offset; prog.ltoPresent=present; } }
+       } else { prog.uncertain=true; if(n<=sizeof(prog.rejectedTime)) { p.copyTo(prog.rejectedTime,n); prog.rejectedTimeLength=uint8_t(n); } }
+     }
+     if(tag==0x81) { if(n==2) prog.duration=value; else prog.uncertain=true; }
+@@ -591,7 +705,8 @@ void Core::pump(unsigned budget) {
+       if(phase_==2) {
+         Programme& p=programme_[programmeDepth_==2?1:0];
+         char* dest=nullptr; size_t cap=0;
+-        if(rootService_ && (parent==0x10 || parent==0x11 || parent==0x12)) { dest=service_.name; cap=sizeof(service_.name); }
++        if(rootService_ && parent==0x10) {dest=service_.shortName;cap=sizeof(service_.shortName);}
++        else if(rootService_ && (parent==0x11 || parent==0x12)) { dest=service_.name; cap=sizeof(service_.name); }
+         else if(parent==0x10) { dest=p.shortName; cap=sizeof(p.shortName); }
+         else if(parent==0x11) { dest=p.medium; cap=sizeof(p.medium); }
+         else if(parent==0x12) { dest=p.name; cap=sizeof(p.name); }
+@@ -608,6 +723,7 @@ void Core::pump(unsigned budget) {
+         if(tag==0x28 && rootService_) service_=Service{};
+         if(tag==0x2b && rootService_) { service_.png=false; service_.logo[0]=0; }
+         if(rootService_ && (tag==0x11 || tag==0x12)) service_.name[0]=0;
++        if(rootService_ && tag==0x10) service_.shortName[0]=0;
+         if(tag==0x1c || tag==0x2e) { programmeDepth_=tag==0x1c?1:2; Programme& p=programme_[programmeDepth_-1]; p=Programme{}; p.bearer=scope_; p.event=tag==0x2e; }
+         if(tag==0x1b) programme_[programmeDepth_==2?1:0].description[0]=0;
+       }
+@@ -616,7 +732,7 @@ void Core::pump(unsigned budget) {
+ }
+ int Core::current(bool* overlap) const {
+   int chosen=-1; unsigned active=0;
+-  if(now_ && fresh() && !ambiguous()) for(size_t i=0;i<viewCount_;++i) {
++  if(now_ && clockTrusted_ && !archiveDay_ && fresh() && !ambiguous() && (!liveMode_ || scheduleDateValid())) for(size_t i=0;i<viewCount_;++i) {
+     const auto& p=at(i);
+     if(p.uncertain) continue;
+     // Explicit policy: original planned interval, latest start wins, then lower ID.
+@@ -628,7 +744,7 @@ int Core::current(bool* overlap) const {
+   return chosen;
+ }
+ int Core::next() const {
+-  if(!now_ || !fresh() || ambiguous()) return -1;
++  if(!now_ || !clockTrusted_ || archiveDay_ || !fresh() || ambiguous() || (liveMode_ && !scheduleDateValid())) return -1;
+   for(size_t i=0;i<viewCount_;++i) if(!at(i).uncertain && at(i).start>now_) return int(i);
+   return -1;
+ }
+diff --git a/src/epg_core.h b/src/epg_core.h
+index cca0c21..b222bed 100644
+--- a/src/epg_core.h
++++ b/src/epg_core.h
+@@ -2,6 +2,7 @@
+ // Bounded, platform-neutral packet MOT/SPI core. ETSI EN 301 234 / TS 102 371.
+ #include <stdint.h>
+ #include <stddef.h>
++#include "epg_time.h"
+ 
+ namespace epg {
+ static const size_t kObjectBytes = 12288, kDirectoryBytes = 4096;
+@@ -62,6 +63,7 @@ uint32_t crc32(Bytes p, size_t n);
+ uint32_t epoch(int year, unsigned month, unsigned day, unsigned hour=0, unsigned minute=0, unsigned second=0);
+ void calendar(uint32_t seconds, int& year, unsigned& month, unsigned& day);
+ bool parseIso(const char* text, uint32_t& utc, int16_t& offsetMinutes);
++bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& offsetMinutes, bool& ltoPresent);
+ bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& offsetMinutes);
+ bool bearerValue(Bytes p, size_t n, uint64_t& out);
+ 
+@@ -70,13 +72,14 @@ struct Programme {
+   uint32_t start=0, duration=0, actual=0, actualDuration=0, id=0;
+   uint16_t version=0;
+   int16_t lto=0;
+-  bool event=false, uncertain=false;
++  bool event=false, uncertain=false, ltoPresent=false, actualLtoPresent=false;
++  int16_t actualLto=0;
+   uint8_t rejectedTime[7]={}, rejectedTimeLength=0;
+   char name[128]={}, medium[64]={}, shortName[32]={}, description[512]={}, crid[64]={};
+ };
+ struct Service {
+   uint64_t bearer=0;
+-  char name[48]={}, logo[32]={};
++  char name[48]={}, logo[32]={}, shortName[17]={};
+   bool conflict=false, png=false;
+ };
+ struct Entry {
+@@ -85,14 +88,15 @@ struct Entry {
+   uint16_t tid=0, subtype=0, epoch=0;
+   int16_t startLto=0, stopLto=0;
+   uint8_t type=0;
+-  bool seen=false;
++  bool seen=false, startLtoPresent=false, stopLtoPresent=false;
+   char name[32]={};
+ };
+ struct CachedProgramme {
+   uint32_t start=0, duration=0, actual=0, actualDuration=0, id=0;
+   uint16_t title=0, description=0, version=0;
+   int16_t lto=0;
+-  bool uncertain=false;
++  int16_t actualLto=0;
++  uint8_t uncertain:1, ltoPresent:1, actualLtoPresent:1;
+   uint8_t context=0;
+ };
+ struct Stats {
+@@ -108,6 +112,11 @@ struct Observer {
+   void (*service)(void*, uint16_t, const Service&)=nullptr;
+   void (*object)(void*, uint16_t, uint8_t, Bytes, size_t)=nullptr;
+ };
++enum class Availability : uint8_t {
++  NoSpi, WaitDirectory, DirectoryEmpty, PendingIdentity, SiOnly,
++  PiLoading, PiDateStale, ReadyLive, IdentityConflict, TimeUnknown
++};
++const char* availabilityName(Availability state);
+ enum class Feed : uint8_t { Accepted, Busy, Rejected };
+ struct Assembly {
+   uint16_t tid=0, stride=0, last=0xffff, lengths[32]={};
+@@ -148,6 +157,20 @@ class Core {
+   int16_t offset() const { return offset_; }
+   const Service* station() const;
+   bool ambiguous() const;
++  uint64_t findStation(uint32_t sid,uint16_t eid,uint8_t ecc,int scids,bool& conflict) const;
++  bool hasPI() const;
++  bool hasSI() const { return station()!=nullptr; }
++  bool scheduleRange(uint32_t& start,uint32_t& end) const;
++  bool scheduleDateValid() const;
++  Availability availability(bool spiPresent) const;
++  void setLive(bool live) { liveMode_=live; }
++  void setClockTrusted(bool valid) { if(clockTrusted_!=valid) {clockTrusted_=valid;++revision;} }
++  bool clockTrusted() const { return clockTrusted_; }
++  bool transportFresh() const {return transportSeen_ && uint32_t(monotonicMs_-transportTouched_)<=900000U;}
++  bool archivePreview(uint32_t localDay); // 0 disables; never changes UTC or PI
++  bool archivePreview() const { return archiveDay_!=0; }
++  bool archived() const { return liveMode_ && !scheduleDateValid() && hasPI(); }
++  uint32_t clockLocalDay() const { return clockDay_*86400U; }
+   Feed feed(Bytes data, size_t size, uint32_t nowMs);
+   void pump(unsigned budget=48);
+   void expire(uint32_t nowMs);
+@@ -159,7 +182,7 @@ class Core {
+   int current(bool* overlapping=nullptr) const;
+   int next() const;
+   Bytes logo() const { return logoSize() ? Bytes(logo_) : Bytes(); }
+-  size_t logoSize() const { return logoBearer_==selected_ ? logoBytes_ : 0; }
++  size_t logoSize() const { return logoBearer_==selected_ && !ambiguous() ? logoBytes_ : 0; }
+   bool fresh() const { return contexts_[context_].haveData && uint32_t(monotonicMs_-contexts_[context_].touched)<=900000U; }
+   bool limited=false, identityConflict=false;
+   uint32_t revision=0;
+@@ -191,7 +214,12 @@ class Core {
+   int16_t offset_=0;
+   int browseOffset_=0;
+   uint16_t cacheEpoch_=1, nextEpoch_=1, focus_=0;
+-  uint16_t wanted() const;
++  uint16_t wanted();
++  bool liveMode_=false, clockTrusted_=true, transportSeen_=false;
++  uint32_t transportTouched_=0;
++  uint32_t clockDay_=0, archiveDay_=0, acquisitionAt_=0;
++  uint16_t acquisitionTid_=0, acquisitionSkip_=0;
++  uint32_t selectionDay(uint64_t bearer,uint32_t utc,int16_t offset) const;
+   struct Level { size_t end; uint8_t tag; } stack_[24];
+   struct Token { uint16_t offset=0, length=0; } tokens_[32];
+   size_t position_=0, objectLength_=0;
+diff --git a/src/epg_runtime.cpp b/src/epg_runtime.cpp
+index b8c72e2..d8da334 100644
+--- a/src/epg_runtime.cpp
++++ b/src/epg_runtime.cpp
+@@ -14,6 +14,9 @@ namespace epg {
+ static Core* core=nullptr;
+ static UartReceiver receiver;
+ static bool replay=false, demo=false;
++static ResolvedClock liveClock;
++static bool clockLost=false;
++static uint32_t lostClockGeneration=0;
+ static uint32_t activity=0;
+ static unsigned demoIndex=0;
+ static bool snapshotFm=false;
+@@ -67,8 +70,10 @@ Core* runtime() { return core; }
+ bool replayActive() { return replay; }
+ // UART replay has its own discovery state; never alter the live radio probe.
+ bool indicatorPresent() { return replay ? core && core->stats.directories!=0 : radio.spiPresent() || padSid!=0; }
++Availability availability() {return core?core->availability(indicatorPresent()):(indicatorPresent()?Availability::WaitDirectory:Availability::NoSpi);}
++ResolvedClock clockStatus() {return liveClock;}
+ IndicatorState indicatorState() {
+-  if(core && core->count() && core->fresh() && !core->ambiguous()) return IndicatorState::Ready;
++  if(core && availability()==Availability::ReadyLive) return IndicatorState::Ready;
+   return indicatorPresent()?IndicatorState::Present:IndicatorState::Absent;
+ }
+ bool liveEnabled() { return core && !replay; }
+@@ -99,26 +104,21 @@ bool ensure(bool reportFailure) {
+   return core!=nullptr;
+ }
+ static void resetLiveCore() {
+-  if(core) { core->reset(); core->select(0,0,0); EpgInvalidate(); }
++  if(core) { core->reset(); core->setLive(true); core->setClockTrusted(false); core->select(0,0,0); EpgInvalidate(); }
+ }
+ void liveReset() {
+-  clearInjection();
++  clearInjection();clockLost=false;liveClock=ResolvedClock{};
+   if(replay) { replay=demo=false; pendingSid=0; receiver.reset(); EpgClose(false); }
+   endpointSid=endpointCid=padSid=padCid=0;
+   resetLiveCore();
+ }
+ void liveContext(uint32_t sid,uint16_t eid,uint8_t ecc,uint32_t utc) {
+   if(!core || replay) return;
+-  uint64_t match=0; bool conflict=false;
+-  for(size_t i=0;i<core->entryCount();++i) {
+-    const uint64_t b=core->entries()[i].bearer;
+-    if(!b || b>0xffffffffffffULL || (uint8_t(b>>40)&0x10) || uint16_t(b)!=sid || ((b>>16)&0xffff)!=eid || ((b>>32)&255)!=ecc) continue;
+-    if(match && match!=b) { match=0; conflict=true; break; }
+-    match=b;
+-  }
+-  // FIC supplies UTC; SI programme LTO is used for local presentation when known.
+-  int16_t offset=core->count()?core->at(0).lto:core->offset();
+-  core->select(match,utc,offset); core->identityConflict=conflict;
++  bool conflict=false;
++  // SCIdS is not separately exposed; reject multiple matching bearers.
++  const uint64_t match=core->findStation(sid,eid,ecc,-1,conflict);
++  core->select(match,utc,liveClock.offsetKnown?liveClock.offset:0); core->identityConflict=conflict;
++
+ }
+ void liveEndpoint(uint32_t sid,uint32_t cid) {
+   if(replay) return;
+@@ -136,16 +136,16 @@ void livePayload(const uint8_t* data,size_t n) { if(core && !replay && !padSid)
+ void livePadPayload(const uint8_t* data,size_t n) { if(core && !replay && padSid) core->feed(data,n,millis()); }
+ void stopReplay() {
+   clearInjection();
+-  replay=demo=false; pendingSid=0; receiver.reset();
++  replay=demo=false; pendingSid=0; receiver.reset(); liveClock=ResolvedClock{};
+   endpointSid=endpointCid=padSid=padCid=0;
+-  if(core) { core->reset(); core->select(0,0,0); }
++  if(core) { core->reset(); core->setLive(true); core->setClockTrusted(false); core->select(0,0,0); }
+   EpgClose();
+ }
+ static uint32_t radioSid() { return radio.ServiceStart && radio.ServiceIndex<radio.numberofservices ? radio.service[radio.ServiceIndex].ServiceID:0; }
+ static void startReplay() {
+   clearInjection();
+   endpointSid=endpointCid=padSid=padCid=0;
+-  core->reset(); replay=true; demo=false; activity=millis(); receiver.reset();
++  core->reset(); core->setLive(false); core->setClockTrusted(true); replay=true; demo=false; activity=millis(); receiver.reset();
+   snapshotFm=radio.isFm(); snapshotFreq=dabfreq; snapshotSid=radioSid();
+   core->select(0x40e231533233ULL,epoch(2024,11,12,3,30),60);
+ }
+@@ -170,15 +170,18 @@ void poll() {
+     if(!core->selectSid(pendingSid)) diagSerial.println("EPG ERROR STATION unknown or ambiguous after SI");
+     pendingSid=0; EpgInvalidate();
+   }
++  if(!replay && (radio.isFm() || !radio.ServiceStart || !radio.signallock)) {
++    clockLost=true;lostClockGeneration=radio.broadcastClock().generation;
++    liveClock=ResolvedClock{};core->setClockTrusted(false);
++  }
+   if(!replay && !radio.isFm() && radio.ServiceStart) {
+     char* end=nullptr; const unsigned eid=strtoul(radio.EID,&end,16);
+-    static uint32_t timeGeneration=0, timeMillis=0, timeUtc=0;
+-    if(radio.timeSampleGeneration()!=timeGeneration) {
+-      timeGeneration=radio.timeSampleGeneration(); timeMillis=nowMs;
+-      timeUtc=radio.Year>=2020?epoch(radio.Year,radio.Months,radio.Days,radio.Hours,radio.Minutes,radio.Seconds):0;
+-    }
+-    const uint32_t utc=timeUtc && uint32_t(nowMs-timeMillis)<300000U?timeUtc+(nowMs-timeMillis)/1000:0;
+-    liveContext(radioSid(),uint16_t(eid),uint8_t(radio.ensembleEcc),utc);
++    const auto& clock=radio.broadcastClock();
++    if(!radio.signallock) {clockLost=true;lostClockGeneration=clock.generation;}
++    if(clockLost && clock.generation!=lostClockGeneration) clockLost=false;
++    liveClock=resolveTime(clock,nowMs,radio.signallock && !clockLost);
++    core->setLive(true);core->setClockTrusted(liveClock.utcValid && liveClock.offsetKnown);
++    liveContext(radioSid(),uint16_t(eid),uint8_t(radio.ensembleEcc),liveClock.utcValid?liveClock.utc:0);
+   }
+ }
+ static bool hexValue(const char* text,uint64_t& value) {
+@@ -195,9 +198,25 @@ static void status() {
+   diagSerial.printf("EPG RAM arena=%u free=%u min=%u largest=%u audio=%u SLS=%u UARTdrop=%u rxCRC=%u rxOrder=%u rxIdentity=%u\n",unsigned(Core::memoryBytes()),ESP.getFreeHeap(),ESP.getMinFreeHeap(),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)),radio.ServiceStart,radio.SlideShowAvailable,diagSerial.droppedBytes(),receiver.crcErrors,receiver.orderErrors,receiver.identityErrors);
+   diagSerial.printf("EPG LOGO bytes=%u interlace=%u\n",unsigned(core->logoSize()),core->logoSize()>28?unsigned(core->logo()[28]):0U);
+   diagSerial.printf("EPG POOLS free8=%u largest8=%u free32=%u largest32=%u\n",unsigned(heap_caps_get_free_size(byteCaps)),unsigned(heap_caps_get_largest_free_block(byteCaps)),unsigned(heap_caps_get_free_size(wordCaps)),unsigned(heap_caps_get_largest_free_block(wordCaps)));
++  uint32_t first=0,last=0;core->scheduleRange(first,last);
++  diagSerial.printf("EPG STATE state=%s transportFresh=%u scheduleDateValid=%u serviceHasPI=%u serviceHasSI=%u clockValid=%u sourceStart=%u sourceEnd=%u archive=%u\n",availabilityName(availability()),core->transportFresh(),core->scheduleDateValid(),core->hasPI(),core->hasSI(),core->clockTrusted(),unsigned(first==UINT32_MAX?0:first),unsigned(last),core->archivePreview());
++  const auto& sample=radio.broadcastClock();
++  diagSerial.printf("EPG CLOCK encoding=%u valid=%u offsetKnown=%u offset=%d utc=%u local=%u generation=%u age=%u\n",unsigned(sample.encoding),liveClock.utcValid,liveClock.offsetKnown,int(liveClock.offset),unsigned(liveClock.utc),unsigned(liveClock.local),unsigned(sample.generation),unsigned(millis()-sample.sampledAtMonotonicMs));
+   if(injectDsrv) diagSerial.printf("EPG INJECT path=%s ua=%u accepted=%u legacy=%u rejected=%u blocked=%u\n",injectPad?"PAD":"MSC",injectUa,unsigned(injectAccepted),unsigned(injectLegacy),unsigned(injectRejected),unsigned(injectBlocked));
+ }
+ bool command(char* input) {
++  if(!strncasecmp(input,"EPG ARCHIVE ",12)) {
++    if(!core || replay) {diagSerial.println("EPG ERROR ARCHIVE requires LIVE data");return true;}
++    uint32_t date=0;
++    if(strcasecmp(input+12,"OFF")) {
++      char value[32];uint32_t utc=0;int16_t off=0;
++      if(strlen(input+12)!=10) {diagSerial.println("EPG ERROR ARCHIVE use YYYY-MM-DD or OFF");return true;}
++      snprintf(value,sizeof(value),"%sT00:00:00Z",input+12);
++      if(!parseIso(value,utc,off)) {diagSerial.println("EPG ERROR ARCHIVE date");return true;}
++      date=utc;
++    }
++    core->archivePreview(date);EpgOpen();diagSerial.println(date?"EPG OK ARCHIVE preview; original dates; NOW disabled":"EPG OK ARCHIVE OFF");return true;
++  }
+   if(!strncmp(input,"E1 ",3) || !strncmp(input,"E2 ",3)) {
+     if(!replay || demo || !core) { diagSerial.println("EPG ERROR START required"); return true; }
+     if(diagSerial.availableForWrite()<160) return true; // sender retries; no silent commit
+@@ -215,7 +234,7 @@ bool command(char* input) {
+   if(diagSerial.availableForWrite()<1024) return true;
+   char* arg=input+9; activity=millis();
+   if(!strcasecmp(arg,"HELP")) {
+-    diagSerial.println("EPG OK HELP: DEMO | START [SID FULLCID] | INJECT MSC/PAD [NOSPI] | TIME ISO8601 | STATION HEX | STATUS | STOP | CLEAR");
++    diagSerial.println("EPG OK HELP: ARCHIVE via EPG ARCHIVE YYYY-MM-DD/OFF | DEMO | START [SID FULLCID] | INJECT MSC/PAD [NOSPI] | TIME ISO8601 | STATION HEX | STATUS | STOP | CLEAR");
+     return true;
+   }
+   if(!strcasecmp(arg,"STOP") || !strcasecmp(arg,"CLEAR")) { const bool clear=!strcasecmp(arg,"CLEAR"); stopReplay(); diagSerial.printf("EPG OK %s\n",clear?"CLEAR":"STOP"); return true; }
+diff --git a/src/epg_runtime.h b/src/epg_runtime.h
+index 618626c..912d776 100644
+--- a/src/epg_runtime.h
++++ b/src/epg_runtime.h
+@@ -5,6 +5,8 @@ Core* runtime();
+ bool ensure(bool reportFailure=false);
+ bool replayActive();
+ bool indicatorPresent();
++Availability availability();
++ResolvedClock clockStatus();
+ enum class IndicatorState : uint8_t { Absent, Present, Ready };
+ IndicatorState indicatorState();
+ bool liveEnabled();
+diff --git a/src/epg_ui.cpp b/src/epg_ui.cpp
+index 4324544..2a8b90e 100644
+--- a/src/epg_ui.cpp
++++ b/src/epg_ui.cpp
+@@ -8,11 +8,25 @@ namespace {
+ bool visible=false, suspended=false, dirty=true, fallback=false;
+ unsigned page=0, selected=0, scroll=0, maxScroll=0;
+ uint32_t revision=0, renderedMinute=0;
++epg::Availability renderedState=epg::Availability::NoSpi;
+ unsigned renderedPage=3, renderedSelected=0, renderedFirst=0, renderedLanguage=8;
+ int renderedDay=0;
+ constexpr int listX=8, listTop=34, rowHeight=20;
+ constexpr int titleX=64, titleWidth=232;
+ const char* text(EpgText id) { return epgText[language<8?language:0][id]; }
++EpgText stateText(epg::Availability state) {
++  switch(state) {
++    case epg::Availability::NoSpi:return EPG_UNAVAILABLE;
++    case epg::Availability::WaitDirectory:return EPG_WAIT_DIRECTORY;
++    case epg::Availability::DirectoryEmpty:return EPG_DIRECTORY_EMPTY;
++    case epg::Availability::PendingIdentity:return EPG_WAIT_SI;
++    case epg::Availability::SiOnly:return EPG_SI_ONLY;
++    case epg::Availability::PiDateStale:return EPG_ARCHIVE;
++    case epg::Availability::IdentityConflict:return EPG_AMBIGUOUS;
++    case epg::Availability::TimeUnknown:return EPG_CLOCK_UNCERTAIN;
++    default:return EPG_WAIT_PROGRAM;
++  }
++}
+ void restore(int x,int y,int width,int height,const uint16_t* background) {
+   for(int row=0;row<height;++row)
+     tft.pushImage(x,y+row,width,1,background+(y+row)*320+x);
+@@ -80,7 +94,7 @@ void clockText(uint32_t utc,int16_t offset,char* out,size_t n) {
+ }
+ void interval(const epg::Core& c,size_t index,char* out,size_t n) {
+   char first[8],last[8]; const auto& p=c.at(index);
+-  clockText(p.start,p.lto,first,sizeof(first)); clockText(p.start+p.duration,p.lto,last,sizeof(last));
++  clockText(p.start,p.lto,first,sizeof(first)); clockText(uint32_t(uint64_t(p.start)+p.duration),p.lto,last,sizeof(last));
+   const bool overnight=(int64_t(p.start)+p.lto*60)/86400!=(int64_t(p.start)+p.duration+p.lto*60)/86400;
+   snprintf(out,n,"%s - %s%s / %u min%s",first,last,overnight?"+1":"",unsigned(p.duration/60),p.uncertain?" ?":"");
+ }
+@@ -147,6 +161,9 @@ void EpgMove(int step,bool second) {
+ void EpgDraw(bool force) {
+   if(!visible || menu) return;
+   epg::Core* c=epg::runtime();
++  const auto state=epg::availability();
++  const bool stateChanged=state!=renderedState;
++  if(stateChanged) dirty=true;
+   if(!force && !dirty && renderedLanguage==language && (!c || (revision==c->revision && renderedMinute==c->now()/60))) return;
+   // Keep volume stable; its closing path requests one complete EPG repaint.
+   if(setvolume) { dirty=true; return; }
+@@ -154,10 +171,10 @@ void EpgDraw(bool force) {
+   if(!force && uint32_t(millis()-renderedAt)<150U) return;
+   renderedAt=millis();
+   const bool full=force || page!=1 || renderedPage!=page || renderedLanguage!=language;
+-  const bool dataChanged=!c || revision!=c->revision || renderedDay!=c->dayOffset();
++  const bool dataChanged=stateChanged || !c || revision!=c->revision || renderedDay!=c->dayOffset();
+   const bool footerChanged=full || dataChanged || (c && renderedMinute!=c->now()/60);
+   const unsigned oldSelected=renderedSelected, oldFirst=renderedFirst;
+-  dirty=false; fallback=false;
++  dirty=false; fallback=false; renderedState=state;
+   if(c) { revision=c->revision; renderedMinute=c->now()/60; if(selected>=c->count()) selected=c->count()?unsigned(c->count()-1):0; }
+   const uint16_t* bg=EpgBackground(page==1);
+   if(full) {
+@@ -172,18 +189,20 @@ void EpgDraw(bool force) {
+   renderedSelected=selected; renderedFirst=selected/9*9;
+   if(c) renderedDay=c->dayOffset();
+   const epg::Service* station=c?c->station():nullptr;
+-  const char* name=station?station->name:epg::replayActive()?text(EPG_WAIT_SI):_serviceName;
++  const char* name=station && !station->conflict?station->name:epg::replayActive()?text(EPG_WAIT_SI):_serviceName;
+   char info[128];
++  const bool archive=c && !epg::replayActive() && (c->archived() || c->archivePreview());
+   if(c) {
+     int year; unsigned month,day; epg::calendar(c->localDay(),year,month,day);
+-    snprintf(info,sizeof(info),"%s %02u.%02u.%04d%s%s%s%s",epg::replayActive()?"TEST":"EPG",day,month,year,c->limited?" ":"",c->limited?text(EPG_LIMIT):"",c->ambiguous()?" ":"",c->ambiguous()?text(EPG_AMBIGUOUS):"");
++    snprintf(info,sizeof(info),"%s %02u.%02u.%04d%s%s%s%s",epg::replayActive()?"TEST":archive?text(c->archivePreview()?EPG_ARCHIVE_PREVIEW:EPG_ARCHIVE):"EPG",day,month,year,c->limited?" ":"",c->limited?text(EPG_LIMIT):"",c->ambiguous()?" ":"",c->ambiguous()?text(EPG_AMBIGUOUS):"");
+   } else snprintf(info,sizeof(info),"%s",text(EPG_MEMORY));
+-  if(c && !c->now()) snprintf(info,sizeof(info),"%s / %s",epg::replayActive()?"TEST":"EPG",text(EPG_NO_TIME));
++  if(c && !c->localDay()) snprintf(info,sizeof(info),"%s / %s",epg::replayActive()?"TEST":"EPG",text(EPG_NO_TIME));
+   if(footerChanged) {
+     if(!full) restore(0,220,320,20,bg);
+     line(info,8,222,304,SecondaryColor);
+   }
+   if(!c) { waiting(text(EPG_MEMORY)); return; }
++  if(c->ambiguous()) {waiting(text(EPG_AMBIGUOUS));return;}
+   if(page==1) {
+     const unsigned first=selected/9*9;
+     // Reuse FONT16 loaded at startup: the main screen shares this sprite.
+@@ -206,7 +225,7 @@ void EpgDraw(bool force) {
+       }
+       FullLineSprite.pushSprite(listX,y);
+     }
+-    if(!c->count() && (full || dataChanged || first!=oldFirst)) waiting(text(c->ambiguous()?EPG_AMBIGUOUS:EPG_WAIT_PROGRAM));
++    if(!c->count() && (full || dataChanged || first!=oldFirst)) waiting(text(stateText(state)));
+   } else if(page==2) {
+     line(name,12,36,200,SecondaryColor);
+     if(c->count()) {
+@@ -215,24 +234,26 @@ void EpgDraw(bool force) {
+       snprintf(info,sizeof(info),"%02u.%02u.%04d",day,month,year); line(info,218,36,90,SecondaryColor);
+       interval(*c,selected,info,sizeof(info)); line(info,12,58,296,ActiveColor);
+       const bool actualPresent=c->at(selected).actual!=0;
+-      if(actualPresent) { char actual[8]; clockText(c->at(selected).actual,c->at(selected).lto,actual,sizeof(actual)); snprintf(info,sizeof(info),text(EPG_ACTUAL),actual); line(info,12,78,296,SecondaryColor); }
++      if(actualPresent) { char actual[8]; clockText(c->at(selected).actual,c->at(selected).actualLto,actual,sizeof(actual)); snprintf(info,sizeof(info),text(EPG_ACTUAL),actual); line(info,12,78,296,SecondaryColor); }
+       char detail[640]; snprintf(detail,sizeof(detail),"%s\n%s",c->title(selected),c->description(selected));
+       const unsigned rows=actualPresent?5:6;
+       const unsigned total=wrapped(detail,scroll,rows,actualPresent?100:80,PrimaryColor);
+       maxScroll=total>rows?total-rows:0;
+-    } else waiting(text(EPG_WAIT_PROGRAM));
++    } else waiting(text(stateText(state)));
+   } else {
+     line(name,118,38,190,PrimaryColor);
+-    char clock[8]; clockText(c->now(),c->offset(),clock,sizeof(clock)); line(c->now()?clock:text(EPG_NO_TIME),118,63,190,SecondaryColor);
+-    if(c->logo()) DrawEpgLogo(c->logo(),c->logoSize(),12,34,100,70);
++    char clock[8]; clockText(c->now(),c->offset(),clock,sizeof(clock)); line(c->now() && c->clockTrusted()?clock:text(EPG_CLOCK_UNCERTAIN),118,63,190,SecondaryColor);
++    if(c->logo() && !c->ambiguous()) DrawEpgLogo(c->logo(),c->logoSize(),12,34,100,70);
+     bool overlap=false; const int current=c->current(&overlap), next=c->next();
+-    line(text(c->ambiguous()?EPG_AMBIGUOUS:overlap?EPG_OVERLAP:EPG_NOW),12,110,296,ActiveColor);
++    line(text(state!=epg::Availability::ReadyLive?stateText(state):overlap?EPG_OVERLAP:EPG_NOW),12,110,296,ActiveColor);
+     if(current>=0) {
+       wrapped(c->title(current),0,2,130,PrimaryColor);
+       interval(*c,current,info,sizeof(info)); line(info,12,171,200,SecondaryColor);
+       const auto& p=c->at(current); const unsigned percent=unsigned((uint64_t(c->now()-p.start)*100)/p.duration);
+       tft.drawRect(222,174,85,7,SecondaryColor); tft.fillRect(223,175,int(percent*83/100),5,ActiveColor);
+-    } else if(!c->count()) waiting(text(c->ambiguous()?EPG_AMBIGUOUS:EPG_WAIT_PROGRAM));
++    } else if(state==epg::Availability::SiOnly || state==epg::Availability::DirectoryEmpty || state==epg::Availability::PiDateStale || state==epg::Availability::TimeUnknown) {
++      wrapped(text(stateText(state)),0,3,132,PrimaryColor);
++    } else if(!c->count()) waiting(text(stateText(state)));
+     else line(text(c->fresh()?EPG_UNAVAILABLE:EPG_STALE),12,134,296,PrimaryColor);
+     if(next>=0) { char time[8]; clockText(c->at(next).start,c->at(next).lto,time,sizeof(time)); snprintf(info,sizeof(info),"%s %s  %s",text(EPG_NEXT),time,c->title(next)); line(info,12,198,296,ActiveColor); }
+   }
+diff --git a/src/language.h b/src/language.h
+index cc9736d..e52f5a1 100644
+--- a/src/language.h
++++ b/src/language.h
+@@ -980,17 +980,18 @@ static const char* const i2sAudioMenuText[8] PROGMEM = {
+ enum EpgText {
+   EPG_OVERVIEW, EPG_PROGRAM, EPG_DETAIL, EPG_WAIT_SI, EPG_WAIT_PROGRAM,
+   EPG_UNAVAILABLE, EPG_STALE, EPG_NO_TIME, EPG_AMBIGUOUS, EPG_MEMORY,
+-  EPG_LIMIT, EPG_NOW, EPG_NEXT, EPG_OVERLAP, EPG_ACTUAL, EPG_TEXT_COUNT
++  EPG_LIMIT, EPG_NOW, EPG_NEXT, EPG_OVERLAP, EPG_ACTUAL, EPG_WAIT_DIRECTORY, EPG_DIRECTORY_EMPTY, EPG_SI_ONLY,
++  EPG_ARCHIVE, EPG_ARCHIVE_PREVIEW, EPG_CLOCK_UNCERTAIN, EPG_TEXT_COUNT
+ };
+ static const char* const epgText[8][EPG_TEXT_COUNT] PROGMEM = {
+-  {"EPG NOW / NEXT", "EPG PROGRAMME", "EPG DETAIL", "Waiting for station", "Waiting for programme...", "EPG unavailable", "EPG unavailable / outdated", "Time unavailable", "Ambiguous service", "EPG: insufficient memory", "LIMIT", "NOW", "NEXT", "NOW (overlap)", "Actual %s (planned time kept)"},
+-  {"EPG NU / STRAKS", "EPG PROGRAMMA", "EPG DETAILS", "Wachten op zender", "Wachten op programma...", "EPG niet beschikbaar", "EPG ontbreekt / verouderd", "Tijd niet beschikbaar", "Onzekere zender", "EPG: te weinig geheugen", "LIMIET", "NU", "STRAKS", "NU (overlap)", "Werkelijk %s (planning blijft)"},
+-  {"EPG ΤΩΡΑ / ΜΕΤΑ", "EPG ΠΡΟΓΡΑΜΜΑ", "EPG ΛΕΠΤΟΜΕΡΕΙΕΣ", "Αναμονή σταθμού", "Αναμονή προγράμματος...", "EPG μη διαθέσιμο", "EPG μη διαθέσιμο / παλιό", "Ώρα μη διαθέσιμη", "Ασαφής σταθμός", "EPG: ανεπαρκής μνήμη", "ΟΡΙΟ", "ΤΩΡΑ", "ΜΕΤΑ", "ΤΩΡΑ (επικάλυψη)", "Έναρξη %s (βάσει σχεδίου)"},
+-  {"EPG JETZT / DANACH", "EPG PROGRAMM", "EPG DETAILS", "Warte auf Sender", "Warte auf Programm...", "EPG nicht verfügbar", "EPG fehlt / veraltet", "Zeit nicht verfügbar", "Sender nicht eindeutig", "EPG: zu wenig Speicher", "LIMIT", "JETZT", "DANACH", "JETZT (Überlappung)", "Beginn %s (Plan bleibt)"},
+-  {"EPG EN COURS / APRÈS", "EPG PROGRAMME", "EPG DÉTAIL", "Attente de la station", "Attente du programme...", "EPG indisponible", "EPG indisponible / périmé", "Heure indisponible", "Station ambiguë", "EPG : mémoire insuffisante", "LIMITE", "EN COURS", "ENSUITE", "EN COURS (chevauchement)", "Début %s (horaire conservé)"},
+-  {"EPG AHORA / DESPUÉS", "EPG PROGRAMA", "EPG DETALLE", "Esperando emisora", "Esperando programa...", "EPG no disponible", "EPG no disponible / antiguo", "Hora no disponible", "Emisora ambigua", "EPG: memoria insuficiente", "LÍMITE", "AHORA", "DESPUÉS", "AHORA (solapamiento)", "Inicio %s (horario conservado)"},
+-  {"EPG TERAZ / POTEM", "EPG PROGRAM", "EPG SZCZEGÓŁY", "Czekam na stację", "Czekam na program...", "EPG niedostępne", "EPG niedostępne / nieaktualne", "Czas niedostępny", "Niejednoznaczna stacja", "EPG: za mało pamięci", "LIMIT", "TERAZ", "POTEM", "TERAZ (nakładanie)", "Początek %s (plan zachowany)"},
+-  {"EPG ACUM / URMEAZĂ", "EPG PROGRAM", "EPG DETALII", "Aștept postul", "Aștept programul...", "EPG indisponibil", "EPG indisponibil / expirat", "Ora indisponibilă", "Post ambiguu", "EPG: memorie insuficientă", "LIMITĂ", "ACUM", "URMEAZĂ", "ACUM (suprapunere)", "Început %s (plan păstrat)"}
++  {"EPG NOW / NEXT", "EPG PROGRAMME", "EPG DETAIL", "Waiting for station", "Waiting for programme...", "EPG unavailable", "EPG unavailable / outdated", "Time unavailable", "Ambiguous service", "EPG: insufficient memory", "LIMIT", "NOW", "NEXT", "NOW (overlap)", "Actual %s (planned time kept)", "Waiting for directory", "EPG signalled, no objects", "Station info available; no programme schedule broadcast", "Archive", "ARCHIVE / SIMULATION", "Clock uncertain"},
++  {"EPG NU / STRAKS", "EPG PROGRAMMA", "EPG DETAILS", "Wachten op zender", "Wachten op programma...", "EPG niet beschikbaar", "EPG ontbreekt / verouderd", "Tijd niet beschikbaar", "Onzekere zender", "EPG: te weinig geheugen", "LIMIET", "NU", "STRAKS", "NU (overlap)", "Werkelijk %s (planning blijft)", "Wachten op directory", "EPG gemeld, geen objecten", "Zenderinfo beschikbaar; geen programmaschema uitgezonden", "Archief", "ARCHIEF / SIMULATIE", "Tijd onzeker"},
++  {"EPG ΤΩΡΑ / ΜΕΤΑ", "EPG ΠΡΟΓΡΑΜΜΑ", "EPG ΛΕΠΤΟΜΕΡΕΙΕΣ", "Αναμονή σταθμού", "Αναμονή προγράμματος...", "EPG μη διαθέσιμο", "EPG μη διαθέσιμο / παλιό", "Ώρα μη διαθέσιμη", "Ασαφής σταθμός", "EPG: ανεπαρκής μνήμη", "ΟΡΙΟ", "ΤΩΡΑ", "ΜΕΤΑ", "ΤΩΡΑ (επικάλυψη)", "Έναρξη %s (βάσει σχεδίου)", "Αναμονή καταλόγου", "EPG χωρίς αντικείμενα", "Πληροφορίες σταθμού χωρίς πρόγραμμα", "Αρχείο", "ΑΡΧΕΙΟ / ΠΡΟΣΟΜΟΙΩΣΗ", "Αβέβαιη ώρα"},
++  {"EPG JETZT / DANACH", "EPG PROGRAMM", "EPG DETAILS", "Warte auf Sender", "Warte auf Programm...", "EPG nicht verfügbar", "EPG fehlt / veraltet", "Zeit nicht verfügbar", "Sender nicht eindeutig", "EPG: zu wenig Speicher", "LIMIT", "JETZT", "DANACH", "JETZT (Überlappung)", "Beginn %s (Plan bleibt)", "Warte auf Verzeichnis", "EPG signalisiert, keine Objekte", "Senderinfo vorhanden; kein Programmplan gesendet", "Archiv", "ARCHIV / SIMULATION", "Zeit unsicher"},
++  {"EPG EN COURS / APRÈS", "EPG PROGRAMME", "EPG DÉTAIL", "Attente de la station", "Attente du programme...", "EPG indisponible", "EPG indisponible / périmé", "Heure indisponible", "Station ambiguë", "EPG : mémoire insuffisante", "LIMITE", "EN COURS", "ENSUITE", "EN COURS (chevauchement)", "Début %s (horaire conservé)", "Attente du répertoire", "EPG signalé, aucun objet", "Informations station reçues; grille non diffusée", "Archives", "ARCHIVES / SIMULATION", "Heure incertaine"},
++  {"EPG AHORA / DESPUÉS", "EPG PROGRAMA", "EPG DETALLE", "Esperando emisora", "Esperando programa...", "EPG no disponible", "EPG no disponible / antiguo", "Hora no disponible", "Emisora ambigua", "EPG: memoria insuficiente", "LÍMITE", "AHORA", "DESPUÉS", "AHORA (solapamiento)", "Inicio %s (horario conservado)", "Esperando directorio", "EPG anunciado, sin objetos", "Datos de emisora; no se emite programación", "Archivo", "ARCHIVO / SIMULACIÓN", "Hora incierta"},
++  {"EPG TERAZ / POTEM", "EPG PROGRAM", "EPG SZCZEGÓŁY", "Czekam na stację", "Czekam na program...", "EPG niedostępne", "EPG niedostępne / nieaktualne", "Czas niedostępny", "Niejednoznaczna stacja", "EPG: za mało pamięci", "LIMIT", "TERAZ", "POTEM", "TERAZ (nakładanie)", "Początek %s (plan zachowany)", "Czekam na katalog", "EPG nadawane, brak obiektów", "Informacje o stacji dostępne; ramówka nie jest nadawana", "Archiwum", "ARCHIWUM / SYMULACJA", "Czas niepewny"},
++  {"EPG ACUM / URMEAZĂ", "EPG PROGRAM", "EPG DETALII", "Aștept postul", "Aștept programul...", "EPG indisponibil", "EPG indisponibil / expirat", "Ora indisponibilă", "Post ambiguu", "EPG: memorie insuficientă", "LIMITĂ", "ACUM", "URMEAZĂ", "ACUM (suprapunere)", "Început %s (plan păstrat)", "Aștept directorul", "EPG semnalat, fără obiecte", "Informații post disponibile; grila nu este transmisă", "Arhivă", "ARHIVĂ / SIMULARE", "Ora incertă"}
+ };
+ 
+ #endif
+diff --git a/src/si4684.cpp b/src/si4684.cpp
+index b0af1b2..6941805 100644
+--- a/src/si4684.cpp
++++ b/src/si4684.cpp
+@@ -730,7 +730,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
+   dabSignalRefreshPending = false;
+   dabServiceListRefreshPending = false;
+   dabEnsembleRefreshPending = false;
+-  dabTimeRefreshPending = false;
++  dabTimeRefreshPending = false; dabUtcRefreshPending = dabClockConfirmPending = false; dabEpgClock.valid=false;
+   dabAudioRefreshPending = false;
+   dabAudioInfoValid = false;
+   dabAudioInfoRetryCount = 0;
+@@ -2226,7 +2226,7 @@ void DAB::setFreq(uint8_t freq) {
+   dabSignalRefreshPending = false;
+   dabServiceListRefreshPending = false;
+   dabEnsembleRefreshPending = false;
+-  dabTimeRefreshPending = false;
++  dabTimeRefreshPending = false; dabUtcRefreshPending = dabClockConfirmPending = false; dabEpgClock.valid=false;
+   dabAudioRefreshPending = false;
+   dabCurrentSubchannelRefreshPending = false;
+   dabCurrentServiceRefreshPending = false;
+@@ -3680,7 +3680,8 @@ void DAB::finishDabCommand(void) {
+       break;
+     }
+ 
+-    case DabCommand::Time: {
++    case DabCommand::Time:
++    case DabCommand::TimeLocalConfirm: {
+       si468x::DabTimeInfo time;
+       const si468x::Result parseResult = si468x::Si468x::parseDabTime(
+           SPIbuffer + 1, 11, time);
+@@ -3695,6 +3696,39 @@ void DAB::finishDabCommand(void) {
+       Minutes = time.minute;
+       Seconds = time.second;
+       dabTimeGeneration = dab_scheduler::nextGeneration(dabTimeGeneration);
++      dabLocalClockEpoch=epg::epoch(time.year,time.month,time.day,time.hour,time.minute,time.second);
++      dabLocalClockMs=millis();
++      if(completed==DabCommand::TimeLocalConfirm) {
++        int16_t offset=0;
++        const bool paired=epg::pairedOffsetAfterUtc(dabEpgClock.calendarEpoch,dabEpgClock.sampledAtMonotonicMs,dabLocalClockEpoch,dabLocalClockMs,offset);
++        dabEpgClock.offsetMinutes=offset;dabEpgClock.offsetKnown=paired;
++        dabEpgClock.valid=paired;dabEpgClock.generation=dabTimeGeneration;
++        if(diagnosticDebug) DIAG_PRINTF("[DAB/CLOCK] confirm local=%u utc=%u paired=%u offset=%d generation=%u\n",unsigned(dabLocalClockEpoch),unsigned(dabEpgClock.calendarEpoch),paired,int(offset),unsigned(dabTimeGeneration));
++      } else {
++        dabEpgClock=epg::BroadcastClockSample{};
++        dabEpgClock.year=time.year;dabEpgClock.month=time.month;dabEpgClock.day=time.day;
++        dabEpgClock.hour=time.hour;dabEpgClock.minute=time.minute;dabEpgClock.second=time.second;
++        dabEpgClock.encoding=epg::ClockEncoding::Local;dabEpgClock.calendarEpoch=dabLocalClockEpoch;
++        dabEpgClock.sampledAtMonotonicMs=dabLocalClockMs;dabEpgClock.generation=dabTimeGeneration;
++        dabEpgClock.valid=dabLocalClockEpoch!=0;dabUtcRefreshPending=dabEpgClock.valid;
++      }
++      if(diagnosticDebug) DIAG_PRINTF("[DAB/CLOCK] type=0 raw=%02X%02X%02X%02X%02X%02X%02X generation=%u local=%u\n",SPIbuffer[5],SPIbuffer[6],SPIbuffer[7],SPIbuffer[8],SPIbuffer[9],SPIbuffer[10],SPIbuffer[11],unsigned(dabTimeGeneration),unsigned(dabLocalClockEpoch));
++      break;
++    }
++
++    case DabCommand::TimeUtc: {
++      si468x::DabTimeInfo time;
++      const auto parsed=si468x::Si468x::parseDabTime(SPIbuffer+1,11,time);
++      if(!parseOk(parsed)) {++diagDabCommandErrorCount;break;}
++      dabEpgClock=epg::BroadcastClockSample{};
++      dabEpgClock.year=time.year;dabEpgClock.month=time.month;dabEpgClock.day=time.day;
++      dabEpgClock.hour=time.hour;dabEpgClock.minute=time.minute;dabEpgClock.second=time.second;
++      dabEpgClock.encoding=epg::ClockEncoding::UTC;
++      dabEpgClock.calendarEpoch=epg::epoch(time.year,time.month,time.day,time.hour,time.minute,time.second);
++      dabEpgClock.sampledAtMonotonicMs=millis();dabEpgClock.generation=dabTimeGeneration;
++      // Trust only after a subsequent LOCAL reply confirms a current offset.
++      dabClockConfirmPending=dabEpgClock.calendarEpoch!=0;
++      if(diagnosticDebug) DIAG_PRINTF("[DAB/CLOCK] type=1 raw=%02X%02X%02X%02X%02X%02X%02X generation=%u utc=%u\n",SPIbuffer[5],SPIbuffer[6],SPIbuffer[7],SPIbuffer[8],SPIbuffer[9],SPIbuffer[10],SPIbuffer[11],unsigned(dabTimeGeneration),unsigned(dabEpgClock.calendarEpoch));
+       break;
+     }
+ 
+@@ -4037,7 +4071,7 @@ void DAB::scheduleNextDabCommand(void) {
+     epgContinuous = false;
+     if (epgManualPending) { epgManualPending = false; requestSpiProbe(); }
+     else if (!epgProductionPaused && epg::liveEnabled() && !epg::replayActive() &&
+-             dabSpiDiscovery.available() && requestSpiProbe()) epgContinuous = true;
++             dabSpiDiscovery.available() && requestSpiProbe()) { epgContinuous = true; dabSpiProbe.productionBaseline(now); }
+   }
+   const bool sameProbeContext = (epgContinuous || diagnosticDebug) &&
+       (!epgContinuous || (dabSpiPresent && dabSpiDiscovery.status != dab_spi::Status::Ambiguous)) &&
+@@ -4121,7 +4155,7 @@ void DAB::scheduleNextDabCommand(void) {
+        (dabServiceListRefreshPending && signallock) ||
+        dabServiceTypeScanIndex < numberofservices ||
+        (dabEnsembleRefreshPending && signallock) ||
+-       (dabTimeRefreshPending && signallock) ||
++       ((dabTimeRefreshPending || dabUtcRefreshPending || dabClockConfirmPending) && signallock) ||
+        (dabAudioRefreshPending && dabActiveServiceValid &&
+         dab_scheduler::retryReady(now, dabAudioInfoNotBeforeMs)) ||
+        (dabCurrentServiceRefreshPending && dabActiveServiceValid) ||
+@@ -4204,6 +4238,19 @@ void DAB::scheduleNextDabCommand(void) {
+     return;
+   }
+ 
++  if(dabClockConfirmPending && signallock) {
++    if(startDabCommand(DabCommand::TimeLocalConfirm,static_cast<uint8_t>(si468x::Command::DAB_GET_TIME),&zero,1,11)) {
++      dabClockConfirmPending=false;dabLastLowPriorityCommandMs=now;
++    }
++    return;
++  }
++  if (dabUtcRefreshPending && signallock) {
++    const uint8_t utcType=1; // AN649: 0 local, 1 UTC; main screen keeps local fields.
++    if(startDabCommand(DabCommand::TimeUtc,static_cast<uint8_t>(si468x::Command::DAB_GET_TIME),&utcType,1,11)) {
++      dabUtcRefreshPending=false;dabLastLowPriorityCommandMs=now;
++    }
++    return;
++  }
+   if (dabTimeRefreshPending && signallock) {
+     if (startDabCommand(DabCommand::Time,
+                         static_cast<uint8_t>(si468x::Command::DAB_GET_TIME),
+diff --git a/src/si4684.h b/src/si4684.h
+index 204ad94..d31c87f 100644
+--- a/src/si4684.h
++++ b/src/si4684.h
+@@ -30,6 +30,7 @@
+ #include "dab_spi_probe.h"
+ #include "dab_diagnostics.h"
+ #include "i2s_audio.h"
++#include "epg_time.h"
+ 
+ struct DABFrequencyLabel_DAB {
+   uint32_t frequency;
+@@ -147,6 +148,7 @@ class DAB {
+     int16_t getRSSI(void);
+     uint32_t signalSampleGeneration(void) const { return rfSampleGeneration; }
+     uint32_t timeSampleGeneration(void) const { return dabTimeGeneration; }
++    const epg::BroadcastClockSample& broadcastClock(void) const { return dabEpgClock; }
+     uint16_t samplerate;
+     uint16_t Year;
+     uint32_t getFreq(uint8_t freq);
+@@ -265,7 +267,7 @@ class DAB {
+       SignalStatus,
+       ServiceListHeader,
+       EnsembleInfo,
+-      Time,
++      Time, TimeUtc, TimeLocalConfirm,
+       ServiceType,
+       AudioInfo,
+       CurrentSubchannelInfo,
+@@ -292,6 +294,9 @@ class DAB {
+     uint32_t dabSignalTimer;
+     uint32_t rfSampleGeneration = 0;
+     uint32_t dabTimeGeneration = 0;
++    epg::BroadcastClockSample dabEpgClock;
++    uint32_t dabLocalClockEpoch=0, dabLocalClockMs=0;
++    bool dabUtcRefreshPending=false, dabClockConfirmPending=false;
+     int16_t dabRssi10;
+     uint8_t fmPsSeenMask;
+     uint8_t fmPsConfirmedMask;
+diff --git a/tests/README.md b/tests/README.md
+index 40a9bc6..3f30ada 100644
+--- a/tests/README.md
++++ b/tests/README.md
+@@ -483,3 +483,21 @@ Preserved real EPG capture, reference archive, synthetic programme/logo streams,
+ PNGs and hashes: [fixtures/epg/README.md](fixtures/epg/README.md).
+ The reusable logo hardware client is `tests/epg/synthetic_logo_test.py`;
+ `--verify-fixtures` validates the saved inputs offline without opening UART.
++
++
++EPG LIVE time/metadata/archive regression (25 October 2026):
++`test_dab_clock.py` executes the real serialized LOCAL/UTC/LOCAL command cases
++and vendor parser across DST boundaries. `test_epg_live.py` checks fixed binary
++timePoint vectors, half-hour offsets, stale/unknown clocks, the separate 27-byte
++empty Directory fixture, real Kraków/OFF SI-only logos, historical Trójka,
++conflicting PR24/Chopin identity, reordered carousel and replacement with current
++PI without reset. Both are included in `run_epg_tests.py`, as is the SPI probe
++router/cleanup regression. Full hardware RF/stack/audio acceptance remains
++separate; see docs/EPG_LIVE_TIME_REPORT_20261025.md and EPG_ANDRZEJ_20261025.md.
++
++The legacy reference JSON had the same time bit-offset bug as the old parser.
++`epg_time_oracle.py` independently reads original binary programme time bytes;
++RAW replay still checks all 1,087 records, identities, titles, descriptions,
++durations, 70 objects and byte-identical PNGs. The original ZIP is unmodified.
++Synthetic stream fixtures ending `_v2.bin` use corrected time encoding; the
++original snapshots are retained with their SHA-256 in fixtures/epg/manifest.json.
+diff --git a/tests/epg/synthetic_logo_test.py b/tests/epg/synthetic_logo_test.py
+index 5931987..3cac9a5 100644
+--- a/tests/epg/synthetic_logo_test.py
++++ b/tests/epg/synthetic_logo_test.py
+@@ -8,7 +8,7 @@ FIXTURES=ROOT/'tests/fixtures/epg'
+ sys.path.insert(0,str(ROOT/'tools'))
+ from epg_synthetic import Client,groups,wire
+ out=ROOT/'.pio/epg_acceptance'
+-original=groups(FIXTURES/'synthetic_programme_groups.bin')
++original=groups(FIXTURES/'synthetic_programme_groups_v2.bin')
+ def tlv(t,b):return bytes([t])+ (bytes([len(b)]) if len(b)<254 else b'\xfe'+struct.pack('>H',len(b)))+b
+ def crc16(b):
+  c=0xffff
+@@ -61,7 +61,7 @@ def main():
+  for interlace in (0,1):
+   image=png(interlace)
+   assert image==(FIXTURES/f'synthetic_logo_{interlace}.png').read_bytes()
+-  assert fixture(image)==groups(FIXTURES/f'synthetic_logo_{interlace}_groups.bin')
++  assert fixture(image)==groups(FIXTURES/f'synthetic_logo_{interlace}_groups_v2.bin')
+   for frame in fixture(image):assert crc16(frame[:-2])==int.from_bytes(frame[-2:],'big')
+  print('Preserved EPG fixture hashes, generated PNG/streams and MSC CRC: PASS',flush=True)
+  if args.verify_fixtures:return
+diff --git a/tests/fixtures/epg/README.md b/tests/fixtures/epg/README.md
+index 2310e5f..d40db54 100644
+--- a/tests/fixtures/epg/README.md
++++ b/tests/fixtures/epg/README.md
+@@ -35,7 +35,7 @@ Syntetický program přes E2, všech devět scénářů a závěrečná PAD smy
+ nepotřebuje předem generovat data v `.pio`:
+ 
+ ```powershell
+-python -u tools/epg_synthetic.py --port COM4 --input tests/fixtures/epg/synthetic_programme_groups.bin --loop
++python -u tools/epg_synthetic.py --port COM4 --input tests/fixtures/epg/synthetic_programme_groups_v2.bin --loop
+ ```
+ 
+ Test čtyř kombinací MSC/PAD × běžné/Adam7 PNG a následná PAD Adam7 smyčka:
+@@ -60,3 +60,13 @@ Původní testy mohou mít stále výchozí cesty do `_usertesting`/`Specificati
+ příkazy výše explicitně vybírají uchované kopie. `.pio` lze znovu vytvořit;
+ tyto vstupy po jeho vyčištění zůstanou. Vstupy nejsou součástí firmware.
+ Syntetická injekce ověřuje MCU zpracování DSRV, nikoli RF ani odbalení PAD v čipu.
++
++
++Od opravy timePoint 25. 10. 2026 používejte syntetické streamy `*_v2.bin`.
++Mají normové bity času 21/26. Původní streamy jsou zachované jako historické
++fixture starého firmwaru; obsahují chybný syntetický encoder času a jejich
++NOW/NEXT nelze použít jako referenci nového parseru. PNG jsou stejné.
++Skript testu loga nyní používá v2; offline kontrola ověřuje oba původní vstupy
++podle hashů a přesnou regeneraci nových v2 streamů. Skutečný RAW a referenční
++ZIP se nezměnily. Časové hodnoty původního JSON oracle mají chybu starého
++parseru; hostitelský test času je proto kontroluje samostatným binárním dekodérem.
+diff --git a/tests/fixtures/epg/manifest.json b/tests/fixtures/epg/manifest.json
+index b0e4f59..3a0f6f5 100644
+--- a/tests/fixtures/epg/manifest.json
++++ b/tests/fixtures/epg/manifest.json
+@@ -46,6 +46,32 @@
+     "synthetic_programme_groups.bin": {
+       "bytes": 304,
+       "sha256": "c7f86a788a5057a68c374cd00265ab2e23d4c31749a291e3959099bd6ad044ed"
++    },
++    "synthetic_programme_groups_v2.bin": {
++      "bytes": 304,
++      "sha256": "b0c0c144af0d07e80411f15fb5a033b072496f35c5bfd9b1b7171bbe52652b85"
++    },
++    "synthetic_logo_0_groups_v2.bin": {
++      "bytes": 676,
++      "sha256": "91e4e35d202f2b4ca2fe832ad540b209373bf306429da737a0d6e8ed20eaafac"
++    },
++    "synthetic_logo_1_groups_v2.bin": {
++      "bytes": 999,
++      "sha256": "52e6f81385ed6edb6d2246aa889e0833762fdb9a5d881648699f1c3c7126e6c8"
++    },
++    "time_source/clock_vectors.json": {
++      "bytes": 731,
++      "sha256": "a80d366e5a222bfa958477fc808b10a98b6dccfaef5aa165f4a1e3551c245290"
++    },
++    "time_source/empty_directory_11a.bin": {
++      "bytes": 27,
++      "sha256": "b258df2aff9bbcf3783dde2d16b7e4a77b4dc4cc483e23d544524a8b908c3057"
++    },
++    "time_source/timepoint_vectors.json": {
++      "bytes": 2451,
++      "sha256": "32ab6e94bebd433dba9d875ed0f42a8ff83955d16439a78cc7922b8ae6e0d4bd"
+     }
+-  }
++  },
++  "v2_added_on": "2026-10-25",
++  "v2_note": "Correct short timePoint encoding (hour at bit21, minute26); original v1 fixtures and reference ZIP unchanged."
+ }
+diff --git a/tests/run_epg_tests.py b/tests/run_epg_tests.py
+index c185a8e..ac4df4c 100644
+--- a/tests/run_epg_tests.py
++++ b/tests/run_epg_tests.py
+@@ -23,7 +23,10 @@ for name,extra in [('errors',[]),('cache',[]),('uart',['src/epg_uart.cpp'])]:
+  exe=out/(name+'.exe')
+  run('compile '+name,[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_epg_'+name+'.cpp','src/epg_core.cpp',*extra,'-o',str(exe)])
+  run(name,[str(exe),str(ROOT/'.pio/epg_test/objects')])
++run('compile SPI probe',[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_dab_spi_probe.cpp','-o',str(out/'spi_probe.exe')])
++run('SPI probe/router',[str(out/'spi_probe.exe')])
++run('DAB clock contract',[sys.executable,'tests/test_dab_clock.py',a.compiler])
+ run('X-PAD config/diagnostics',[sys.executable,'tests/test_dab_xpad_integration.py',a.compiler])
+-for name in ['runtime','ui','transport','synthetic_paths','synthetic_uart','storage','png_adam7']+([] if a.skip_pc else ['pc']):
++for name in ['live','runtime','ui','transport','synthetic_paths','synthetic_uart','storage','png_adam7']+([] if a.skip_pc else ['pc']):
+  run(name,[sys.executable,'tests/test_epg_'+name+'.py',a.compiler])
+ print('All EPG host checks passed. Reports: .pio/epg_acceptance/results.log and results.json')
+diff --git a/tests/test_dab_spi_probe.cpp b/tests/test_dab_spi_probe.cpp
+index eabfe95..dcac3ee 100644
+--- a/tests/test_dab_spi_probe.cpp
++++ b/tests/test_dab_spi_probe.cpp
+@@ -281,6 +281,11 @@ static void testFailuresAndWraparound() {
+ }
+ 
+ int main() {
++  Probe production;
++  assert(production.request(audio,sls,spi,1,100));
++  assert(production.nextActionMs==5100); // DEBUG baseline stays five seconds.
++  production.productionBaseline(100);production.advance(599,true);assert(production.state==State::Baseline);
++  production.advance(600,true);assert(production.state==State::StartRequested);
+   testRouter();
+   testLegacyReceptionGate();
+   testCapturedAudioPadIdentity();
+diff --git a/tests/test_epg_cache.cpp b/tests/test_epg_cache.cpp
+index b6e588d..133314e 100644
+--- a/tests/test_epg_cache.cpp
++++ b/tests/test_epg_cache.cpp
+@@ -13,7 +13,7 @@ static Data number(uint64_t value,unsigned bytes){Data out(bytes);while(bytes){o
+ static Data tlv(uint8_t tag,const Data& data){Data out{tag};if(data.size()<254)out.push_back(uint8_t(data.size()));else{out.push_back(254);append(out,number(data.size(),2));}append(out,data);return out;}
+ static Data str(const std::string& value){return Data(value.begin(),value.end());}
+ static void bits(Data& out,unsigned offset,unsigned count,uint32_t value){for(unsigned i=0;i<count;++i){const unsigned bit=offset+i;out[bit/8]|=uint8_t(((value>>(count-1-i))&1)<<(7-bit%8));}}
+-static Data timeValue(uint32_t seconds){Data out(4);bits(out,1,17,seconds/86400+40587);bits(out,20,5,(seconds/3600)%24);bits(out,25,6,(seconds/60)%60);return out;}
++static Data timeValue(uint32_t seconds){Data out(4);bits(out,1,17,seconds/86400+40587);bits(out,21,5,(seconds/3600)%24);bits(out,26,6,(seconds/60)%60);return out;}
+ struct Object{uint16_t tid;uint64_t bearer;uint32_t day;Data body;};
+ static Object object(unsigned id,unsigned station,unsigned day,unsigned count,unsigned description=8){
+  Object out{uint16_t(0x100+id),base+station,today+day*86400,{}};
+diff --git a/tests/test_epg_errors.cpp b/tests/test_epg_errors.cpp
+index 0114af7..a700291 100644
+--- a/tests/test_epg_errors.cpp
++++ b/tests/test_epg_errors.cpp
+@@ -28,14 +28,14 @@ static void put(uint8_t* p,unsigned at,unsigned n,uint32_t v){for(unsigned i=0;i
+ static void timeTests(){
+   for(bool longForm:{false,true})for(int offset:{-60,0,60,120}){
+     uint8_t b[7]={};const uint32_t expected=epg::epoch(2024,3,31,1,30,longForm?59:0);
+-    put(b,1,17,expected/86400+40587);put(b,18,1,longForm);put(b,19,1,1);put(b,20,5,1);put(b,25,6,30);
+-    if(longForm)put(b,31,6,59);
++    put(b,1,17,expected/86400+40587);put(b,20,1,longForm);put(b,19,1,1);put(b,21,5,1);put(b,26,6,30);
++    if(longForm)put(b,32,6,59);
+     b[longForm?6:4]=uint8_t((offset<0?32:0)+(offset<0?-offset:offset)/30);
+     uint32_t decoded=0;int16_t lto=0;assert(epg::timePoint(b,longForm?7:5,decoded,lto)&&decoded==expected&&lto==offset);
+     int y;unsigned m,d;epg::calendar(uint32_t(int64_t(decoded)+lto*60),y,m,d);assert(y==2024&&m==3&&d==31);
+     assert(!epg::timePoint(b,longForm?6:4,decoded,lto));
+   }
+-  const uint8_t impossible[]={0x3b,0x34,0x95,0x78,0x02};uint32_t utc=0;int16_t off=0;
++  const uint8_t impossible[]={0x3b,0x34,0x96,0x00,0x02};uint32_t utc=0;int16_t off=0;
+   assert(!epg::timePoint(impossible,sizeof(impossible),utc,off));
+   uint64_t id=0;const uint8_t data[]={0x50,0xe2,0x31,0x53,0x12,0x34,0x56,0x78};
+   assert(epg::bearerValue(data,sizeof(data),id)&&id==0x50e2315312345678ULL);
+diff --git a/tests/test_epg_replay.py b/tests/test_epg_replay.py
+index 0ae77a1..e4a94f4 100644
+--- a/tests/test_epg_replay.py
++++ b/tests/test_epg_replay.py
+@@ -21,6 +21,7 @@ r=subprocess.run([str(exe),str(out/'frames.bin'),str(objs)],capture_output=True,
+ print(r.stderr); r.check_returncode()
+ (out/'programmes.tsv').write_text(r.stdout)
+ from datetime import datetime
++from epg_time_oracle import programme_times
+ with zipfile.ZipFile(a.reference) as z:
+  assert hashlib.sha256(a.reference.read_bytes()).hexdigest()=='aed762cc1f5076dbda47b63101dfeef6ced4b418c9210e7c3c60ba25cc509d1e'
+  reference=json.loads(z.read('decoded.json'))
+@@ -37,21 +38,20 @@ with zipfile.ZipFile(a.reference) as z:
+   assert bool(int(png))==(expected['medias'][-1]['mimeValue']=='image/png')
+  print('SI: 55 service records, exact bearer/name/MIME/logo metadata: PASS')
+  index={(x['tid'],x['shortId']):x for x in oracle}
+- rejected=[]
++ binary_times={}
++ corrected_legacy_times=0
+  truncated=0
+  for row in rows:
+   _,tid,bearer,start,duration,lto,pid,version,medium,title,desc,rejected_time=row
+   expected=index[tid,int(pid)];t=expected['time'][0]
+   assert bearer==expected['sid'],(tid,pid,'bearer')
+-  if not rejected_time:
+-   assert int(start)==int(datetime.fromisoformat(t['time']['utc']).timestamp()),(tid,pid,'time')
+-  else:
+-   raw=bytes.fromhex(rejected_time)
+-   minute=(raw[3]>>1)&63
+-   assert int(start)==0 and minute==60,(tid,pid,'bad time',raw.hex())
+-   rejected.append((tid,int(pid),rejected_time))
++  if tid not in binary_times:binary_times[tid]=programme_times((objs/f'4_{tid}.bin').read_bytes())
++  expected_start,expected_lto,_=binary_times[tid][int(pid)]
++  assert not rejected_time,(tid,pid,'valid broadcast time rejected')
++  assert int(start)==expected_start,(tid,pid,'binary UTC')
++  assert int(lto)==expected_lto,(tid,pid,'binary LTO')
++  if expected_start!=int(datetime.fromisoformat(t['time']['utc']).timestamp()):corrected_legacy_times+=1
+   assert int(duration)==t['duration'],(tid,pid,'duration')
+-  if not rejected_time: assert int(lto)==int(t['time']['offset_hours']*60),(tid,pid,'LTO')
+   assert bytes.fromhex(medium).decode()==expected['mediumName'],(tid,pid,'medium')
+   expected_title=expected['longName'] or expected['mediumName'] or expected['shortName']
+   assert bytes.fromhex(title).decode()==expected_title,(tid,pid,'title')
+@@ -59,8 +59,8 @@ with zipfile.ZipFile(a.reference) as z:
+   actual=bytes.fromhex(desc).decode()
+   assert actual==expected_desc or (len(actual.encode())>=508 and expected_desc.startswith(actual)),(tid,pid,'description',actual,expected_desc)
+   if actual!=expected_desc: truncated+=1
+- assert len(rejected)==3, rejected
+- print('Rejected minute=60, oracle normalizes invalid broadcast time:',rejected)
++ assert corrected_legacy_times>0
++ print('Legacy JSON time corrections against independent binary oracle:',corrected_legacy_times)
+  print('Bounded descriptions truncated:',truncated)
+  assert (objs/'6_F651.bin').read_bytes()==z.read('MOT_Directory_F651.bin')
+  for name in z.namelist():
+diff --git a/tests/test_epg_runtime.py b/tests/test_epg_runtime.py
+index 4fc654d..0ab5bb8 100644
+--- a/tests/test_epg_runtime.py
++++ b/tests/test_epg_runtime.py
+@@ -70,7 +70,9 @@ struct Monitor {
+   void printf(const char* format,...) { char b[1200]; va_list args; va_start(args,format); vsnprintf(b,sizeof(b),format,args); va_end(args); output+=b; }
+ } diagSerial;
+ struct Radio {
+- bool fm=false, spi=true, ServiceStart=true, SlideShowAvailable=true;
++ bool fm=false, spi=true, ServiceStart=true, SlideShowAvailable=true, signallock=true;
++ epg::BroadcastClockSample clock;
++ const epg::BroadcastClockSample& broadcastClock() const{return clock;}
+  unsigned ServiceIndex=0, numberofservices=1, ensembleEcc=0xe2,Year=2026,Months=10,Days=23,Hours=10,Minutes=0,Seconds=0;
+  char EID[5]="3153";
+  struct Svc { uint32_t ServiceID=0x3233; } service[1];
+@@ -159,7 +161,7 @@ int main(int argc,char** argv) {
+   cmd("EPG TEST TIME 2026-10-23T10:30:00Z"); assert(core->current()==-1 && core->count()==0);
+   checkIcon(epg::IndicatorState::Present,0x06df);
+   cmd("EPG TEST TIME 2024-11-12T04:30:00+01:00");
+-  assert(core->count()==39);checkIcon(epg::IndicatorState::Ready,0x07e0);
++  assert(core->count()==42);checkIcon(epg::IndicatorState::Ready,0x07e0);
+   testMillis+=900001;epg::poll();
+   checkIcon(epg::IndicatorState::Present,0x06df); // Stale programmes are not ready.
+   cmd("EPG TEST STOP"); assert(!epg::replayActive() && !view && core->count()==0);
+@@ -210,18 +212,30 @@ int main(int argc,char** argv) {
+   for(const auto& group:epgDemoGroups) epg::livePayload(group.data,group.size);
+   assert(core->stats.frames==0 && core->count()==0);
+   for(const auto& group:epgDemoGroups){epg::livePadPayload(group.data,group.size);while(core->busy())core->pump();}
+-  assert(core->count()==39 && core->stats.pi==1);
++  assert(core->count()==42 && core->stats.pi==1);
+   const uint32_t padFrames=core->stats.frames;
+   epg::liveEndpoint(0xe23153ff,0x01f2c00d); // A packet START cannot evict PAD data.
+   epg::livePadEndpoint(0x3211,0x01fe0005);
+   epg::livePayload(epgDemoGroups[0].data,epgDemoGroups[0].size);
+-  assert(core->count()==39 && core->stats.frames==padFrames);
++  assert(core->count()==42 && core->stats.frames==padFrames);
+   epg::livePadEndpoint(0x3222,0x01fe0006);
+   assert(core->count()==0 && core->stats.frames==0);
+   epg::livePadEndpoint(0,0);
+   core->select(0x40e231533211ULL,epg::epoch(2024,11,12,3,30),60);
+   for(const auto& group:epgDemoGroups){epg::livePayload(group.data,group.size);while(core->busy())core->pump();}
+-  assert(core->count()==39 && core->stats.pi==1);
++  assert(core->count()==42 && core->stats.pi==1);
++  radio.service[0].ServiceID=0x3211;
++  radio.clock.calendarEpoch=epg::epoch(2026,10,25,6,33);radio.clock.encoding=epg::ClockEncoding::UTC;
++  radio.clock.valid=true;radio.clock.offsetKnown=true;radio.clock.offsetMinutes=60;
++  radio.clock.generation=1;radio.clock.sampledAtMonotonicMs=testMillis;
++  epg::poll();assert(core->selected()==0x40e231533211ULL && core->current()==-1);
++  assert(epg::availability()==epg::Availability::PiDateStale);
++  const uint32_t realNow=core->now();cmd("EPG ARCHIVE 2024-11-12");
++  assert(core->archivePreview() && core->now()==realNow && core->current()==-1);
++  cmd("EPG ARCHIVE OFF");assert(!core->archivePreview() && core->now()==realNow);
++  radio.signallock=false;epg::poll();assert(epg::availability()==epg::Availability::TimeUnknown);
++  radio.signallock=true;epg::poll();assert(!core->clockTrusted());
++  ++radio.clock.generation;epg::poll();assert(core->clockTrusted() && core->current()==-1);
+   cmd("EPG TEST START");
+   epg::livePadEndpoint(0x3211,0x01fe0005);
+   epg::livePadPayload(epgDemoGroups[0].data,epgDemoGroups[0].size);
+diff --git a/tests/test_epg_uart.cpp b/tests/test_epg_uart.cpp
+index ddc2f3c..509f9cf 100644
+--- a/tests/test_epg_uart.cpp
++++ b/tests/test_epg_uart.cpp
+@@ -15,7 +15,7 @@ static std::string message(unsigned seq,unsigned offset,unsigned total,const uin
+   assert(value.size()<127); return value;
+ }
+ int main() {
+-  assert(epg::Core::memoryBytes()<=50*1024);
++  assert(epg::Core::memoryBytes()<=51*1024);
+   static_assert(sizeof(epg::UartReceiver)<4200,"bounded UART receiver");
+   auto core=std::unique_ptr<epg::Core>(new epg::Core);
+   epg::UartReceiver rx;
+diff --git a/tests/test_epg_ui.py b/tests/test_epg_ui.py
+index 16aecb6..9a6030e 100644
+--- a/tests/test_epg_ui.py
++++ b/tests/test_epg_ui.py
+@@ -20,7 +20,7 @@ meta=b[:24+count*28]
+ translations=(ROOT/'src/language.h').read_text(encoding='utf-8').split('// EPG UI strings follow',1)[1].rsplit('#endif',1)[0]
+ translations='// EPG UI strings follow'+translations
+ messages=re.findall(r'"([^"\n]*)"',translations)
+-assert len(messages)==8*15
++assert len(messages)==8*21
+ glyphs={struct.unpack_from('>7i',b,24+i*28)[0] for i in range(count)}
+ missing={ch for message in messages for ch in message if ord(ch)>=127 and ord(ch) not in glyphs}
+ assert not missing, repr(missing)
+@@ -86,8 +86,9 @@ int PrimaryColor=1,PrimaryColorSmooth=2,SecondaryColor=3,SecondaryColorSmooth=4,
+ char _serviceName[17]="radio";
+ struct Radio { bool isFm(){return false;} } radio;
+ namespace epg {
+-static Core instance;
+-Core* runtime(){return &instance;} bool replayActive(){return true;} bool ensure(bool){return true;}
++static Core instance;static bool testReplay=true;
++Availability availability(){return instance.availability(true);}
++Core* runtime(){return &instance;} bool replayActive(){return testReplay;} bool ensure(bool){return true;}
+ }
+ void DrawNeutralStatusPanel(){++panels;}
+ const uint16_t configurationbackground[320*240]={};
+@@ -211,7 +212,7 @@ int main(int argc,char** argv){
+  for(language=0;language<8;++language) {
+    EpgOpen();assert(panels>0);
+    assert(textLog.find(epgText[language][EPG_OVERVIEW])!=std::string::npos);
+-   assert(textLog.find(epgText[language][EPG_WAIT_PROGRAM])!=std::string::npos);
++   assert(textLog.find(epgText[language][EPG_WAIT_DIRECTORY])!=std::string::npos);
+    EpgClick();testMillis+=200;EpgDraw();
+    assert(textLog.find(epgText[language][EPG_PROGRAM])!=std::string::npos);
+    const unsigned oldPanels=panels, oldBackgrounds=backgrounds;
+@@ -230,6 +231,13 @@ int main(int argc,char** argv){
+    c->feed(b.data(),n,testMillis++);while(c->busy())c->pump();}
+  testMillis+=200;EpgDraw();assert(c->count() && backgrounds==previous && rows==beforeRows+9 && panels==dataPanels);
+  EpgBack();EpgBack();
++ // LIVE archive footer must retain the original programme date, never 2026.
++ epg::testReplay=false;c->setLive(true);c->setTime(epg::epoch(2026,10,25,6,33),60);
++ EpgOpen();assert(textLog.find("2024")!=std::string::npos && textLog.find("2026")==std::string::npos);
++ assert(textLog.find(epgText[0][EPG_ARCHIVE])!=std::string::npos && c->current()==-1 && c->next()==-1);
++ c->setClockTrusted(false);testMillis+=200;EpgDraw();
++ assert(textLog.find(epgText[0][EPG_CLOCK_UNCERTAIN])!=std::string::npos);
++ EpgClose();
+  std::puts("Actual EPG UI: two-column background/text geometry, Jedynka multiline/advisory times/scroll, partial list redraw, waiting/data transition, 8 languages, UTF8 fonts, volume/day/navigation: PASS");
+ }
+ '''
+diff --git a/docs/EPG_ANDRZEJ_20261025.md b/docs/EPG_ANDRZEJ_20261025.md
+new file mode 100644
+index 0000000..02c199d
+--- /dev/null
++++ b/docs/EPG_ANDRZEJ_20261025.md
+@@ -0,0 +1,67 @@
++# Test EPG LIVE dla Andrzeja – 25.10.2026
++
++Nowe poprawki przeszły testy na komputerze i build, ale **nie były jeszcze
++wgrane ani sprawdzone przez RF**. Ten dokument nie potwierdza testu HW.
++Oczekiwany czas i offset pochodzą z DAB_GET_TIME LOCAL/UTC/LOCAL;
++EPG z 2024 nie jest automatycznie przenoszone do 2026.
++
++1. Po uzgodnionym wgraniu aplikacji na 0x10000 zachować NVS. Nie używać
++   receiver-complete.bin na 0x0. Sam plik testowy nie zmienia ustawień.
++2. Zamknąć skrypt replay/syntetyczny. Otworzyć jeden monitor 115200 8-N-1.
++   Wysłać `EPG TEST STATUS`; jeżeli mode=TEST, jednorazowo `EPG TEST STOP`.
++   Nie wysyłać STOP między pomiarami LIVE, bo kasuje cache.
++3. Wybrać MAN i stabilny sygnał. Zakończyć strojenie przed rozpoczęciem logu.
++   `DEBUG` włącza/wyłącza diagnostykę – sprawdzić odpowiedź ON; gdy wyjdzie
++   OFF, wysłać jeszcze raz. Nie włączać DEBUG SLSV/VERBOSE ani długich HEX.
++4. Na MUX 11B wybrać PR Trójka i otworzyć EPG długim SL. Zapisać STATUS
++   przed Directory i po 2–3 pełnych obrotach carouselu. Gdy PI nadal ma rok
++   2024, oczekiwane PI_DATE_STALE / Archive z datą programu 2024, brak
++   bieżącego NOW/NEXT/progress i brak zielonego Ready. Samo świeże odebranie
++   starego PI nie oznacza aktualnego programu. Jeśli nadawca wyśle obecny
++   rozkład i potwierdzi się clock, oczekiwane READY_LIVE i właściwy NOW.
++5. Na tym samym MUX wybrać Radio Kraków (37FC), potem OFF RadioKraków
++   (37FD). Oczekiwane SI_ONLY, nazwa + właściwe logo, komunikat o braku
++   ramówki, bez cudzego programu i bez zielonego Ready. Otworzyć listę/detail:
++   nie powinny udawać, że trwają nieskończone pobieranie brakującego PI.
++6. Sprawdzić PR24/Chopin, jeśli oba nadal mają ten sam bearer. Oczekiwane
++   IDENTITY_CONFLICT; nie wolno wybierać przypadkowego logo lub rozkładu.
++7. Na MUX 11A: jeśli nadal nadawany jest 27-bajtowy pusty Directory,
++   oczekiwane DIRECTORY_EMPTY, obiekty=0 i cyan Present. Nie przenosić tej
++   obserwacji do RAW z 11B. Gdy nadawca doda obiekty, stan ma się sam zmienić.
++8. Test archiwum, opcjonalnie po załadowaniu LIVE danych:
++
++```text
++EPG ARCHIVE 2024-11-12
++EPG TEST STATUS
++EPG ARCHIVE OFF
++```
++
++Oczekiwane ARCHIVE / SIMULATION z oryginalnym rokiem 2024; brak NOW/progress.
++UTC DAB i oryginalne PI nie mogą zostać przepisane. To nie jest mapowanie
++aktualnej godziny do starego programu. Wirtualny NOW testuje się osobno przez
++DEMO/replay z oznaczeniem TEST i `EPG TEST TIME`, nie jako dowód LIVE.
++
++9. Przełączyć stację, MUX, DAB/FM, wrócić. Po utracie locku nie może pozostać
++   stare Ready; po powrocie potrzebna jest nowa generacja poprawnego clock.
++   Sprawdzić audio analogowe/I²S, DLS i slideshow (JPEG/PNG/Adam7), równocześnie
++   zbierając status przed/po. Bez zgody nie restartować ani nie zmieniać NVS.
++10. Włączyć DEBUG tylko do krótkiego zapisu i zebrać:
++
++```text
++EPG TEST STATUS
++```
++
++Przesłać pełne linie EPG DATA/RX/RAM/LOGO/POOLS/STATE/CLOCK oraz
++[DAB/CLOCK] type=0/type=1 i confirm paired/offset. W załączniku opisać:
++aktualną datę i godzinę lokalną + znane UTC, rzeczywisty LTO z nadawania,
++MUX, SID, PI/SI/PNG, treść statusu na TFT i wygląd logo.
++Jeżeli TIME_UNKNOWN, nie zgadywać CET +60 z dawnego PI: potrzebne surowe
++clock odpowiedzi. Poprawny typ 1 na zainstalowanym FW trzeba potwierdzić.
++
++W dłuższym pomiarze sprawdzić brak narastającego ubytku RAM (free8/free32,
++largest/min), CTS+=0 i overflow+=0; UARTdrop liczy utracone logi, nie musi
++znaczyć utraty DSRV. Niedokończone/długie HEX nie są wiarygodnym pomiarem
++całego strumienia. Proszę potwierdzić słuchowo brak przerw audio i wizualnie
++slideshow – sam `audio=1` tego nie dowodzi.
++
++Raport PC i zakres zmian: [EPG_LIVE_TIME_REPORT_20261025.md](EPG_LIVE_TIME_REPORT_20261025.md).
+diff --git a/docs/EPG_LIVE_TIME_REPORT_20261025.md b/docs/EPG_LIVE_TIME_REPORT_20261025.md
+new file mode 100644
+index 0000000..a3ab79f
+--- /dev/null
++++ b/docs/EPG_LIVE_TIME_REPORT_20261025.md
+@@ -0,0 +1,200 @@
++# EPG LIVE – čas, SI-only, archiv a regrese (25. 10. 2026)
++
++Lokální implementace podle CODEX_ZADANI_SI4684_EPG_CAS_SI_ONLY_DST_ARCHIV_2026-10-25.md.
++Výchozí i konečný HEAD: `116758e5bd05927f70f6884a332a845e0e60369b`.
++Pracovní strom byl na začátku čistý. Nebyl použit cherry-pick, změna historie,
++Git indexu ani push. Firmware nebyl nahrán, COM port nebyl otevřen a NVS se neměnilo.
++
++**Výsledek:** hostitelská sada a esp32dev build PASS. Nová verze na přijímači:
++**HW NOT TESTED**. Předchozí potvrzené HW výsledky z 24. 10. zůstávají baseline;
++nelze je připsat tomuto novému buildu. Testerovo hlášení úspěchu 25. 10. 07:33
++je konkrétní dřívější pozorování, nikoli důkaz všech DST hranic této změny.
++
++## Kontrola podkladů a převzetí v2
++
++Oba archivy nalezeny v `_usertesting`, jednotlivé rozdíly porovnány s HEAD.
++V1 má čtyři soubory (core cpp/h, runtime, probe), v2 pět včetně UI.
++Převzata oprava bitových pozic po ověření normy; priorita PI byla přepracována
++na akvizici bez hladovění SI/PNG. Paměťové zvětšení 128/16384 nebylo převzato:
++96 záznamů a 8192 B textu už pokryje opravených 68 pořadů Trójky bez LIMIT.
++Zkrácena pouze produkční baseline na 500 ms; DEBUG SPI má stále 5 s a původní
++30s pozorování i stejný CTS/START/STOP cleanup owner.
++
++Z v2 nebylo převzato implicitní CET +60, odvozování současného offsetu z PI,
++mapování historického dne na dnešní čas ani přelepení původního roku v UI.
++Soubor `_usertesting/20261024.txt` rozlišuje 11A prázdný Directory a 11B
++70 objektů. Nová 27B fixture testuje první případ odděleně od skutečného RAW 11B.
++
++## Čas a hodiny
++
++`epg_time.h` je čisté C++11 rozhraní bez Arduino/TZ: BroadcastClockSample,
++ResolvedClock, resolveTime a ověření páru UTC/local. timePoint zachovává
++`ltoPresent` v Directory, Programme a cache; skutečné/relativní časy mají
++oddělený offset. UTC instants se neposouvají do lokálního času při uložení.
++Rezervované bity se ignorují, délky 4/6 + LTO, MJD, HH/MM/SS, znaménko a
++půlhodinový rozsah ±14 h se validují. Duration a planned interval zůstávají
++UTC `[start,end)`; explicitní actual nepřepisuje planned policy NOW.
++
++TS 102 371 §4.7.4 výslovně definuje nepřítomné LTO jako lokální čas rovný UTC.
++Proto je numerická hodnota 0 pro tento PI správná, ale příznak přítomnosti
++zůstává oddělený od explicitního LTO +00. Není doplňována česká/polská zóna.
++
++Důležitý nález při kontrole skutečného kódu: rádio posílalo TIME_TYPE=0.
++AN649 str. 200 definuje **0 local, 1 UTC**. Lokální čas byl tedy chybně
++předán jako UTC. Vendor parser pouze vyjme rok/měsíc/den/HH/MM/SS a žádnou
++konverzi nedělá. Vlastní vendor soubor se nezměnil.
++
++Nová sériová fronta drží původní lokální čtení pro hlavní hodiny, přidává
++UTC čtení a následnou lokální kontrolu. Offset se určí porovnáním UTC se
++**pozdějším** lokálním vzorkem, nejvýše po 2 s a s tolerancí 2 s pro sekundové
++rozlišení. To funguje i při přeskočení DST mezi oběma odpověďmi. UTC vzorek
++se použije přímo; nejde o odečítání historického PI LTO. Kalendář z UTC je
++oddělen od veřejných lokálních radio.Year/Hours, takže hlavní hodiny zůstávají lokální.
++Neznámá/nesmyslná/stará odpověď neustanoví spolehlivý čas. Pro NOW je potřeba
++UTC i aktuální potvrzený offset. Clock sample od 300 s, ztráta locku/FM nebo
++neúspěšná kontrola odstraní důvěryhodnost; po ztrátě locku je potřeba nová generace.
++
++DEBUG vypisuje omezené `[DAB/CLOCK] type=0|1 raw=...` z původních 7 kalendářních
++bajtů odpovědi a `confirm local=... utc=... paired=... offset=... generation=...`.
++Existující vlastníctví SPI reply a kooperativní fronta jsou zachované.
++AN649 kontrakt i skutečný parser jsou otestované na hostiteli; konkrétní
++odpovědi FW 6.0.9 po této změně jsou **HW NOT TESTED**.
++
++## Dostupnost, SI, archiv a UI
++
++Core poskytuje lookup SI **i** Directory podle SID/EID/ECC; pokud API dodá
++SCIdS, helper ho umí zkontrolovat. Rádio zatím SCIdS samostatně nepublikuje:
++při více různých odpovídajících bearerech se vyhlásí konflikt, ne odhad podle
++názvu/CID. SI služba má uložený název, krátký název, PNG příznak a URL/jméno
++obrázku. Název/loga stanice bez PI jsou dostupné a nezískají cizí pořady.
++
++Akvizice upřednostňuje relevantní PI, ale dostupné SI/PNG může zpracovat,
++pokud ještě nezačala jiná sestava. Rozpracovaná sestava drží jediný body buffer;
++po 5 s bez pokroku uvolní prioritu. SI scope není filtrován podle dnešního
++roku a načítají se i další SI objekty po prvním. PNG před SI lze získat při
++dalším carouselu; žádný druhý obrazový buffer se nepřidává. Focus používaný
++při offline inventuře zůstává striktní a nepřijímá jiné objekty.
++
++Oddělené údaje: transportFresh (příchod CRC-validní MOT skupiny), původní
++fresh() pro PI cache, scheduleDateValid, serviceHasPI/SI a clockTrusted.
++Priority stavů odpovídají následujícímu pořadí:
++
++| Stav | Výsledek |
++|---|---|
++| IDENTITY_CONFLICT | Nejvyšší priorita konfliktu, nepřiřazovat náhodný PI/obrázek. |
++| NO_SPI | SPI není potvrzeno. |
++| SPI_PRESENT_WAIT_DIR | Čekání na platný adresář. |
++| DIRECTORY_EMPTY | Kompletní Directory má 0 objektů, přítomnost služby zůstává. |
++| PENDING_IDENTITY | Čekání na ověřené spárování. |
++| SI_ONLY | Metadata existují, Directory nedeklaruje PI pro tuto stanici. |
++| TIME_UNKNOWN | PI deklarováno, ale současné hodiny/offset nejsou důvěryhodné. |
++| PI_DATE_STALE | Původní PI nekryje LIVE datum nebo jde o výslovný archivní náhled. |
++| READY_LIVE | Platné datum, čas, čerstvý PI a NOW nebo NEXT. TEST má označené virtuální hodiny. |
++| PI_DECLARED_LOADING | PI čeká na kompletaci/platnou cache nebo její obnovení. |
++
++Green vyžaduje READY_LIVE. SI-only, samotný PNG, prázdný Directory a archiv
++nezelenají. Při archivních datech zůstává skutečné UTC z roku 2026;
++seznam a detail uvádějí původní den/rok a označení archivu. NOW/NEXT/progress
++se netváří jako živý program. UI nerozšiřuje framebuffer a ponechává částečné
++překreslování seznamu, selektor, fonty a všech osm stávajících lokalizací.
++Metadata bez PI mají samostatný text o absenci rozpisu a vlastní logo.
++
++`EPG ARCHIVE YYYY-MM-DD` je výslovný náhled původního kalendářního dne v LIVE;
++`EPG ARCHIVE OFF` ho vypne. Default OFF, trvalé označení ARCHIVE / SIMULATION,
++žádné mapování současného času dne, žádný NOW ani přepsání PI/clock/NVS.
++Standardní LIVE může historický seznam procházet i bez simulace. TEST DEMO,
++E1/E2 a virtuální TIME/STOP zůstávají samostatné. STATUS nově přidává STATE
++ a CLOCK, včetně příznaků a zdrojového rozsahu. Podrobná syntaxe je v Serial_protocol.md.
++
++## Matice T01–T18
++
++PASS níže znamená **hostitelský test produkčního kódu / mock**, nikoli RF test.
++
++| ID | Stav | Důkaz a hranice |
++|---|---|---|
++| T01 | PASS | Pevné nezávislé binární vektory 00:00, 00:07, 12:34, 19:00, 22:07, 23:59. |
++| T02 | PASS | Short/long, +00/+01/+02/−05:30/+05:30, absence LTO, neplatné HH/MM/SS/délka/LTO, rok/MJD. |
++| T03 | PASS | Pevné podzimní UTC/local vektory i skutečné LOCAL/UTC/LOCAL cases přes 01:00Z. |
++| T04 | PASS | Jarní skok 01:59:59→03:00:00 přes 01:00Z; stejný parser/fronta. |
++| T05 | PASS | RAW Trójka + živé hodiny 25.10.2026: archive/date stale, NOW/NEXT −1. |
++| T06 | PASS | RAW TEST + 12.11.2024: 68 položek Trójky, NOW/NEXT; DEMO Jedynka nyní 42 platných položek. |
++| T07 | PASS | RAW 37FC: Radio Kraków, vlastní krakow.png, SI_ONLY, žádný PI. |
++| T08 | PASS | RAW 37FD: OFF RadioKraków, vlastní off.png, SI_ONLY. |
++| T09 | PASS | Samostatně sestavený validní 27B Directory s 0 objekty, bez CRC/transport chyby. |
++| T10 | PASS | RAW PI/SI/PNG pro Trójku, 68 položek bez LIMIT; metadata nejsou blokována čekáním na PI. |
++| T11 | PASS | Normální i obrácený RAW carousel, otočené segmenty, další rotace po PNG před SI. |
++| T12 | PASS | RAW PR24/Chopin se stejným bearer: konflikt, žádné logo/NOW. |
++| T13 | PASS / HW NOT TESTED | Runtime STOP/FM/service/mux, starý READY odstraněn; skutečné audio/SLS po změně netestováno. |
++| T14 | PASS | Dosavadní CRC/length/duplicate/out-of-order/conflict/timeout regressions, SPI cleanup/router. |
++| T15 | HW NOT TESTED | Host allocator/canaries/rollback/IRAM/Adam7/word access PASS; reálné low-water RAM, stack a souběh SLS/EPG na desce NOT RUN. |
++| T16 | PASS | Přímá výměna archivního Directory za současný PI bez resetu: READY_LIVE. |
++| T17 | PASS | Nejistý/stale clock, chybějící offset, ztráta locku; obnovit až s novou generací. |
++| T18 | PASS | SI+PNG bez PI obou Kraków služeb, vlastní metadata a žádný NOW. |
++
++Celá `python tests/run_epg_tests.py` prošla: RAW/oracle, errors/cache/UART,
++SPI probe/router, skutečné DAB clock cases, X-PAD, live/runtime/UI/transport,
++synthetic MSC/PAD/E2, storage, Adam7 i PC klient. Samostatně prošel offline
++hash/regenerační test uložených fixture a rozšířený actual/end-exclusive test.
++Logy jsou v `.pio/epg_acceptance/results.log`, results.json a epg_live_20261025.json.
++Trvalé souhrnné výsledky: [EPG_live_20261025_results.json](EPG_live_20261025_results.json).
++
++## RAW oracle a zachování původních dat
++
++Z 3080 deklarovaných výpisů se získá 1939 kompletních CRC-validních rámců,
++1141 neúplných se nadále zahazuje. Ověřeno 70 objektů = 35 PI + 5 SI + 30 PNG,
++55 SI záznamů napříč SI objekty a všech 1087 programových záznamů. Počet
++záznamů dekódovaných offline není velikost RAM cache jednoho dne (Trójka 68).
++
++Původní referenční JSON má stejnou chybu bitu hodin jako starý parser;
++jeho časy tedy nemohou být správnou časovou referencí. ZIP nebyl změněn.
++`tests/epg_time_oracle.py` nezávisle čte z původních binárních objektů UTC/LTO
++podle normy. Všechny ostatní reference, názvy, popisy, identity, duration,
++MOT Directory a PNG byte-for-byte zůstávají porovnávané proti původnímu ZIP.
++Tři časy dříve mylně odmítané jako minute=60 jsou po opravě validní.
++Nové syntetické streamy mají `_v2.bin`; původní v1 fixture i staré HW reporty
++zůstaly zachované včetně hashů. Nízké-levels UART formát E1/E2 se nezměnil.
++
++## Paměť, build a omezení důkazů
++
++ESP32 layout byl ověřen xtensa kompilátorem: Core 14232 B DRAM + 36864 B
++word-only IRAM bufferů = **51096 B**, o 296 B více než původních 50800.
++CachedProgramme zůstává 32 B; nové flags využívají bitová pole. Žádné nové
++image/frame buffery, malloc/free na paketu, PSRAM nebo flash cache.
++Zůstává kMaxProgrammes=96, kTextBytes=8192. Guard 12 KiB DRAM a 4 KiB IRAM
++po alokaci zůstává; allocator rollback, reuse i canaries se otestovaly.
++
++Build esp32dev PASS: statická RAM **66584 B**, flash **3545485 / 4128768 B**,
++firmware.bin **3546112 B**, verze v2.5b.
++SHA256 `20aa1ba00ecbd921c9a3cc12ee7c3ad06f2abc21d1dd2259e36c428068819ed8`.
++Host mock po alokaci: free8/largest8=13832, free32/largest32=17416 B;
++jsou to **simulované** hodnoty. Nové skutečné HW free8/free32/largest/minheap/
++stack jsou **NOT RUN / HW NOT TESTED** a nesmějí se zaměnit s těmito čísly.
++
++I²S konstanta `0x1870` a soubory i2s_audio.h, slideshow.cpp, png_adam7.cpp,
++vendor/si468x/Si468x.h, nvs_storage.cpp i epg_uart.cpp jsou obsahově beze změn
++vůči HEAD. UART výsledky a obrazové regresní testy prošly. Zachování fyzického
++audia, CTS/overflow a chování FIFO po nové dvojici clock dotazů musí ověřit HW.
++
++Během práce se v pracovním stromu objevilo odstranění src/IRReceiver.cpp/.h
++mimo tento EPG zásah. Nebyly obnoveny ani zahrnuty do EPG patche; uvedený build
++je z tohoto aktuálního pracovního stromu. Původní build HEAD před tím narazil
++na chybějící IRremoteESP8266; byla instalována lokálně do .pio/libdeps verze
++2.9.0 přes `pio pkg install --library crankyoldgit/IRremoteESP8266@2.9.0 --no-save`.
++platformio.ini se neměnilo. Po odstranění nepoužívaných IRReceiver souborů
++aktuální LDF tuto knihovnu nevyužívá. Jde o okolnost reprodukce buildu.
++
++## Soubory a diff
++
++Produkce: epg_core.cpp/.h, nové epg_time.h, epg_runtime.cpp/.h,
++epg_ui.cpp, language.h, si4684.cpp/.h a malý productionBaseline v dab_spi_probe.h.
++Testy: nezávislý time oracle, test_dab_clock.py, test_epg_live.py, pevné JSON
++vektory, probe/regresní testy a nový v2 stream. Upravené starší testy opravují
++syntetické encodery a očekávané počty po opravě času, neobcházejí kontrolu UTC.
++Dokumentace: Serial_protocol.md, tests README/fixture manifest a tento report.
++
++Konkrétní lokální diff (včetně nových souborů):
++[EPG_live_20261025.patch](patches/EPG_live_20261025.patch).
++Návod pro skutečné HW ověření: [EPG_ANDRZEJ_20261025.md](EPG_ANDRZEJ_20261025.md).
++
++Normové zdroje: [ETSI TS 102 371 V3.2.1 §4.7.4](https://www.etsi.org/deliver/etsi_ts/102300_102399/102371/03.02.01_60/ts_102371v030201p.pdf)
++a [Skyworks AN649 Rev.2, DAB_GET_TIME str.199–200](https://www.skyworksinc.com/-/media/Skyworks/SL/documents/public/application-notes/an649.pdf).
+diff --git a/docs/EPG_live_20261025_results.json b/docs/EPG_live_20261025_results.json
+new file mode 100644
+index 0000000..672b2d1
+--- /dev/null
++++ b/docs/EPG_live_20261025_results.json
+@@ -0,0 +1,42 @@
++{
++  "date": "2026-10-25",
++  "head": "116758e5bd05927f70f6884a332a845e0e60369b",
++  "firmware_sha256": "20aa1ba00ecbd921c9a3cc12ee7c3ad06f2abc21d1dd2259e36c428068819ed8",
++  "firmware_bytes": 3546112,
++  "static_ram": 66584,
++  "flash": 3545485,
++  "esp32_core": 14232,
++  "esp32_buffers": 36864,
++  "esp32_arena": 51096,
++  "hardware_tested": false,
++  "flashed": false,
++  "host_suite": "PASS",
++  "real_raw_objects": 70,
++  "real_raw_pi": 35,
++  "real_raw_si": 5,
++  "real_raw_png": 30,
++  "decoded_programmes": 1087,
++  "trojka_cache": 68,
++  "jedynka_demo_cache": 42,
++  "mock_pools_after_allocation": {
++    "free8": 13832,
++    "largest8": 13832,
++    "free32": 17416,
++    "largest32": 17416,
++    "not_hardware": true
++  },
++  "hardware_telemetry": {
++    "free8": "HW NOT TESTED",
++    "free32": "HW NOT TESTED",
++    "largest8": "HW NOT TESTED",
++    "largest32": "HW NOT TESTED",
++    "min_heap": "HW NOT TESTED",
++    "stack": "HW NOT TESTED"
++  },
++  "independent_checks": [
++    "preserved fixture SHA256/PNG/MSC CRC PASS",
++    "actual SPI probe/router PASS",
++    "new actual-duration/end-exclusive LIVE check PASS",
++    "I2S/SLS/Adam7/vendor/NVS/UART unchanged PASS"
++  ]
++}
+diff --git a/src/epg_time.h b/src/epg_time.h
+new file mode 100644
+index 0000000..f334587
+--- /dev/null
++++ b/src/epg_time.h
+@@ -0,0 +1,50 @@
++#pragma once
++// Platform-neutral clock contract. No timezone globals or PI-derived live offset.
++#include <stdint.h>
++namespace epg {
++enum class ClockEncoding : uint8_t { Unknown, Local, UTC };
++struct BroadcastClockSample {
++  uint16_t year=0; uint8_t month=0, day=0, hour=0, minute=0, second=0;
++  ClockEncoding encoding=ClockEncoding::Unknown;
++  uint32_t calendarEpoch=0, sampledAtMonotonicMs=0, generation=0;
++  int16_t offsetMinutes=0;
++  bool offsetKnown=false, valid=false;
++};
++struct ResolvedClock { uint32_t utc=0, local=0; int16_t offset=0; bool utcValid=false, localValid=false, offsetKnown=false; };
++inline ResolvedClock resolveTime(const BroadcastClockSample& s,uint32_t now,bool locked) {
++  ResolvedClock r;
++  const uint32_t age=now-s.sampledAtMonotonicMs;
++  if(!s.valid || !locked || age>=300000U || !s.calendarEpoch) return r;
++  const int64_t value=int64_t(s.calendarEpoch)+age/1000;
++  if(value<=0 || value>UINT32_MAX) return r;
++  r.offset=s.offsetMinutes; r.offsetKnown=s.offsetKnown;
++  if(s.encoding==ClockEncoding::UTC) {
++    r.utc=uint32_t(value);r.utcValid=true;
++    const int64_t local=value+int32_t(r.offset)*60;
++    if(s.offsetKnown && local>0 && local<=UINT32_MAX) {r.local=uint32_t(local);r.localValid=true;}
++  } else if(s.encoding==ClockEncoding::Local) {
++    r.local=uint32_t(value);r.localValid=true;
++    const int64_t utc=value-int32_t(r.offset)*60;
++    if(s.offsetKnown && utc>0 && utc<=UINT32_MAX) {r.utc=uint32_t(utc);r.utcValid=true;}
++  }
++  return r;
++}
++// Two serialized GET_TIME replies: compare at the UTC sample's monotonic time.
++// Reject invalid/stale pairs, including pairs straddling a DST transition.
++inline bool pairedOffset(uint32_t local,uint32_t localMs,uint32_t utc,uint32_t utcMs,int16_t& offset) {
++  const uint32_t elapsed=utcMs-localMs;
++  if(!local || !utc || elapsed>2000) return false;
++  const int64_t seconds=int64_t(local)+elapsed/1000-int64_t(utc);
++  const int64_t halfHours=seconds>=0?(seconds+900)/1800:(seconds-900)/1800;
++  const int64_t residual=seconds-halfHours*1800;
++  if(halfHours < -28 || halfHours>28 || residual < -2 || residual>2) return false;
++  offset=int16_t(halfHours*30);return true;
++}
++// Prefer the LOCAL reply after UTC, so an offset change between the replies
++// belongs to the later local sample, including the repeated autumn hour.
++inline bool pairedOffsetAfterUtc(uint32_t utc,uint32_t utcMs,uint32_t local,uint32_t localMs,int16_t& offset) {
++  const uint32_t elapsed=localMs-utcMs;
++  if(elapsed>2000 || uint64_t(utc)+elapsed/1000>UINT32_MAX) return false;
++  return pairedOffset(local,localMs,utc+elapsed/1000,localMs,offset);
++}
++} // namespace epg
+diff --git a/tests/epg_time_oracle.py b/tests/epg_time_oracle.py
+new file mode 100644
+index 0000000..0a7a5c9
+--- /dev/null
++++ b/tests/epg_time_oracle.py
+@@ -0,0 +1,50 @@
++"""Independent test-only TS 102 371 time decoder; no production parser calls.
++The supplied legacy JSON used the wrong hour bit and is retained unchanged.
++"""
++from datetime import datetime,timedelta,timezone
++
++def time_point(raw):
++    word=int.from_bytes(raw[:4],'big')
++    long_form=bool(word & (1<<11));present=bool(word & (1<<12))
++    size=6 if long_form else 4
++    assert len(raw)==size+int(present)
++    mjd=(word>>14)&0x1ffff
++    hour=(word>>6)&31;minute=word&63
++    second=(raw[4]>>2) if long_form else 0
++    assert 40587<=mjd<=99999 and hour<24 and minute<60 and second<60
++    offset=(raw[size]&31)*30*(-1 if raw[size]&32 else 1) if present else 0
++    assert abs(offset)<=840
++    value=datetime(1858,11,17,tzinfo=timezone.utc)+timedelta(days=mjd,hours=hour,minutes=minute,seconds=second)
++    return int(value.timestamp()),offset,present
++
++def children(data):
++    pos=0
++    while pos<len(data):
++        tag,length=data[pos:pos+2];pos+=2
++        if length>=254:
++            count=2 if length==254 else 3
++            length=int.from_bytes(data[pos:pos+count],'big');pos+=count
++        assert pos+length<=len(data)
++        yield tag,data[pos:pos+length]
++        pos+=length
++
++def programme_times(data):
++    result={}
++    def visit(data):
++        for tag,body in children(data):
++            if tag==0x1c:
++                fields=list(children(body));pid=next(int.from_bytes(b,'big') for t,b in fields if t==0x81)
++                def find_time(data):
++                    for t,b in children(data):
++                        if t==0x2c:
++                            for a,v in children(b):
++                                if a==0x80:return v
++                        if t in (0x19,0x2d):
++                            found=find_time(b)
++                            if found is not None:return found
++                raw=find_time(body)
++                assert raw is not None,pid
++                result[pid]=time_point(raw)
++            elif tag in (2,0x21):visit(body)
++    visit(data)
++    return result
+diff --git a/tests/fixtures/epg/synthetic_logo_0_groups_v2.bin b/tests/fixtures/epg/synthetic_logo_0_groups_v2.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..178b8979c8a6efb6ce997cbe5c21723d2847b52e
+GIT binary patch
+literal 676
+zcmeZfC}U_~5Mp3taA05nVrC!-0!%>6BEZ}Slwe@sGGOmxe9q?Z$S~N55u`$319uDa
+z89s*M%Dj?{)RN3(y@I@SE-oL25|Cj)y^hTGYPK5Inj8&KU4p`lg26D=3a$a}3jTSi
+z+ENXinYoGSsro?eO}r?kz3htyn#RB&1av?E(?V9LIWmTgKnE}i2{8&3mn4>C=I1FG
+zDrA<V<|-ISb1`x_L4gie1B<mugF_<|p8!M)6S9^KEnveL!G=Ti8)DJ#h|tfBtRJey
+z2#Xe{Mj<{vP&hDw3}*(~FLway6QIKbIs^RNdAX#xfIj2(^l%9R(g{H9zyS*Itgxq%
+zK<bjGi(^Q|oVQmu@*Y+Ya0p~O!62zAoVMYL+#%@+=R#9j4m{)F|9fcC+RGoM7<!;S
+z0U5r0%Ui4LKWqo3_d9;*TYmiWQe}sRb<C&chvfWVWnk=*Rd8rvVC0ekQLd~)3%DDK
+z4$n*yS#U_hp*669Yca!J?vj6n#{)whbfX!WSU4{HJ_<IRNeE=PJmcK?eT$<SqNcI1
+za0o2;^kmicP;bA_;;${Z1b`+^V_apmopEapD+iEg%)ItmmxJZrZjdoRz9BQ1YGl4*
+z?9i}_`DOWIa}GU4HBc}ygAA9x_k(xag<8h%fBe+E*Zo`o3<L&GS3j3^P6<uUssMo(
+Bwk`kw
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/fixtures/epg/synthetic_logo_1_groups_v2.bin b/tests/fixtures/epg/synthetic_logo_1_groups_v2.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..255f5d53b00b58ccb7f463bd0c5c3af1647f339f
+GIT binary patch
+literal 999
+zcmeZfC}U_~5Mp3taA05nVrC!-0!%>6BEZ}Slwe@sGGOmxe9q?Z$S~N55u`$?fV+kH
+z3?D;rWnM`}YDs3YUO`^^Q*|GP5|Cj)y^hTGYPK5Inj8&KU4p`lg26D=3a$a}3jTSi
+z+ENXinYoGSsro?eO}r?kz3htyn#RB&1av?E(?V9LIWmTgKnE}i2{8&3mn4>C=I1FG
+zDrA<V<|-ISb1`x_L4gie1B<mugF_<|p8!M)6S9^KEnveL!G=Ti8)DJ#h|tfBtRJey
+z2#Xe{Mj<{vP&hDw3}*(~FLway6QIKbIs^RNdAX#xfIj2(^l%9R(g{H9zyS<2M%lot
+z=YiBaPZ!6KiaBp*WfvVX;AyF4;5#tULXrJ(Ip0CvOABWP9iNtRl7CH0YS}WA4$&;A
+zPe6vJ{*5g3xg{_yJu<O!UH=BVLr<$7FVWi-ldt{XqkGb;x8b)ke{&q_ye#!Dd&lbT
+zQ&m&DAJ?Z|5_`(=NPYLBC02Gbtp4_EmkSB3=uVkY_4n+1TQ{)bOhO>T^W8-&r}j>I
+zrZBtP+DUrp<Nm%Qy-|KD5{1`pEqv<sbYbMyxeCn7_V@2nxux6Wd-ugvj|`>6-n+U=
+zi+fI}`NgT8H#M91;h|?l@uD9I|5kMgrsseSX9gSoGLHFn&Xtl^^G|oYP>#P<cVzmB
+zZ(A2IE3yQ!d{QtA*yK~NI%T6<{4y?;{x)M(W?sb*$BC!IJx|0g*rj<n;;Z769W$6j
+z9mSY>ul;tCh!+&BQ3M;#0yg|a@dD;Ndzq8T3humHe(y7=wr_FZDEZ}Z`6!!FF6-24
+zwYO;;jklOi2K!wrX#DkM!fpqn#LH7A<~uHU*QizHky$#;;nR_sOee!Qu1I8DGY|Ku
+z0vpZ>Hk`#tfkjI9cw<dw9n<qF``P!L*0DJ7Hhij9xct70VS+WI00R(Jva(!dnDjnw
+z#=G1fTbLG{XUcjRH+d@OgvG%;4GbAiq^?|C#Twx4!C-az>e3)k>R|&J?yhwAB3A>$
+z3x@`u{(i<RPgaL!#@gBY1Oxtk_j)IPijkv%0gU)`nFL(2>za;ktz)>D?57s?&V&V+
+Rs2Dt5{an^LB{Z#j2mq?zOsD_=
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/fixtures/epg/synthetic_programme_groups_v2.bin b/tests/fixtures/epg/synthetic_programme_groups_v2.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..9647bc14caebd34be66692529729a79e9c16b919
+GIT binary patch
+literal 304
+zcmXqFC}U_~5Mp3tP-kEOVkRI70w9_xfVmGS!N9;}z~0CBoXz2pVXzV7lNtkt5|AFC
+z5>;kpHAM}1O^ybrq@XaPU~pw#Nk(c(X0n27fV+Z!Uh3kH(Lfyx3_?J&0+<%ELe<I`
+zHZn6XFbWAV3KW+lmSpDVDHtkbmZat?7)Wz5ayUVO4p#$<wMm0RBNLwhL<<wLmJKan
+p!x_PbL-iYC(eH@R&y1`es>KM47N<rbK0c6NnLvg!1MQbP001z<J<tFE
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/fixtures/epg/time_source/clock_vectors.json b/tests/fixtures/epg/time_source/clock_vectors.json
+new file mode 100644
+index 0000000..8bef4ca
+--- /dev/null
++++ b/tests/fixtures/epg/time_source/clock_vectors.json
+@@ -0,0 +1,37 @@
++[
++  {
++    "utc": "2026-10-25T00:59:59Z",
++    "local": "2026-10-25T02:59:59Z",
++    "offset": 120
++  },
++  {
++    "utc": "2026-10-25T01:00:00Z",
++    "local": "2026-10-25T02:00:00Z",
++    "offset": 60
++  },
++  {
++    "utc": "2026-10-25T01:59:59Z",
++    "local": "2026-10-25T02:59:59Z",
++    "offset": 60
++  },
++  {
++    "utc": "2026-03-29T00:59:59Z",
++    "local": "2026-03-29T01:59:59Z",
++    "offset": 60
++  },
++  {
++    "utc": "2026-03-29T01:00:00Z",
++    "local": "2026-03-29T03:00:00Z",
++    "offset": 120
++  },
++  {
++    "utc": "2026-01-01T00:10:00Z",
++    "local": "2025-12-31T18:40:00Z",
++    "offset": -330
++  },
++  {
++    "utc": "2025-12-31T22:50:00Z",
++    "local": "2026-01-01T04:20:00Z",
++    "offset": 330
++  }
++]
+diff --git a/tests/fixtures/epg/time_source/empty_directory_11a.bin b/tests/fixtures/epg/time_source/empty_directory_11a.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fe78c91aaac3a82205ab336262a003a393b5e81
+GIT binary patch
+literal 27
+ScmZQzV31~j0zMc6LIVH;bpR>=
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/fixtures/epg/time_source/timepoint_vectors.json b/tests/fixtures/epg/time_source/timepoint_vectors.json
+new file mode 100644
+index 0000000..71de3c9
+--- /dev/null
++++ b/tests/fixtures/epg/time_source/timepoint_vectors.json
+@@ -0,0 +1,146 @@
++[
++  {
++    "hex": "3be68000",
++    "utc": 1792886400,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3be68800ec00",
++    "utc": 1792886459,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3be68007",
++    "utc": 1792886820,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3be68807ec00",
++    "utc": 1792886879,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3be68322",
++    "utc": 1792931640,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3be68b22ec00",
++    "utc": 1792931699,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3be684c0",
++    "utc": 1792954800,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3be68cc0ec00",
++    "utc": 1792954859,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3be68587",
++    "utc": 1792966020,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3be6958700",
++    "utc": 1792966020,
++    "offset": 0,
++    "present": true
++  },
++  {
++    "hex": "3be6958702",
++    "utc": 1792966020,
++    "offset": 60,
++    "present": true
++  },
++  {
++    "hex": "3be6958704",
++    "utc": 1792966020,
++    "offset": 120,
++    "present": true
++  },
++  {
++    "hex": "3be695872b",
++    "utc": 1792966020,
++    "offset": -330,
++    "present": true
++  },
++  {
++    "hex": "3be695870b",
++    "utc": 1792966020,
++    "offset": 330,
++    "present": true
++  },
++  {
++    "hex": "3be68d87ec00",
++    "utc": 1792966079,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3be69d87ec0000",
++    "utc": 1792966079,
++    "offset": 0,
++    "present": true
++  },
++  {
++    "hex": "3be69d87ec0002",
++    "utc": 1792966079,
++    "offset": 60,
++    "present": true
++  },
++  {
++    "hex": "3be69d87ec0004",
++    "utc": 1792966079,
++    "offset": 120,
++    "present": true
++  },
++  {
++    "hex": "3be69d87ec002b",
++    "utc": 1792966079,
++    "offset": -330,
++    "present": true
++  },
++  {
++    "hex": "3be69d87ec000b",
++    "utc": 1792966079,
++    "offset": 330,
++    "present": true
++  },
++  {
++    "hex": "3be685fb",
++    "utc": 1792972740,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3be68dfbec00",
++    "utc": 1792972799,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3b40c5fb",
++    "utc": 1735689540,
++    "offset": 0,
++    "present": false
++  },
++  {
++    "hex": "3b410000",
++    "utc": 1735689600,
++    "offset": 0,
++    "present": false
++  }
++]
+diff --git a/tests/test_dab_clock.py b/tests/test_dab_clock.py
+new file mode 100644
+index 0000000..3ec6253
+--- /dev/null
++++ b/tests/test_dab_clock.py
+@@ -0,0 +1,70 @@
++"""Execute the actual DAB clock cases and queued command scheduling with mock SPI."""
++from pathlib import Path
++import subprocess,sys
++ROOT=Path(__file__).resolve().parents[1];out=ROOT/'.pio/dab_clock';out.mkdir(exist_ok=True)
++radio=(ROOT/'src/si4684.cpp').read_text(encoding='utf-8')
++cases=radio[radio.index('    case DabCommand::Time:'):radio.index('    case DabCommand::ServiceType:',radio.index('    case DabCommand::Time:'))]
++queue=radio[radio.index('  if(dabClockConfirmPending && signallock)'):radio.index('  if (dabAudioRefreshPending && dabActiveServiceValid)',radio.index('  if(dabClockConfirmPending && signallock)'))]
++cpp=r'''
++#include "epg_core.h"
++#include "dab_scheduler_policy.h"
++#include "vendor/si468x/Si468x.h"
++#include <cassert>
++#include <cstdio>
++#include <cstring>
++#define DIAG_PRINTF(...) ((void)0)
++static uint32_t tick=100;
++uint32_t millis(){return tick;}
++uint8_t SPIbuffer[32]={};
++struct Radio {
++ enum class DabCommand {None,Time,TimeUtc,TimeLocalConfirm};
++ unsigned Year=0,Months=0,Days=0,Hours=0,Minutes=0,Seconds=0,diagDabCommandErrorCount=0;
++ uint32_t dabTimeGeneration=0,dabLocalClockEpoch=0,dabLocalClockMs=0,dabLastLowPriorityCommandMs=0;
++ bool dabUtcRefreshPending=false,dabClockConfirmPending=false,dabTimeRefreshPending=true,signallock=true,diagnosticDebug=false;
++ epg::BroadcastClockSample dabEpgClock;
++ DabCommand sent=DabCommand::None;uint8_t sentType=255;
++ bool parseOk(si468x::Result result){return result==si468x::Result::Ok;}
++ bool startDabCommand(DabCommand cmd,uint8_t command,const uint8_t* args,unsigned n,unsigned response){
++  assert(command==0xbc && n==1 && response==11);sent=cmd;sentType=*args;return true;
++ }
++ void schedule(){const uint32_t now=millis();const uint8_t zero=0;
++'''+queue+r'''
++ }
++ void reply(unsigned year,unsigned month,unsigned day,unsigned hour,unsigned minute,unsigned second){
++  assert(sent!=DabCommand::None);const auto completed=sent;sent=DabCommand::None;
++  std::memset(SPIbuffer,0,sizeof(SPIbuffer));SPIbuffer[1]=128;
++  SPIbuffer[5]=uint8_t(year);SPIbuffer[6]=uint8_t(year>>8);SPIbuffer[7]=uint8_t(month);SPIbuffer[8]=uint8_t(day);SPIbuffer[9]=uint8_t(hour);SPIbuffer[10]=uint8_t(minute);SPIbuffer[11]=uint8_t(second);
++  switch(completed){
++'''+cases+r'''
++  default:assert(false);
++  }
++ }
++};
++int main(){
++ Radio r;
++ r.schedule();assert(r.sentType==0);r.reply(2026,10,25,2,59,59);assert(r.Hours==2 && !r.dabEpgClock.offsetKnown);
++ tick+=100;r.schedule();assert(r.sentType==1);r.reply(2026,10,25,0,59,59);assert(r.Hours==2 && !r.dabEpgClock.valid);
++ tick+=1000;r.schedule();assert(r.sentType==0);r.reply(2026,10,25,2,0,0);
++ auto clock=epg::resolveTime(r.dabEpgClock,tick,true);
++ assert(clock.utcValid && clock.offsetKnown && clock.offset==60 && clock.utc==epg::epoch(2026,10,25,1,0,0));
++ assert(clock.local==epg::epoch(2026,10,25,2,0,0) && r.Hours==2 && r.Minutes==0);
++ r.dabTimeRefreshPending=true;tick+=100;r.schedule();r.reply(2026,3,29,1,59,59);
++ tick+=100;r.schedule();r.reply(2026,3,29,0,59,59);
++ tick+=1000;r.schedule();r.reply(2026,3,29,3,0,0);
++ clock=epg::resolveTime(r.dabEpgClock,tick,true);
++ assert(clock.utc==epg::epoch(2026,3,29,1) && clock.local==epg::epoch(2026,3,29,3) && clock.offset==120);
++ assert(!epg::resolveTime(r.dabEpgClock,tick,false).utcValid);
++ r.dabTimeRefreshPending=true;r.schedule();r.reply(2026,10,25,8,0,0);
++ tick+=100;r.schedule();r.reply(2026,10,25,7,0,0);
++ tick+=2100;r.schedule();r.reply(2026,10,25,8,0,2);
++ assert(!r.dabEpgClock.valid && !r.dabEpgClock.offsetKnown);
++ r.dabTimeRefreshPending=true;r.schedule();r.reply(2026,10,25,8,0,0);
++ tick+=100;r.schedule();r.reply(2026,10,25,24,0,0);
++ assert(!r.dabEpgClock.valid && !r.dabClockConfirmPending);
++ r.signallock=false;r.dabTimeRefreshPending=true;r.schedule();assert(r.sent==Radio::DabCommand::None);
++ std::puts("Actual serialized LOCAL/UTC/LOCAL reply parser and queue: DST boundary, local display preservation, stale pair and invalid calendar rejection: PASS");
++}
++'''
++source=out/'clock.cpp';source.write_text(cpp,encoding='utf-8');exe=out/'clock.exe'
++subprocess.run([sys.argv[1] if len(sys.argv)>1 else 'C:/msys64/ucrt64/bin/g++.exe','-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(ROOT/'src'),str(source),str(ROOT/'src/epg_core.cpp'),'-o',str(exe)],check=True)
++subprocess.run([str(exe)],check=True)
+diff --git a/tests/test_epg_live.py b/tests/test_epg_live.py
+new file mode 100644
+index 0000000..368aa27
+--- /dev/null
++++ b/tests/test_epg_live.py
+@@ -0,0 +1,109 @@
++"""Clock/DST/availability regression against real bounded Core and vendor parser."""
++from pathlib import Path
++import json,subprocess,sys
++from datetime import datetime
++ROOT=Path(__file__).resolve().parents[1];out=ROOT/'.pio/epg_live';out.mkdir(exist_ok=True)
++compiler=sys.argv[1] if len(sys.argv)>1 else 'C:/msys64/ucrt64/bin/g++.exe'
++vectors=json.loads((ROOT/'tests/fixtures/epg/time_source/timepoint_vectors.json').read_text())
++clocks=json.loads((ROOT/'tests/fixtures/epg/time_source/clock_vectors.json').read_text())
++fixture=(ROOT/'tests/test_epg_cache.cpp').read_text();fixture=fixture[fixture.index('using Data='):fixture.index('int main()')]
++cpp=r'''
++#include "epg_core.h"
++#include "vendor/si468x/Si468x.h"
++#include <cassert>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <memory>
++#include <fstream>
++'''+fixture+r'''
++static void loadRaw(epg::Core& c,const std::vector<Data>& frames,uint32_t sid,bool live,bool reversed=false){
++ c.reset();c.setLive(live);c.setClockTrusted(true);
++ c.select(0x40e231530000ULL|sid,live?epg::epoch(2026,10,25,6,33):epg::epoch(2024,11,12,3,30),60);
++ uint32_t tick=1;std::vector<Data> ordered=frames;
++ if(reversed){ordered.clear();for(const auto& f:frames)if((f[0]&15)==6)ordered.push_back(f);for(auto i=frames.rbegin();i!=frames.rend();++i)if(((*i)[0]&15)==4)ordered.push_back(*i);}
++ for(unsigned turn=0;turn<4;++turn)for(const auto& f:ordered){
++  c.feed(f.data(),f.size(),tick+=10);while(c.busy())c.pump();
++  bool conflict=false;auto b=c.findStation(sid,0x3153,0xe2,-1,conflict);
++  c.select(b,c.now(),60);c.identityConflict=conflict;
++ }
++}
++int main(int argc,char** argv){
++ assert(argc==3);uint32_t utc=0;int16_t off=0;bool present=false;
++'''
++for v in vectors:
++ cpp+='{ const uint8_t b[]={'+','.join(str(x) for x in bytes.fromhex(v['hex']))+'};assert(epg::timePoint(b,sizeof(b),utc,off,present));assert(utc=='+str(v['utc'])+'U && off=='+str(v['offset'])+' && present=='+str(int(v['present']))+');}\n'
++cpp+=r'''
++ const uint8_t invalidHour[]={0x3b,0x34,0x96,0x00,0x02};assert(!epg::timePoint(invalidHour,5,utc,off,present));
++ const uint8_t invalidMinute[]={0x3b,0x34,0x90,0x3c,0x02};assert(!epg::timePoint(invalidMinute,5,utc,off,present));
++ const uint8_t invalidSeconds[]={0x3b,0x34,0x98,0x00,0xf0,0x00,0x02};assert(!epg::timePoint(invalidSeconds,7,utc,off,present));
++ const uint8_t invalidLto[]={0x3b,0x34,0x90,0x00,0x1d};assert(!epg::timePoint(invalidLto,5,utc,off,present));
++ const uint8_t missing[]={0x3b,0x34,0x90,0x00};assert(!epg::timePoint(missing,4,utc,off,present));
++ epg::BroadcastClockSample s;s.valid=true;s.generation=1;s.sampledAtMonotonicMs=100;s.encoding=epg::ClockEncoding::Local;
++'''
++for v in clocks:
++ u=int(datetime.fromisoformat(v['utc']).timestamp());l=int(datetime.fromisoformat(v['local']).timestamp())
++ cpp+=f'''s.calendarEpoch={l}U;s.offsetMinutes={v['offset']};s.offsetKnown=true;
++ {{auto r=epg::resolveTime(s,100,true);assert(r.utcValid && r.localValid && r.utc=={u}U && r.local=={l}U);int16_t paired=0;assert(epg::pairedOffset({l}U,100,{u}U,100,paired)&&paired=={v['offset']});}}
++'''
++cpp+=r'''
++ assert(!epg::resolveTime(s,300100,true).utcValid);assert(!epg::resolveTime(s,100,false).utcValid);
++ s.offsetKnown=false;assert(!epg::resolveTime(s,100,true).utcValid && epg::resolveTime(s,100,true).localValid);
++ s.encoding=epg::ClockEncoding::Unknown;assert(!epg::resolveTime(s,100,true).utcValid);
++ s.encoding=epg::ClockEncoding::UTC;assert(epg::resolveTime(s,100,true).utcValid);
++ int16_t delta=0;assert(!epg::pairedOffset(100000,0,100000,2100,delta));
++ assert(!epg::pairedOffset(100900,0,100000,100,delta));
++ const uint8_t rawClock[]={128,0,0,0,0xea,0x07,10,25,2,0,0};si468x::DabTimeInfo parsed;
++ assert(si468x::Si468x::parseDabTime(rawClock,sizeof(rawClock),parsed)==si468x::Result::Ok);
++ assert(parsed.year==2026 && parsed.month==10 && parsed.day==25 && parsed.hour==2);
++ auto ptr=std::unique_ptr<epg::Core>(new epg::Core);auto& c=*ptr;
++ assert(c.availability(false)==epg::Availability::NoSpi);
++ assert(c.availability(true)==epg::Availability::WaitDirectory);
++ Data empty(27);empty[3]=27;empty[12]=14;
++ std::ifstream emptyFile(argv[2],std::ios::binary);Data savedEmpty((std::istreambuf_iterator<char>(emptyFile)),std::istreambuf_iterator<char>());assert(savedEmpty==empty);
++ auto f=group(1,6,0,true,empty);
++ assert(c.feed(f.data(),f.size(),1)==epg::Feed::Accepted);
++ assert(c.availability(true)==epg::Availability::DirectoryEmpty && c.stats.invalid==0);
++ std::ifstream input(argv[1],std::ios::binary);std::vector<Data> frames;
++ while(true){uint8_t h[10];input.read(reinterpret_cast<char*>(h),10);if(!input.gcount())break;assert(input.gcount()==10);Data b(h[8]|(unsigned(h[9])<<8));input.read(reinterpret_cast<char*>(b.data()),b.size());assert(size_t(input.gcount())==b.size());frames.push_back(b);}
++ assert(frames.size()==1939);
++ for(bool reversed:{false,true}) for(uint32_t sid:{0x37fcU,0x37fdU}) {
++  loadRaw(c,frames,sid,true,reversed);
++  assert(c.station() && c.logoSize()>0 && !c.hasPI() && c.count()==0);
++  assert(c.availability(true)==epg::Availability::SiOnly && c.current()==-1 && c.next()==-1);
++  assert(std::string(c.station()->logo)==(sid==0x37fc?"krakow.png":"off.png"));
++ }
++ loadRaw(c,frames,0x3233,true);
++ assert(c.hasSI() && c.hasPI() && c.logoSize()>0 && c.count()==68);
++ assert(c.availability(true)==epg::Availability::PiDateStale && c.current()==-1 && c.next()==-1);
++ uint32_t first=0,last=0;assert(c.scheduleRange(first,last) && first<epg::epoch(2025,1,1));
++ assert(c.now()==epg::epoch(2026,10,25,6,33));
++ assert(c.archivePreview(epg::epoch(2024,11,12)));assert(c.current()==-1 && c.now()==epg::epoch(2026,10,25,6,33));
++ assert(c.archivePreview(0));c.setClockTrusted(false);assert(c.availability(true)==epg::Availability::TimeUnknown && c.current()==-1);
++ c.setClockTrusted(true);assert(c.availability(true)==epg::Availability::PiDateStale);
++ // Replace stale Directory with a current PI without resetting the receiver.
++ Object updated{0x123,0x40e231533233ULL,epg::epoch(2026,10,25),{}};
++ Data p=tlv(0x81,number(1,3));append(p,tlv(0x12,tlv(1,str("Current replacement"))));
++ Data t=tlv(0x80,timeValue(updated.day+6*3600));append(t,tlv(0x81,number(3600,2)));
++ append(t,tlv(0x82,timeValue(updated.day+6*3600+600)));append(t,tlv(0x83,number(2400,2)));append(p,tlv(0x2c,t));
++ Data r=tlv(5,number(updated.bearer,6));append(r,tlv(0x1c,p));updated.body=tlv(2,r);
++ directory(c,{updated});c.select(updated.bearer,epg::epoch(2026,10,25,6,33),0);feed(c,updated);
++ assert(c.availability(true)==epg::Availability::ReadyLive && c.count()==1 && c.current()==0);
++ assert(c.at(0).actual==updated.day+6*3600+600 && c.at(0).actualDuration==2400 && c.at(0).duration==3600);
++ c.setTime(updated.day+7*3600,0);assert(c.current()==-1); // [start,end), planned interval preserved.
++ c.setTime(updated.day+6*3600,0);assert(c.current()==0);
++ loadRaw(c,frames,0x3233,false);assert(c.count()==68 && c.current()>=0 && c.next()>=0);
++ loadRaw(c,frames,0x32a3,true);assert(c.availability(true)==epg::Availability::IdentityConflict && !c.logoSize());
++ c.reset();c.setLive(true);c.setClockTrusted(true);Object now=object(0,1,0,3);directory(c,{now});select(c,now);feed(c,now);verify(c,now,3);
++ assert(c.availability(true)==epg::Availability::ReadyLive);
++ c.setClockTrusted(false);assert(c.availability(true)==epg::Availability::TimeUnknown && c.current()==-1 && c.next()==-1);
++ c.setClockTrusted(true);assert(c.current()>=0);
++ const uint32_t day=c.localDay();c.select(c.selected(),0,0);assert(c.localDay()==day);
++ c.reset();assert(!c.count() && !c.logoSize() && c.availability(true)==epg::Availability::WaitDirectory);
++ std::printf("Clock/DST/RAW metadata/archive/conflict/empty-directory: PASS (arena=%zu)\n",epg::Core::memoryBytes());
++}
++'''
++source=out/'live.cpp';source.write_text(cpp,encoding='utf-8');exe=out/'live.exe'
++subprocess.run([compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(ROOT/'src'),str(source),str(ROOT/'src/epg_core.cpp'),'-o',str(exe)],check=True)
++subprocess.run([str(exe),str(ROOT/'.pio/epg_test/frames.bin'),str(ROOT/'tests/fixtures/epg/time_source/empty_directory_11a.bin')],check=True)

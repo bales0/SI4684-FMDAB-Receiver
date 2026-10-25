@@ -155,3 +155,14 @@ synthetic_logo_1.png, hardware_synthetic_logo.json a .log.
 Jde nadále o syntetickou DSRV injekci, nikoli ověření příjmu z éteru.
 
 Uživatel potvrdil, že závěrečné PAD Adam7 logo je celé a správně vykreslené.
+
+
+## Doplnění 25. 10. 2026 – souběh packet/X-PAD
+
+Historické testy na desce výše zůstávají záznamem tehdejšího firmware.
+Nový hostitelský `tests/test_epg_coexistence.py` ověřuje obě větve současně
+přes skutečný DsrvHeader, UA publikaci a runtime/Core. Zahrnuje přesnou 27B
+skupinu prázdného packet Directory a plné PAD SI/PI, kolizi TID, vlastní logo,
+nejistou UA a vadný první PAD payload. Nevysílá do rádia a neověřuje RF.
+Nový `EPG TEST TRANSPORT` vypisuje obě větve samostatně bez přepnutí režimu.
+Viz [report](EPG_MUX11A_XPAD_REPORT_20261025.md) a [živý RF postup](EPG_MUX11A_XPAD_RF_TEST_CZ.md).

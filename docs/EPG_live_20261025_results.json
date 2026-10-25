@@ -1,0 +1,42 @@
+{
+  "date": "2026-10-25",
+  "head": "116758e5bd05927f70f6884a332a845e0e60369b",
+  "firmware_sha256": "20aa1ba00ecbd921c9a3cc12ee7c3ad06f2abc21d1dd2259e36c428068819ed8",
+  "firmware_bytes": 3546112,
+  "static_ram": 66584,
+  "flash": 3545485,
+  "esp32_core": 14232,
+  "esp32_buffers": 36864,
+  "esp32_arena": 51096,
+  "hardware_tested": false,
+  "flashed": false,
+  "host_suite": "PASS",
+  "real_raw_objects": 70,
+  "real_raw_pi": 35,
+  "real_raw_si": 5,
+  "real_raw_png": 30,
+  "decoded_programmes": 1087,
+  "trojka_cache": 68,
+  "jedynka_demo_cache": 42,
+  "mock_pools_after_allocation": {
+    "free8": 13832,
+    "largest8": 13832,
+    "free32": 17416,
+    "largest32": 17416,
+    "not_hardware": true
+  },
+  "hardware_telemetry": {
+    "free8": "HW NOT TESTED",
+    "free32": "HW NOT TESTED",
+    "largest8": "HW NOT TESTED",
+    "largest32": "HW NOT TESTED",
+    "min_heap": "HW NOT TESTED",
+    "stack": "HW NOT TESTED"
+  },
+  "independent_checks": [
+    "preserved fixture SHA256/PNG/MSC CRC PASS",
+    "actual SPI probe/router PASS",
+    "new actual-duration/end-exclusive LIVE check PASS",
+    "I2S/SLS/Adam7/vendor/NVS/UART unchanged PASS"
+  ]
+}

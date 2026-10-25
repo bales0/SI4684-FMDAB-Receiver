@@ -730,7 +730,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   dabSignalRefreshPending = false;
   dabServiceListRefreshPending = false;
   dabEnsembleRefreshPending = false;
-  dabTimeRefreshPending = false;
+  dabTimeRefreshPending = false; dabUtcRefreshPending = dabClockConfirmPending = false; dabEpgClock.valid=false;
   dabAudioRefreshPending = false;
   dabAudioInfoValid = false;
   dabAudioInfoRetryCount = 0;
@@ -2226,7 +2226,7 @@ void DAB::setFreq(uint8_t freq) {
   dabSignalRefreshPending = false;
   dabServiceListRefreshPending = false;
   dabEnsembleRefreshPending = false;
-  dabTimeRefreshPending = false;
+  dabTimeRefreshPending = false; dabUtcRefreshPending = dabClockConfirmPending = false; dabEpgClock.valid=false;
   dabAudioRefreshPending = false;
   dabCurrentSubchannelRefreshPending = false;
   dabCurrentServiceRefreshPending = false;
@@ -2945,7 +2945,7 @@ void DAB::setService(uint8_t _index) {
 
   // Invalidate in-flight UA ownership as well as endpoint selection. Keep the
   // last known ensemble presence while the new audio context becomes stable.
-  epg::livePadEndpoint(0,0);
+  epg::liveServiceChanged();
   resetDabSpiDiscovery(true, false);
   dabSpiProbe.stop(millis());
   pty = 36;
@@ -3094,8 +3094,10 @@ void DAB::finishDabCommand(void) {
     if (completed == DabCommand::SpiProbeStart) {
       dabSpiProbe.started(now, result == si468x::Result::Ok,
                           result == si468x::Result::Timeout);
-      if (result == si468x::Result::Ok)
+      if (result == si468x::Result::Ok) {
+        epg_acq::trace().mark(0,4,now);
         epg::liveEndpoint(dabSpiProbe.spi.sid, dabSpiProbe.spi.cid);
+      }
       DIAG_PRINTF("[DAB/SPI/TEST] START result=%d reason=%02X; no SLS STOP issued\n",
                   static_cast<int>(result), static_cast<unsigned>(chip.lastDeviceError()));
     } else {
@@ -3484,6 +3486,7 @@ void DAB::finishDabCommand(void) {
           SPIbuffer + 1, 24, header);
       if (!parseOk(parseResult)) {
         ++diagDabCommandErrorCount;
+        epg_diag::increment(epg_diag::registry().headerErrors);
         dabDsrvPending = false;
         break;
       }
@@ -3495,6 +3498,7 @@ void DAB::finishDabCommand(void) {
       const dab_probe::Route target = dab_probe::route(
           header.serviceId, header.componentId, header.dataSource,
           audio, sls, dabSpiProbe.spi);
+      epg_diag::registry().header(header.dataSource,header.rawUatypeOrRfu,header.dscType,header.serviceState,header.serviceId,header.componentId,header.byteCount,dabUaScan.generation,millis(),(header.dataSource==0U && target==dab_probe::Route::Spi) || (header.dataSource==1U && header.rawUatypeOrRfu==7U));
       dabSpiProbe.observe(target, header.dataSource, header.serviceStopped(),
                           header.byteCount > 0U);
       const uint32_t routeNow = millis();
@@ -3574,20 +3578,30 @@ void DAB::finishDabCommand(void) {
                 !(header.interruptSource & 0x04U));
         if (padRoute == epg_ingress::PadRoute::Epg) {
           if (header.byteCount <= sizeof(SPIbuffer)-25U) {
-            epg::livePadEndpoint(dabActiveServiceId,dabActiveComponentId);
             if (epg::liveEnabled()) {
               const si468x::Result readResult = chip.readCurrentReply(
                   SPIbuffer+1,static_cast<uint16_t>(24U+header.byteCount));
               finishCommandDiagnostics(readResult);
               if (readResult==si468x::Result::Ok)
-                epg::livePadPayload(SPIbuffer+25,header.byteCount);
-              else ++diagDabCommandErrorCount;
-            }
-          }
+                epg::livePadData(dabActiveServiceId,dabActiveComponentId,SPIbuffer+25,header.byteCount);
+              else {++diagDabCommandErrorCount;epg_diag::registry().reject(epg_diag::Path::Pad,epg_diag::Reject::Read);}
+            } else epg_diag::registry().reject(epg_diag::Path::Pad,epg_diag::Reject::Replay);
+          } else epg_diag::registry().reject(epg_diag::Path::Pad,epg_diag::Reject::Length);
         } else if (padRoute == epg_ingress::PadRoute::Discard) {
+          epg_diag::Reject reason=epg_diag::Reject::Ua;
+          if(!dabActiveServiceValid || !ServiceStart || dabServiceRequestPending || dabTuneRequestPending || !dab_switch::audioContextUsable(dabSwitch.state))reason=epg_diag::Reject::Inactive;
+          else if(header.serviceId!=dabActiveServiceId)reason=epg_diag::Reject::Sid;
+          else if(!(dab_probe::Endpoint(dabActiveServiceId,dabActiveComponentId).matches(header.serviceId,header.componentId) || dab_probe::matchesAudioPad(dab_probe::Endpoint(dabActiveServiceId,dabActiveComponentId),header.serviceId,header.componentId)))reason=epg_diag::Reject::Cid;
+          else if(!dabUaInventoryValid || xpadSpiIdentity()==dab_spi::Identity::Unqueried)reason=epg_diag::Reject::Generation;
+          else if(header.dscType!=0 && header.dscType!=60)reason=epg_diag::Reject::Dscty;
+          else if(header.serviceState!=0 && header.serviceState!=3)reason=epg_diag::Reject::State;
+          else if(header.interruptSource&4)reason=epg_diag::Reject::Physical;
+          epg_diag::registry().reject(epg_diag::Path::Pad,reason);
           ++diagDabStaleMotCount;
         } else if (target == dab_probe::Route::Spi) {
-          if (header.dataSource == 0U && header.byteCount <= sizeof(SPIbuffer) - 25U &&
+          if((header.serviceState!=0U && header.serviceState!=3U) || (header.interruptSource&4U)) {
+            epg_diag::registry().reject(epg_diag::Path::Packet,(header.interruptSource&4U)?epg_diag::Reject::Physical:epg_diag::Reject::State);
+          } else if (header.dataSource == 0U && header.byteCount <= sizeof(SPIbuffer) - 25U &&
               epg::liveEnabled() && dabSpiProbe.state == dab_probe::State::Observing &&
               dabActiveServiceValid && !dabServiceRequestPending && !dabTuneRequestPending) {
             const si468x::Result readResult = chip.readCurrentReply(
@@ -3595,11 +3609,13 @@ void DAB::finishDabCommand(void) {
             finishCommandDiagnostics(readResult);
             if (readResult == si468x::Result::Ok)
               epg::livePayload(SPIbuffer + 25, header.byteCount);
-            else ++diagDabCommandErrorCount;
-          }
+            else {++diagDabCommandErrorCount;epg_diag::registry().reject(epg_diag::Path::Packet,epg_diag::Reject::Read);}
+          } else epg_diag::registry().reject(epg_diag::Path::Packet,epg::replayActive()?epg_diag::Reject::Replay:header.byteCount>sizeof(SPIbuffer)-25U?epg_diag::Reject::Length:epg_diag::Reject::Inactive);
         } else if (feedLegacy) {
+          epg_diag::increment(epg_diag::registry().at(header.dataSource==0?epg_diag::Path::Packet:epg_diag::Path::Pad).legacy);
           getServiceData();
         } else if (target != dab_probe::Route::Spi) {
+          epg_diag::registry().reject(header.dataSource==0?epg_diag::Path::Packet:epg_diag::Path::Pad,epg_diag::Reject::NoEndpoint);
           ++diagDabStaleMotCount;
         }
       }
@@ -3680,7 +3696,8 @@ void DAB::finishDabCommand(void) {
       break;
     }
 
-    case DabCommand::Time: {
+    case DabCommand::Time:
+    case DabCommand::TimeLocalConfirm: {
       si468x::DabTimeInfo time;
       const si468x::Result parseResult = si468x::Si468x::parseDabTime(
           SPIbuffer + 1, 11, time);
@@ -3695,6 +3712,39 @@ void DAB::finishDabCommand(void) {
       Minutes = time.minute;
       Seconds = time.second;
       dabTimeGeneration = dab_scheduler::nextGeneration(dabTimeGeneration);
+      dabLocalClockEpoch=epg::epoch(time.year,time.month,time.day,time.hour,time.minute,time.second);
+      dabLocalClockMs=millis();
+      if(completed==DabCommand::TimeLocalConfirm) {
+        int16_t offset=0;
+        const bool paired=epg::pairedOffsetAfterUtc(dabEpgClock.calendarEpoch,dabEpgClock.sampledAtMonotonicMs,dabLocalClockEpoch,dabLocalClockMs,offset);
+        dabEpgClock.offsetMinutes=offset;dabEpgClock.offsetKnown=paired;
+        dabEpgClock.valid=paired;dabEpgClock.generation=dabTimeGeneration;
+        if(diagnosticDebug) DIAG_PRINTF("[DAB/CLOCK] confirm local=%u utc=%u paired=%u offset=%d generation=%u\n",unsigned(dabLocalClockEpoch),unsigned(dabEpgClock.calendarEpoch),paired,int(offset),unsigned(dabTimeGeneration));
+      } else {
+        dabEpgClock=epg::BroadcastClockSample{};
+        dabEpgClock.year=time.year;dabEpgClock.month=time.month;dabEpgClock.day=time.day;
+        dabEpgClock.hour=time.hour;dabEpgClock.minute=time.minute;dabEpgClock.second=time.second;
+        dabEpgClock.encoding=epg::ClockEncoding::Local;dabEpgClock.calendarEpoch=dabLocalClockEpoch;
+        dabEpgClock.sampledAtMonotonicMs=dabLocalClockMs;dabEpgClock.generation=dabTimeGeneration;
+        dabEpgClock.valid=dabLocalClockEpoch!=0;dabUtcRefreshPending=dabEpgClock.valid;
+      }
+      if(diagnosticDebug) DIAG_PRINTF("[DAB/CLOCK] type=0 raw=%02X%02X%02X%02X%02X%02X%02X generation=%u local=%u\n",SPIbuffer[5],SPIbuffer[6],SPIbuffer[7],SPIbuffer[8],SPIbuffer[9],SPIbuffer[10],SPIbuffer[11],unsigned(dabTimeGeneration),unsigned(dabLocalClockEpoch));
+      break;
+    }
+
+    case DabCommand::TimeUtc: {
+      si468x::DabTimeInfo time;
+      const auto parsed=si468x::Si468x::parseDabTime(SPIbuffer+1,11,time);
+      if(!parseOk(parsed)) {++diagDabCommandErrorCount;break;}
+      dabEpgClock=epg::BroadcastClockSample{};
+      dabEpgClock.year=time.year;dabEpgClock.month=time.month;dabEpgClock.day=time.day;
+      dabEpgClock.hour=time.hour;dabEpgClock.minute=time.minute;dabEpgClock.second=time.second;
+      dabEpgClock.encoding=epg::ClockEncoding::UTC;
+      dabEpgClock.calendarEpoch=epg::epoch(time.year,time.month,time.day,time.hour,time.minute,time.second);
+      dabEpgClock.sampledAtMonotonicMs=millis();dabEpgClock.generation=dabTimeGeneration;
+      // Trust only after a subsequent LOCAL reply confirms a current offset.
+      dabClockConfirmPending=dabEpgClock.calendarEpoch!=0;
+      if(diagnosticDebug) DIAG_PRINTF("[DAB/CLOCK] type=1 raw=%02X%02X%02X%02X%02X%02X%02X generation=%u utc=%u\n",SPIbuffer[5],SPIbuffer[6],SPIbuffer[7],SPIbuffer[8],SPIbuffer[9],SPIbuffer[10],SPIbuffer[11],unsigned(dabTimeGeneration),unsigned(dabEpgClock.calendarEpoch));
       break;
     }
 
@@ -3867,6 +3917,10 @@ void DAB::setDabSwitchState(dab_switch::State state) {
                 dab_switch::stateName(state),
                 static_cast<unsigned>(dabSwitch.requestId));
   dabSwitch.state = state;
+  if(state==dab_switch::State::Ready || state==dab_switch::State::AudioOnly){
+    epg_acq::trace().enable(diagnosticDebug);
+    epg_acq::trace().audio(dabActiveServiceId,dabActiveComponentId,millis());
+  }
 }
 
 void DAB::requestDabDataServiceEvaluation(void) {
@@ -4037,7 +4091,7 @@ void DAB::scheduleNextDabCommand(void) {
     epgContinuous = false;
     if (epgManualPending) { epgManualPending = false; requestSpiProbe(); }
     else if (!epgProductionPaused && epg::liveEnabled() && !epg::replayActive() &&
-             dabSpiDiscovery.available() && requestSpiProbe()) epgContinuous = true;
+             dabSpiDiscovery.available() && requestSpiProbe(true)) { epgContinuous = true; }
   }
   const bool sameProbeContext = (epgContinuous || diagnosticDebug) &&
       (!epgContinuous || (dabSpiPresent && dabSpiDiscovery.status != dab_spi::Status::Ambiguous)) &&
@@ -4121,7 +4175,7 @@ void DAB::scheduleNextDabCommand(void) {
        (dabServiceListRefreshPending && signallock) ||
        dabServiceTypeScanIndex < numberofservices ||
        (dabEnsembleRefreshPending && signallock) ||
-       (dabTimeRefreshPending && signallock) ||
+       ((dabTimeRefreshPending || dabUtcRefreshPending || dabClockConfirmPending) && signallock) ||
        (dabAudioRefreshPending && dabActiveServiceValid &&
         dab_scheduler::retryReady(now, dabAudioInfoNotBeforeMs)) ||
        (dabCurrentServiceRefreshPending && dabActiveServiceValid) ||
@@ -4204,6 +4258,19 @@ void DAB::scheduleNextDabCommand(void) {
     return;
   }
 
+  if(dabClockConfirmPending && signallock) {
+    if(startDabCommand(DabCommand::TimeLocalConfirm,static_cast<uint8_t>(si468x::Command::DAB_GET_TIME),&zero,1,11)) {
+      dabClockConfirmPending=false;dabLastLowPriorityCommandMs=now;
+    }
+    return;
+  }
+  if (dabUtcRefreshPending && signallock) {
+    const uint8_t utcType=1; // AN649: 0 local, 1 UTC; main screen keeps local fields.
+    if(startDabCommand(DabCommand::TimeUtc,static_cast<uint8_t>(si468x::Command::DAB_GET_TIME),&utcType,1,11)) {
+      dabUtcRefreshPending=false;dabLastLowPriorityCommandMs=now;
+    }
+    return;
+  }
   if (dabTimeRefreshPending && signallock) {
     if (startDabCommand(DabCommand::Time,
                         static_cast<uint8_t>(si468x::Command::DAB_GET_TIME),
@@ -4257,6 +4324,7 @@ void DAB::scheduleNextDabCommand(void) {
   }
 
   if (dabSpiProbe.state == dab_probe::State::StartRequested) {
+    epg_acq::trace().mark(0,3,now);
     logSpiProbeSummary("baseline complete");
     uint8_t args[11] = {0};
     si468x::writeLe32(args + 3, dabSpiProbe.spi.sid);
@@ -4304,7 +4372,7 @@ void DAB::scheduleNextDabCommand(void) {
   }
 }
 
-bool DAB::requestSpiProbe(void) {
+bool DAB::requestSpiProbe(bool production) {
   if (epg::replayActive() || dabSpiProbe.state == dab_probe::State::CleanupFailed) return false;
   if (epgContinuous && dabSpiProbe.spi.valid) {
     epgManualPending = true;
@@ -4316,21 +4384,26 @@ bool DAB::requestSpiProbe(void) {
       (dabSwitch.state != dab_switch::State::Ready &&
        dabSwitch.state != dab_switch::State::AudioOnly)) return false;
   const uint32_t now = millis();
+  const uint32_t baselineMs=production?500U:5000U;
   if (!dabSpiProbe.request(
           dab_probe::Endpoint(dabActiveServiceId, dabActiveComponentId),
           dab_probe::Endpoint(dabActiveDataServiceId, dabActiveDataComponentId,
                               dabActiveDataServiceValid),
           dab_probe::Endpoint(dabSpiDiscovery.serviceId, dabSpiDiscovery.componentId),
-          dabSwitch.requestId, now)) return false;
+          dabSwitch.requestId, now, baselineMs)) return false;
+  epg_acq::trace().enable(diagnosticDebug);
+  epg_acq::trace().endpoint(0,dabSpiProbe.spi.sid,dabSpiProbe.spi.cid,now);
+  epg_acq::trace().mark(0,2,now);
   dabSpiProbeLastSummaryMs = now;
   dabSpiProbeSuppressedRoutes = 0;
   for (auto& last : dabSpiProbeLastRouteMs) last = now - 500U;
   dabSpiProbeCtsStart = diagDabCtsTimeoutCount;
   dabSpiProbeOverflowStart = diagDabDsrvOverflowCount;
   dabSpiProbeUartDropStart = diagSerial.droppedBytes();
-  DIAG_PRINTF("[DAB/SPI/TEST] baseline 5s then START SID=%08X CID=%08X; observe 30s; audio/SLS kept\n",
+  DIAG_PRINTF("[DAB/SPI/TEST] mode=%s baseline=%u ms then START SID=%08X CID=%08X; observe=%s; audio/SLS kept\n",
+              production?"LIVE":"DEBUG",unsigned(baselineMs),
               static_cast<unsigned>(dabSpiProbe.spi.sid),
-              static_cast<unsigned>(dabSpiProbe.spi.cid));
+              static_cast<unsigned>(dabSpiProbe.spi.cid),production?"continuous":"30s");
   return true;
 }
 
@@ -4361,19 +4434,33 @@ void DAB::logSpiProbeSummary(const char* phase) {
     DIAG_PRINTLN("[DAB/SPI/TEST] coexistence inconclusive; missing packets can be carousel timing");
 }
 
-bool DAB::xpadSpiPresent(void) const {
-  if(isFm() || !ServiceStart || !dabUaInventoryValid || !dabActiveServiceValid ||
-     dabServiceRequestPending || dabTuneRequestPending ||
-     !dab_switch::audioContextUsable(dabSwitch.state)) return false;
+dab_spi::Identity DAB::xpadSpiIdentity(void) const {
+  if(!dabUaInventoryValid || !dabActiveServiceValid) return dab_spi::Identity::Unqueried;
   for(uint8_t i=0;i<dabUaServiceCount;++i) {
     const UaService& entry=dabUaServices[i];
     if(entry.sid!=dabActiveServiceId || entry.first>dabUaComponentCount ||
        entry.count>dabUaComponentCount-entry.first) continue;
     for(uint16_t j=entry.first;j<entry.first+entry.count;++j)
-      if(dabUaComponents[j]==dabActiveComponentId && dab_spi::isSpi(dabSpiIdentities[j]))
-        return true;
+      if(dabUaComponents[j]==dabActiveComponentId) return dabSpiIdentities[j];
   }
-  return false;
+  return dabUaScan.functionalComplete(dabCommand==DabCommand::ComponentInfo)?
+      dab_spi::Identity::NotSpi:dab_spi::Identity::Unqueried;
+}
+void DAB::logEpgTransportPage(uint8_t page) {
+  if(page==0) {
+    const auto identity=xpadSpiIdentity();
+    const char* ua=dab_spi::isSpi(identity)?"confirmed":identity==dab_spi::Identity::Failed?"failed":identity==dab_spi::Identity::Unqueried?"unknown":"not-signalled";
+    diagSerial.printf("EPG AUDIO sid=%08X cid=%08X ua=%s identity=%u gen=%u published=%u inventory=%u complete=%u failed=%u usable=%u\n",unsigned(dabActiveServiceId),unsigned(dabActiveComponentId),ua,unsigned(identity),unsigned(dabUaScan.generation),unsigned(dabSpiDiscoveryGeneration),dabUaInventoryValid,dabUaScan.functionalComplete(dabCommand==DabCommand::ComponentInfo),unsigned(dabUaScan.failed),xpadSpiPresent());
+  } else if(page==1) {
+    diagSerial.printf("EPG PACKET selected=%u sid=%08X cid=%08X status=%s confirmed=%u unverified=%u tracked=%08X/%08X probe=%u\n",dabSpiDiscovery.available(),unsigned(dabSpiDiscovery.serviceId),unsigned(dabSpiDiscovery.componentId),dab_spi::statusName(dabSpiDiscovery.status),unsigned(dabSpiDiscovery.confirmed),unsigned(dabSpiDiscovery.packetMotUnverified),unsigned(dabSpiProbe.spi.sid),unsigned(dabSpiProbe.spi.cid),unsigned(dabSpiProbe.state));
+  } else {
+    diagSerial.printf("EPG RADIO mode=%s requestedIndex=%u khz=%u eid=%s ecc=%02X lock=%u tune=%u switching=%u CTS=%u overflow=%u errors=%u XPAD=%04X set=%d get=%d match=%u\n",isFm()?"FM":"DAB",unsigned(dabRequestedFrequency),unsigned(getFreq(dabRequestedFrequency)),EID,unsigned(ensembleEcc),signallock,dabTuneRequestPending,dabServiceRequestPending,unsigned(diagDabCtsTimeoutCount),unsigned(diagDabDsrvOverflowCount),unsigned(diagDabCommandErrorCount),unsigned(dabXpad.value),int(dabXpad.setResult),int(dabXpad.getResult),dabXpad.matches());
+  }
+}
+bool DAB::xpadSpiPresent(void) const {
+  return !isFm() && ServiceStart && dabUaInventoryValid && dabActiveServiceValid &&
+      !dabServiceRequestPending && !dabTuneRequestPending &&
+      dab_switch::audioContextUsable(dabSwitch.state) && dab_spi::isSpi(xpadSpiIdentity());
 }
 
 void DAB::resetDabSpiDiscovery(bool preservePresence, bool logInventory) {
@@ -4417,7 +4504,7 @@ void DAB::refreshDabSpiDiscovery(void) {
        dabSwitch.state != dab_switch::State::AudioOnly))) return;
   if (dabUaInventoryValid &&
       !dabUaScan.functionalComplete(dabCommand == DabCommand::ComponentInfo)) return;
-  dab_spi::Selector selector(dabActiveServiceId);
+  dab_spi::Selector selector(dabActiveServiceId,true);
   for (uint8_t i = 0; i < dabUaServiceCount; ++i) {
     const UaService& entry = dabUaServices[i];
     for (uint16_t j = entry.first; j < entry.first + entry.count; ++j) {
@@ -4432,13 +4519,20 @@ void DAB::refreshDabSpiDiscovery(void) {
   }
   dabSpiDiscovery = result;
   dabSpiDiscoveryGeneration = dabUaScan.generation;
+  epg_acq::trace().enable(diagnosticDebug);
+  if(dabUaInventoryValid && result.available())epg_acq::trace().endpoint(0,result.serviceId,result.componentId,millis());
+  if(xpadSpiPresent())epg_acq::trace().endpoint(1,dabActiveServiceId,dabActiveComponentId,millis());
   if (dabUaInventoryValid) dabSpiPresent = result.confirmedPresent();
   // Only a completed validated inventory can withdraw the selected PAD owner.
   // During routine UA refresh a temporarily unqueried answer merely pauses PAD.
   if(dabUaInventoryValid) {
     const bool pad=xpadSpiPresent();
     if(pad) epg::livePadEndpoint(dabActiveServiceId,dabActiveComponentId);
-    else if(dabUaScan.failed==0) epg::livePadEndpoint(0,0);
+    else {
+      const auto identity=xpadSpiIdentity();
+      if(identity==dab_spi::Identity::NotSpi || identity==dab_spi::Identity::Slideshow)
+        epg::livePadRevoked();
+    }
   }
   dabSpiDiscoveryDirty = false;
   // Invalid inventories require a new valid service list, never a UA-only pass.

@@ -8,7 +8,7 @@ FIXTURES=ROOT/'tests/fixtures/epg'
 sys.path.insert(0,str(ROOT/'tools'))
 from epg_synthetic import Client,groups,wire
 out=ROOT/'.pio/epg_acceptance'
-original=groups(FIXTURES/'synthetic_programme_groups.bin')
+original=groups(FIXTURES/'synthetic_programme_groups_v2.bin')
 def tlv(t,b):return bytes([t])+ (bytes([len(b)]) if len(b)<254 else b'\xfe'+struct.pack('>H',len(b)))+b
 def crc16(b):
  c=0xffff
@@ -61,7 +61,7 @@ def main():
  for interlace in (0,1):
   image=png(interlace)
   assert image==(FIXTURES/f'synthetic_logo_{interlace}.png').read_bytes()
-  assert fixture(image)==groups(FIXTURES/f'synthetic_logo_{interlace}_groups.bin')
+  assert fixture(image)==groups(FIXTURES/f'synthetic_logo_{interlace}_groups_v2.bin')
   for frame in fixture(image):assert crc16(frame[:-2])==int.from_bytes(frame[-2:],'big')
  print('Preserved EPG fixture hashes, generated PNG/streams and MSC CRC: PASS',flush=True)
  if args.verify_fixtures:return

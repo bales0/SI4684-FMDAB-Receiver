@@ -1,0 +1,21 @@
+{
+  "source_archive": "EPG_DSRV_dumps_and_files.zip",
+  "source_archive_sha256": "7f585793084d3b7a6072d5775f557b0eac75e4d7b639eff552445da10a030dbe",
+  "source_entry": "log_11A.txt",
+  "entry_sha256": "f72e015bed9b9e321667129967f5224ec4b6835556c1945ac02a25f760df43dd",
+  "complete_packet_groups": 422,
+  "crc_valid": 422,
+  "crc_bad": 0,
+  "packet_sid": "E231B3FE",
+  "packet_cid": "C00B",
+  "group_bytes": 27,
+  "directory_bytes": 16,
+  "tid": "8CC2",
+  "objects": 0,
+  "directory_hex": "0000001000000000dc00000003004101",
+  "pad_route_lines": 44,
+  "sampled_ua_packet_spi": 2,
+  "sampled_ua_pad_slideshow": 3,
+  "sampled_ua_pad_spi": 0,
+  "conclusion": "Empty packet carousel proved. X-PAD SPI on 11A unverified; rate-limited UA samples cannot prove absence."
+}

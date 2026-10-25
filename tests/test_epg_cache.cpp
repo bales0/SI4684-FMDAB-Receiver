@@ -13,7 +13,7 @@ static Data number(uint64_t value,unsigned bytes){Data out(bytes);while(bytes){o
 static Data tlv(uint8_t tag,const Data& data){Data out{tag};if(data.size()<254)out.push_back(uint8_t(data.size()));else{out.push_back(254);append(out,number(data.size(),2));}append(out,data);return out;}
 static Data str(const std::string& value){return Data(value.begin(),value.end());}
 static void bits(Data& out,unsigned offset,unsigned count,uint32_t value){for(unsigned i=0;i<count;++i){const unsigned bit=offset+i;out[bit/8]|=uint8_t(((value>>(count-1-i))&1)<<(7-bit%8));}}
-static Data timeValue(uint32_t seconds){Data out(4);bits(out,1,17,seconds/86400+40587);bits(out,20,5,(seconds/3600)%24);bits(out,25,6,(seconds/60)%60);return out;}
+static Data timeValue(uint32_t seconds){Data out(4);bits(out,1,17,seconds/86400+40587);bits(out,21,5,(seconds/3600)%24);bits(out,26,6,(seconds/60)%60);return out;}
 struct Object{uint16_t tid;uint64_t bearer;uint32_t day;Data body;};
 static Object object(unsigned id,unsigned station,unsigned day,unsigned count,unsigned description=8){
  Object out{uint16_t(0x100+id),base+station,today+day*86400,{}};

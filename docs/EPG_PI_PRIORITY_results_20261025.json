@@ -1,0 +1,760 @@
+{
+  "date": "2026-10-25",
+  "head": "116758e5bd05927f70f6884a332a845e0e60369b",
+  "baseline": "Local state after EPG_MUX11A_XPAD_20261025; previous UTC/LTO/archive fixes preserved.",
+  "T01_T16": {
+    "T01": {
+      "result": "PASS",
+      "evidence": [
+        "priority: exact selected PI before SI"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T02": {
+      "result": "PASS",
+      "evidence": [
+        "priority: PI -> SI -> own Adam7 PNG; NOW survives SI"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T03": {
+      "result": "PASS",
+      "evidence": [
+        "priority: SI-only",
+        "live: real Krakow/OFF SI-only and verified station identity"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T04": {
+      "result": "PASS",
+      "evidence": [
+        "priority: foreign PI excluded"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T05": {
+      "result": "PASS",
+      "evidence": [
+        "priority: zero/unknown/conflict identity",
+        "before-fix zero-bearer regression reproduced"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T06": {
+      "result": "PASS",
+      "evidence": [
+        "priority: archival interval -> SI/PNG; no year rewrite",
+        "live: real historical PI is stale"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T07": {
+      "result": "PASS",
+      "evidence": [
+        "coexistence A: 19 empty packet groups, PAD 3 programmes stays Ready"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T08": {
+      "result": "PASS",
+      "evidence": [
+        "coexistence A: same Directory TID8CC2"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T09": {
+      "result": "PASS",
+      "evidence": [
+        "coexistence D: partial packet/PAD owner changes, failed/incomplete UA, confirmed revocation"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T10": {
+      "result": "PASS",
+      "evidence": [
+        "transport: actual scheduler at 499/500 ms"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T11": {
+      "result": "PASS",
+      "evidence": [
+        "transport: manual at 4999/5000 ms and actual mode/baseline log"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T12": {
+      "result": "PASS",
+      "evidence": [
+        "transport: baseline lock/tune/service/request cancellation",
+        "SPI probe/router: context guards"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T13": {
+      "result": "PASS",
+      "evidence": [
+        "priority: 500/5000 baselines across UINT32_MAX",
+        "SPI probe/router: STOP retry across wrap"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T14": {
+      "result": "PASS",
+      "evidence": [
+        "priority: uncertain START -> STOP",
+        "SPI probe/router: bounded cleanup failure"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T15": {
+      "result": "PASS",
+      "evidence": [
+        "synthetic_paths",
+        "X-PAD config/diagnostics",
+        "coexistence E: SLS/DLS/identity isolation"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    },
+    "T16": {
+      "result": "PASS",
+      "evidence": [
+        "priority: repeated carousel has 3 records and own PNG without reset"
+      ],
+      "scope": "host; mocked RF/chip/clock/UART"
+    }
+  },
+  "host_acceptance": [
+    {
+      "test": "RAW/oracle production core",
+      "exit": 0,
+      "seconds": 7.258
+    },
+    {
+      "test": "compile errors",
+      "exit": 0,
+      "seconds": 0.81
+    },
+    {
+      "test": "errors",
+      "exit": 0,
+      "seconds": 0.143
+    },
+    {
+      "test": "compile cache",
+      "exit": 0,
+      "seconds": 0.792
+    },
+    {
+      "test": "cache",
+      "exit": 0,
+      "seconds": 0.318
+    },
+    {
+      "test": "compile uart",
+      "exit": 0,
+      "seconds": 0.771
+    },
+    {
+      "test": "uart",
+      "exit": 0,
+      "seconds": 0.044
+    },
+    {
+      "test": "compile SPI probe",
+      "exit": 0,
+      "seconds": 0.283
+    },
+    {
+      "test": "SPI probe/router",
+      "exit": 0,
+      "seconds": 0.047
+    },
+    {
+      "test": "compile dab_spi_discovery",
+      "exit": 0,
+      "seconds": 0.257
+    },
+    {
+      "test": "dab_spi_discovery",
+      "exit": 0,
+      "seconds": 0.038
+    },
+    {
+      "test": "compile dab_packet_inventory",
+      "exit": 0,
+      "seconds": 0.387
+    },
+    {
+      "test": "dab_packet_inventory",
+      "exit": 0,
+      "seconds": 0.07
+    },
+    {
+      "test": "DAB clock contract",
+      "exit": 0,
+      "seconds": 0.603
+    },
+    {
+      "test": "X-PAD config/diagnostics",
+      "exit": 0,
+      "seconds": 0.521
+    },
+    {
+      "test": "live",
+      "exit": 0,
+      "seconds": 3.728
+    },
+    {
+      "test": "priority",
+      "exit": 0,
+      "seconds": 0.797
+    },
+    {
+      "test": "runtime",
+      "exit": 0,
+      "seconds": 1.707
+    },
+    {
+      "test": "ui",
+      "exit": 0,
+      "seconds": 1.172
+    },
+    {
+      "test": "transport",
+      "exit": 0,
+      "seconds": 0.535
+    },
+    {
+      "test": "coexistence",
+      "exit": 0,
+      "seconds": 1.287
+    },
+    {
+      "test": "synthetic_paths",
+      "exit": 0,
+      "seconds": 1.02
+    },
+    {
+      "test": "synthetic_uart",
+      "exit": 0,
+      "seconds": 1.03
+    },
+    {
+      "test": "storage",
+      "exit": 0,
+      "seconds": 3.532
+    },
+    {
+      "test": "png_adam7",
+      "exit": 0,
+      "seconds": 4.497
+    },
+    {
+      "test": "pc",
+      "exit": 0,
+      "seconds": 7.919
+    }
+  ],
+  "coexistence": {
+    "kind": "host full production DSRV/runtime/Core, not RF",
+    "pass": true,
+    "unexpectedResets": 0,
+    "mockExtraDramPressure": 1024,
+    "physical_hardware_tested": false,
+    "resetReasonNames": [
+      "tune",
+      "service",
+      "packet-endpoint",
+      "packet->PAD",
+      "PAD->packet",
+      "pad-endpoint",
+      "ua-revoked",
+      "replay-start",
+      "replay-stop",
+      "PAD-acquire"
+    ],
+    "padRejectNames": [
+      "ua",
+      "generation",
+      "sid",
+      "cid",
+      "inactive",
+      "dscty",
+      "state",
+      "physical",
+      "length",
+      "read",
+      "replay",
+      "owner",
+      "data",
+      "no-endpoint",
+      "busy"
+    ],
+    "cases": [
+      {
+        "case": "A-empty-packet-full-PAD-same-TID-menu",
+        "pass": true,
+        "packetGroups": 19,
+        "packetEmpty": 19,
+        "packetBlocked": 18,
+        "padGroups": 6,
+        "padPI": 1,
+        "padSI": 1,
+        "padPNG": 0,
+        "cached": 3,
+        "resets": 1,
+        "expectedResets": 1,
+        "resetReasons": [
+          1,
+          0,
+          1,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "padRejects": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "case": "B-empty-packet-PAD-not-confirmed",
+        "pass": true,
+        "packetGroups": 4,
+        "packetEmpty": 4,
+        "packetBlocked": 0,
+        "padGroups": 0,
+        "padPI": 0,
+        "padSI": 0,
+        "padPNG": 0,
+        "cached": 0,
+        "resets": 0,
+        "expectedResets": 0,
+        "resetReasons": [
+          2,
+          0,
+          2,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "padRejects": [
+          1,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "case": "B2-E-packet-SLS-DLS-failed-first-PAD",
+        "pass": true,
+        "packetGroups": 5,
+        "packetEmpty": 0,
+        "packetBlocked": 0,
+        "padGroups": 2,
+        "padPI": 0,
+        "padSI": 0,
+        "padPNG": 0,
+        "cached": 3,
+        "resets": 0,
+        "expectedResets": 0,
+        "resetReasons": [
+          3,
+          0,
+          3,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "padRejects": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          2,
+          0,
+          0
+        ]
+      },
+      {
+        "case": "B3-full-PAD-without-packet-endpoint",
+        "pass": true,
+        "packetGroups": 0,
+        "packetEmpty": 0,
+        "packetBlocked": 0,
+        "padGroups": 5,
+        "padPI": 1,
+        "padSI": 1,
+        "padPNG": 0,
+        "cached": 3,
+        "resets": 1,
+        "expectedResets": 1,
+        "resetReasons": [
+          4,
+          0,
+          5,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "padRejects": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "case": "C-PAD-SI-own-PNG-no-PI",
+        "pass": true,
+        "packetGroups": 8,
+        "packetEmpty": 8,
+        "packetBlocked": 8,
+        "padGroups": 9,
+        "padPI": 0,
+        "padSI": 1,
+        "padPNG": 1,
+        "cached": 0,
+        "resets": 0,
+        "expectedResets": 0,
+        "resetReasons": [
+          5,
+          0,
+          6,
+          2,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "padRejects": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "case": "D-owner-handoff-UA-unknown-failed-duplicate-revoked",
+        "pass": true,
+        "packetGroups": 5,
+        "packetEmpty": 0,
+        "packetBlocked": 0,
+        "padGroups": 6,
+        "padPI": 1,
+        "padSI": 1,
+        "padPNG": 0,
+        "cached": 3,
+        "resets": 2,
+        "expectedResets": 2,
+        "resetReasons": [
+          6,
+          0,
+          7,
+          3,
+          0,
+          0,
+          1,
+          0,
+          0,
+          1
+        ],
+        "padRejects": [
+          1,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "case": "D-service-frequency-FM-isolation",
+        "pass": true,
+        "packetGroups": 0,
+        "packetEmpty": 0,
+        "packetBlocked": 0,
+        "padGroups": 0,
+        "padPI": 0,
+        "padSI": 0,
+        "padPNG": 0,
+        "cached": 0,
+        "resets": 4,
+        "expectedResets": 4,
+        "resetReasons": [
+          9,
+          1,
+          8,
+          5,
+          0,
+          0,
+          1,
+          0,
+          0,
+          1
+        ],
+        "padRejects": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "case": "E-negative-header-identity-CRC-read-timeout-clock",
+        "pass": true,
+        "packetGroups": 0,
+        "packetEmpty": 0,
+        "packetBlocked": 0,
+        "padGroups": 6,
+        "padPI": 1,
+        "padSI": 1,
+        "padPNG": 0,
+        "cached": 3,
+        "resets": 0,
+        "expectedResets": 0,
+        "resetReasons": [
+          10,
+          1,
+          9,
+          6,
+          0,
+          0,
+          1,
+          0,
+          0,
+          1
+        ],
+        "padRejects": [
+          0,
+          1,
+          1,
+          2,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          1,
+          0
+        ]
+      },
+      {
+        "case": "F-PAD-signalled-no-data-is-WAITING",
+        "pass": true,
+        "packetGroups": 11,
+        "packetEmpty": 11,
+        "packetBlocked": 10,
+        "padGroups": 0,
+        "padPI": 0,
+        "padSI": 0,
+        "padPNG": 0,
+        "cached": 0,
+        "resets": 1,
+        "expectedResets": 1,
+        "resetReasons": [
+          11,
+          1,
+          10,
+          7,
+          0,
+          0,
+          1,
+          0,
+          0,
+          1
+        ],
+        "padRejects": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "case": "F-replay-quarantine",
+        "pass": true,
+        "packetGroups": 11,
+        "packetEmpty": 11,
+        "packetBlocked": 10,
+        "padGroups": 0,
+        "padPI": 0,
+        "padSI": 0,
+        "padPNG": 0,
+        "cached": 0,
+        "resets": 1,
+        "expectedResets": 1,
+        "resetReasons": [
+          11,
+          1,
+          10,
+          7,
+          0,
+          0,
+          1,
+          1,
+          0,
+          1
+        ],
+        "padRejects": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    ],
+    "synthetic_snapshot": "EPG OK TRANSPORT queued\nEPG AUDIO sid=00003201 cid=01FE0005 ua=confirmed identity=2 gen=2 published=1 inventory=1 complete=1 failed=0 usable=1\nEPG PACKET selected=1 sid=E23153FE cid=01F2C00C status=confirmed/ensemble confirmed=1 unverified=0 tracked=E23153FE/01F2C00C probe=4\nEPG RADIO mode=DAB requestedIndex=24 khz=216928 eid=3153 ecc=E2 lock=1 tune=0 switching=0 CTS=0 overflow=0 errors=0 XPAD=0000 set=127 get=127 match=0\nEPG OWNER mode=LIVE owner=PAD channelIndex=24 epoch=1 resets=3 last=packet->PAD stateChanges=5 state=READY_LIVE headerErrors=0\nEPG TRANSPORT path=PACKET endpoint=E23153FE/01F2C00C headers=19/0/0/0 candidate=19 admitted=1 blocked=18 legacy=0 last=E23153FE/0000C00C src=0 ua=0007 dscty=60 state=0 bytes=27 gen=2 waitMs=0 idleMs=500 reason=empty-directory\nEPG MOTPATH path=PACKET groups=19 valid=19 crcBad=0 invalid=0 type4=0 type6=19 dirs=19 unique=1 repeats=18 empty=19 tid=8CC2 dirBytes=16 objects=0 SI=0 PI=0 PNG=0 programmes=0 historyLimited=0\nEPG REJECT path=PACKET ua=0 generation=0 sid=0 cid=0 inactive=0 dscty=0 state=0 physical=0 length=0 read=0 replay=0 owner=18 data=0 no-endpoint=0 busy=0\nEPG TRANSPORT path=PAD endpoint=00003201/01FE0005 headers=0/6/0/0 candidate=6 admitted=6 blocked=0 legacy=0 last=00003201/00000005 src=1 ua=0007 dscty=60 state=0 bytes=50 gen=2 waitMs=0 idleMs=2303 reason=directory-known\nEPG MOTPATH path=PAD groups=6 valid=6 crcBad=0 invalid=0 type4=4 type6=2 dirs=2 unique=1 repeats=1 empty=0 tid=8CC2 dirBytes=39 objects=2 SI=1 PI=1 PNG=0 programmes=3 historyLimited=0\nEPG REJECT path=PAD ua=0 generation=0 sid=0 cid=0 inactive=0 dscty=0 state=0 physical=0 length=0 read=0 replay=0 owner=0 data=0 no-endpoint=0 busy=0\nEPG RESETS total=3 tune=1 service=0 packet-endpoint=1 packet->PAD=1 PAD->packet=0 pad-endpoint=0 ua-revoked=0 replay-start=0 replay-stop=0 PAD-acquire=0\nEPG HEALTH free8=12808 largest8=12808 free32=17416 largest32=17416 min=30224 UARTdrop=0 audio=1 SLS=1 core=1 arena=51392 cached=3 limited=0 timeout=0 busy=0 invalid=0 crcBad=0\nEPG TRANSPORT END\n",
+    "stderr": ""
+  },
+  "before_fix": {
+    "T05": "Expected failure reproduced with pre-task Core when selected=0 and PI bearer=0."
+  },
+  "build": {
+    "pass": true,
+    "environment": "esp32dev",
+    "ram_bytes": 67248,
+    "flash_bytes": 3553337,
+    "firmware_bytes": 3553952,
+    "firmware_sha256": "7c5dbe6c7f8734dd7a3595990560af7937254cff4c926a310aa186fb10e425cc",
+    "target_trace_bytes": 124,
+    "target_core_bytes": 14232,
+    "target_core_buffers_bytes": 36864,
+    "target_core_total_bytes": 51096
+  },
+  "latency": {
+    "old_production_baseline_ms": 5000,
+    "previous_local_production_baseline_ms": 500,
+    "current_production_baseline_ms": 500,
+    "manual_baseline_ms": 5000,
+    "expected_reduction_vs_old_ms": 4500,
+    "additional_reduction_vs_previous_local_ms": 0,
+    "total_ui_gain_measured_on_hardware": false
+  },
+  "hardware": {
+    "result": "NOT RUN / LIVE RF NOT VERIFIED",
+    "uploaded": false,
+    "nvs_changed": false,
+    "mux11a_xpad": "UNVERIFIED",
+    "audio_sls_fifo_stack": "NOT TESTED"
+  }
+}

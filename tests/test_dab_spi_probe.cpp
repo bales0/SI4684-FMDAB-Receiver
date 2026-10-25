@@ -281,6 +281,11 @@ static void testFailuresAndWraparound() {
 }
 
 int main() {
+  Probe production;
+  assert(production.request(audio,sls,spi,1,100));
+  assert(production.nextActionMs==5100); // DEBUG baseline stays five seconds.
+  production.stop(100);assert(production.request(audio,sls,spi,1,100,500));production.advance(599,true);assert(production.state==State::Baseline);
+  production.advance(600,true);assert(production.state==State::StartRequested);
   testRouter();
   testLegacyReceptionGate();
   testCapturedAudioPadIdentity();

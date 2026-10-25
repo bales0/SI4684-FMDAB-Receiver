@@ -1,0 +1,146 @@
+[
+  {
+    "hex": "3be68000",
+    "utc": 1792886400,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3be68800ec00",
+    "utc": 1792886459,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3be68007",
+    "utc": 1792886820,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3be68807ec00",
+    "utc": 1792886879,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3be68322",
+    "utc": 1792931640,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3be68b22ec00",
+    "utc": 1792931699,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3be684c0",
+    "utc": 1792954800,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3be68cc0ec00",
+    "utc": 1792954859,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3be68587",
+    "utc": 1792966020,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3be6958700",
+    "utc": 1792966020,
+    "offset": 0,
+    "present": true
+  },
+  {
+    "hex": "3be6958702",
+    "utc": 1792966020,
+    "offset": 60,
+    "present": true
+  },
+  {
+    "hex": "3be6958704",
+    "utc": 1792966020,
+    "offset": 120,
+    "present": true
+  },
+  {
+    "hex": "3be695872b",
+    "utc": 1792966020,
+    "offset": -330,
+    "present": true
+  },
+  {
+    "hex": "3be695870b",
+    "utc": 1792966020,
+    "offset": 330,
+    "present": true
+  },
+  {
+    "hex": "3be68d87ec00",
+    "utc": 1792966079,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3be69d87ec0000",
+    "utc": 1792966079,
+    "offset": 0,
+    "present": true
+  },
+  {
+    "hex": "3be69d87ec0002",
+    "utc": 1792966079,
+    "offset": 60,
+    "present": true
+  },
+  {
+    "hex": "3be69d87ec0004",
+    "utc": 1792966079,
+    "offset": 120,
+    "present": true
+  },
+  {
+    "hex": "3be69d87ec002b",
+    "utc": 1792966079,
+    "offset": -330,
+    "present": true
+  },
+  {
+    "hex": "3be69d87ec000b",
+    "utc": 1792966079,
+    "offset": 330,
+    "present": true
+  },
+  {
+    "hex": "3be685fb",
+    "utc": 1792972740,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3be68dfbec00",
+    "utc": 1792972799,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3b40c5fb",
+    "utc": 1735689540,
+    "offset": 0,
+    "present": false
+  },
+  {
+    "hex": "3b410000",
+    "utc": 1735689600,
+    "offset": 0,
+    "present": false
+  }
+]

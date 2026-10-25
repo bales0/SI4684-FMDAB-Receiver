@@ -35,7 +35,7 @@ Syntetický program přes E2, všech devět scénářů a závěrečná PAD smy�
 nepotřebuje předem generovat data v `.pio`:
 
 ```powershell
-python -u tools/epg_synthetic.py --port COM4 --input tests/fixtures/epg/synthetic_programme_groups.bin --loop
+python -u tools/epg_synthetic.py --port COM4 --input tests/fixtures/epg/synthetic_programme_groups_v2.bin --loop
 ```
 
 Test čtyř kombinací MSC/PAD × běžné/Adam7 PNG a následná PAD Adam7 smyčka:
@@ -60,3 +60,29 @@ Původní testy mohou mít stále výchozí cesty do `_usertesting`/`Specificati
 příkazy výše explicitně vybírají uchované kopie. `.pio` lze znovu vytvořit;
 tyto vstupy po jeho vyčištění zůstanou. Vstupy nejsou součástí firmware.
 Syntetická injekce ověřuje MCU zpracování DSRV, nikoli RF ani odbalení PAD v čipu.
+
+
+Od opravy timePoint 25. 10. 2026 používejte syntetické streamy `*_v2.bin`.
+Mají normové bity času 21/26. Původní streamy jsou zachované jako historické
+fixture starého firmwaru; obsahují chybný syntetický encoder času a jejich
+NOW/NEXT nelze použít jako referenci nového parseru. PNG jsou stejné.
+Skript testu loga nyní používá v2; offline kontrola ověřuje oba původní vstupy
+podle hashů a přesnou regeneraci nových v2 streamů. Skutečný RAW a referenční
+ZIP se nezměnily. Časové hodnoty původního JSON oracle mají chybu starého
+parseru; hostitelský test času je proto kontroluje samostatným binárním dekodérem.
+
+
+## Přesná fixture MUX 11A (25. 10. 2026)
+
+`mux11a_empty_group.bin` je první úplná CRC-validní 27B skupina z
+`EPG_DSRV_dumps_and_files.zip/log_11A.txt`, SID E231B3FE, CID C00B, TID 8CC2.
+`mux11a_empty_directory.bin` je její přesné 16B tělo s nulou objektů.
+`mux11a_capture_analysis.json` uchovává souhrn a hashe původního archivu/logu.
+422 úplných skupin má platné CRC a stejné tělo. Tři omezené vzorky PAD UA
+ukazují Slideshow; X-PAD SPI na 11A z tohoto logu nelze potvrdit ani vyloučit.
+
+Starší `time_source/empty_directory_11a.bin` je 27B **syntetické tělo**
+Directory pro časové testy; není přesnou kopií 27B přenosové skupiny z 11A.
+Oba vstupy zůstávají uchované. `test_epg_coexistence.py` používá přesnou novou
+fixture proti souběžnému PAD programu, včetně kolize stejného TID mezi toky.
+Viz [RF postup](../../../docs/EPG_MUX11A_XPAD_RF_TEST_CZ.md).

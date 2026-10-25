@@ -20,7 +20,7 @@ meta=b[:24+count*28]
 translations=(ROOT/'src/language.h').read_text(encoding='utf-8').split('// EPG UI strings follow',1)[1].rsplit('#endif',1)[0]
 translations='// EPG UI strings follow'+translations
 messages=re.findall(r'"([^"\n]*)"',translations)
-assert len(messages)==8*15
+assert len(messages)==8*21
 glyphs={struct.unpack_from('>7i',b,24+i*28)[0] for i in range(count)}
 missing={ch for message in messages for ch in message if ord(ch)>=127 and ord(ch) not in glyphs}
 assert not missing, repr(missing)
@@ -86,8 +86,9 @@ int PrimaryColor=1,PrimaryColorSmooth=2,SecondaryColor=3,SecondaryColorSmooth=4,
 char _serviceName[17]="radio";
 struct Radio { bool isFm(){return false;} } radio;
 namespace epg {
-static Core instance;
-Core* runtime(){return &instance;} bool replayActive(){return true;} bool ensure(bool){return true;}
+static Core instance;static bool testReplay=true;
+Availability availability(){return instance.availability(true);}
+Core* runtime(){return &instance;} bool replayActive(){return testReplay;} bool ensure(bool){return true;}
 }
 void DrawNeutralStatusPanel(){++panels;}
 const uint16_t configurationbackground[320*240]={};
@@ -149,7 +150,10 @@ int main(int argc,char** argv){
  while(true){uint8_t h[10];f.read(reinterpret_cast<char*>(h),10);if(!f.gcount())break;assert(f.gcount()==10);
   unsigned n=h[8]|(unsigned(h[9])<<8);std::vector<uint8_t> b(n);f.read(reinterpret_cast<char*>(b.data()),n);
   c->feed(b.data(),n,testMillis++);while(c->busy())c->pump();}
- assert(c->count() && c->current()>=0); EpgOpen();
+ assert(c->count() && c->current()>=0);
+ epg::testReplay=false;epg_acq::trace().enable(true);epg_acq::trace().endpoint(0,0xe23153fe,0x01f2c00c,testMillis);
+ EpgOpen();assert(epg_acq::trace().paths[0].known&(1U<<7));
+ epg_acq::trace().enable(false);epg::testReplay=true;
  assert(EpgVisible() && textLog.find("EPG NOW / NEXT")!=std::string::npos);
  unsigned previous=backgrounds;EpgDraw();assert(backgrounds==previous);
  assert(EpgBackground(true)==configurationbackground && EpgBackground(false)==configurationbackground);
@@ -211,7 +215,7 @@ int main(int argc,char** argv){
  for(language=0;language<8;++language) {
    EpgOpen();assert(panels>0);
    assert(textLog.find(epgText[language][EPG_OVERVIEW])!=std::string::npos);
-   assert(textLog.find(epgText[language][EPG_WAIT_PROGRAM])!=std::string::npos);
+   assert(textLog.find(epgText[language][EPG_WAIT_DIRECTORY])!=std::string::npos);
    EpgClick();testMillis+=200;EpgDraw();
    assert(textLog.find(epgText[language][EPG_PROGRAM])!=std::string::npos);
    const unsigned oldPanels=panels, oldBackgrounds=backgrounds;
@@ -230,6 +234,13 @@ int main(int argc,char** argv){
    c->feed(b.data(),n,testMillis++);while(c->busy())c->pump();}
  testMillis+=200;EpgDraw();assert(c->count() && backgrounds==previous && rows==beforeRows+9 && panels==dataPanels);
  EpgBack();EpgBack();
+ // LIVE archive footer must retain the original programme date, never 2026.
+ epg::testReplay=false;c->setLive(true);c->setTime(epg::epoch(2026,10,25,6,33),60);
+ EpgOpen();assert(textLog.find("2024")!=std::string::npos && textLog.find("2026")==std::string::npos);
+ assert(textLog.find(epgText[0][EPG_ARCHIVE])!=std::string::npos && c->current()==-1 && c->next()==-1);
+ c->setClockTrusted(false);testMillis+=200;EpgDraw();
+ assert(textLog.find(epgText[0][EPG_CLOCK_UNCERTAIN])!=std::string::npos);
+ EpgClose();
  std::puts("Actual EPG UI: two-column background/text geometry, Jedynka multiline/advisory times/scroll, partial list redraw, waiting/data transition, 8 languages, UTF8 fonts, volume/day/navigation: PASS");
 }
 '''

@@ -570,3 +570,33 @@ synthetic_logo_1.png, hardware_synthetic_logo.json a .log.
 Jde nadále o syntetickou DSRV injekci, nikoli ověření příjmu z éteru.
 
 Uživatel potvrdil, že závěrečné PAD Adam7 logo je celé a správně vykreslené.
+
+
+## EPG LIVE UTC/LTO, SI-only a archiv (25. 10. 2026)
+
+Lokální opravy, plná hostitelská sada a esp32dev build PASS; nový firmware
+nebyl nahrán ani HW testován. Podrobné změny, T01–T18, paměť a aktuální hash:
+[EPG_LIVE_TIME_REPORT_20261025.md](EPG_LIVE_TIME_REPORT_20261025.md).
+Historické výsledky výše zůstávají vázané na své původní buildy.
+
+
+## Doplnění 25. 10. 2026: souběh packet a X-PAD
+
+Doplněna samostatná transportní diagnostika, přesná 11A fixture a integrované
+A–F testy přes skutečný DsrvHeader/UA/runtime/Core. Opraveno předčasné odvolání
+PAD při neaktivním audiu, volba samostatného packet endpointu, převzetí po vadném
+prvním PAD payloadu a přijetí packet skupiny s chybným service state. Zachován
+jeden Core a předchozí časové opravy. Nové změny jsou hostitelsky ověřené;
+nový RF test, audio/SLS a skutečné X-PAD SPI v 11A zůstávají neověřené.
+Podrobnosti: [report](EPG_MUX11A_XPAD_REPORT_20261025.md), [RF návod](EPG_MUX11A_XPAD_RF_TEST_CZ.md).
+
+
+## Doplnění 25. 10. 2026: PI priorita a explicitní baseline
+
+Produkční 500ms baseline se nyní předává přímo při požadavku, ruční DEBUG SPI
+ponechává 5000 ms; log hlásí skutečnou dobu a režim. Stávající priorita PI
+zůstává, doplněna ochrana nulové identity a cílené T01–T16. Nová DEBUG časová
+osa EPG ACQ rozlišuje t0–t8, neznámé kroky a skutečné vykreslení NOW/NEXT.
+Nejde o další změřené zrychlení proti předchozí lokální 500ms verzi.
+[Report a výsledky](EPG_PI_PRIORITY_REPORT_20261025.md); firmware nenahrán,
+živé RF/audio/SLS/stack ověření neprovedeno.

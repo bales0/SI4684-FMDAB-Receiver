@@ -69,11 +69,15 @@ struct Monitor {
   void println(const char* s) { output+=s; output+='\n'; }
   void printf(const char* format,...) { char b[1200]; va_list args; va_start(args,format); vsnprintf(b,sizeof(b),format,args); va_end(args); output+=b; }
 } diagSerial;
+bool diagnosticDebug=false;
 struct Radio {
- bool fm=false, spi=true, ServiceStart=true, SlideShowAvailable=true;
+ bool fm=false, spi=true, ServiceStart=true, SlideShowAvailable=true, signallock=true;
+ epg::BroadcastClockSample clock;
+ const epg::BroadcastClockSample& broadcastClock() const{return clock;}
  unsigned ServiceIndex=0, numberofservices=1, ensembleEcc=0xe2,Year=2026,Months=10,Days=23,Hours=10,Minutes=0,Seconds=0;
  char EID[5]="3153";
  struct Svc { uint32_t ServiceID=0x3233; } service[1];
+ void logEpgTransportPage(uint8_t){}
  bool isFm() { return fm; } bool spiPresent(){return spi;}
  unsigned timeSampleGeneration(){return 1;}
 } radio;
@@ -159,7 +163,7 @@ int main(int argc,char** argv) {
   cmd("EPG TEST TIME 2026-10-23T10:30:00Z"); assert(core->current()==-1 && core->count()==0);
   checkIcon(epg::IndicatorState::Present,0x06df);
   cmd("EPG TEST TIME 2024-11-12T04:30:00+01:00");
-  assert(core->count()==39);checkIcon(epg::IndicatorState::Ready,0x07e0);
+  assert(core->count()==42);checkIcon(epg::IndicatorState::Ready,0x07e0);
   testMillis+=900001;epg::poll();
   checkIcon(epg::IndicatorState::Present,0x06df); // Stale programmes are not ready.
   cmd("EPG TEST STOP"); assert(!epg::replayActive() && !view && core->count()==0);
@@ -210,18 +214,30 @@ int main(int argc,char** argv) {
   for(const auto& group:epgDemoGroups) epg::livePayload(group.data,group.size);
   assert(core->stats.frames==0 && core->count()==0);
   for(const auto& group:epgDemoGroups){epg::livePadPayload(group.data,group.size);while(core->busy())core->pump();}
-  assert(core->count()==39 && core->stats.pi==1);
+  assert(core->count()==42 && core->stats.pi==1);
   const uint32_t padFrames=core->stats.frames;
   epg::liveEndpoint(0xe23153ff,0x01f2c00d); // A packet START cannot evict PAD data.
   epg::livePadEndpoint(0x3211,0x01fe0005);
   epg::livePayload(epgDemoGroups[0].data,epgDemoGroups[0].size);
-  assert(core->count()==39 && core->stats.frames==padFrames);
+  assert(core->count()==42 && core->stats.frames==padFrames);
   epg::livePadEndpoint(0x3222,0x01fe0006);
   assert(core->count()==0 && core->stats.frames==0);
   epg::livePadEndpoint(0,0);
   core->select(0x40e231533211ULL,epg::epoch(2024,11,12,3,30),60);
   for(const auto& group:epgDemoGroups){epg::livePayload(group.data,group.size);while(core->busy())core->pump();}
-  assert(core->count()==39 && core->stats.pi==1);
+  assert(core->count()==42 && core->stats.pi==1);
+  radio.service[0].ServiceID=0x3211;
+  radio.clock.calendarEpoch=epg::epoch(2026,10,25,6,33);radio.clock.encoding=epg::ClockEncoding::UTC;
+  radio.clock.valid=true;radio.clock.offsetKnown=true;radio.clock.offsetMinutes=60;
+  radio.clock.generation=1;radio.clock.sampledAtMonotonicMs=testMillis;
+  epg::poll();assert(core->selected()==0x40e231533211ULL && core->current()==-1);
+  assert(epg::availability()==epg::Availability::PiDateStale);
+  const uint32_t realNow=core->now();cmd("EPG ARCHIVE 2024-11-12");
+  assert(core->archivePreview() && core->now()==realNow && core->current()==-1);
+  cmd("EPG ARCHIVE OFF");assert(!core->archivePreview() && core->now()==realNow);
+  radio.signallock=false;epg::poll();assert(epg::availability()==epg::Availability::TimeUnknown);
+  radio.signallock=true;epg::poll();assert(!core->clockTrusted());
+  ++radio.clock.generation;epg::poll();assert(core->clockTrusted() && core->current()==-1);
   cmd("EPG TEST START");
   epg::livePadEndpoint(0x3211,0x01fe0005);
   epg::livePadPayload(epgDemoGroups[0].data,epgDemoGroups[0].size);

@@ -17,6 +17,20 @@ uint32_t crc32(Bytes p, size_t n) {
   while(n--) { c ^= p[index++]; for(unsigned i=0;i<8;++i) c=(c>>1)^((c&1)?0xedb88320U:0); }
   return c^0xffffffff;
 }
+GroupCheck inspectGroup(Bytes p,size_t n,GroupEnvelope& h) {
+  if(!p || n<11 || n>kMaxGroup)return GroupCheck::Invalid;
+  if(crc16(p,n-2)!=be16(p+(n-2)))return GroupCheck::Crc;
+  h.type=p[0]&15;
+  if((p[0]&0x70)!=0x70 || (h.type!=4 && h.type!=6))return GroupCheck::Invalid;
+  size_t pos=(p[0]&128)?4:2;
+  if(pos+3>n-2)return GroupCheck::Invalid;
+  h.segment=be16(p+pos);pos+=2;
+  const uint8_t ua=p[pos++];const size_t uaLen=ua&15;
+  if(!(ua&16) || uaLen<2 || uaLen>n-2-pos || pos+uaLen+2>n-2)return GroupCheck::Invalid;
+  h.tid=be16(p+pos);pos+=uaLen;h.repetition=p[pos]>>5;
+  h.length=be16(p+pos)&8191;pos+=2;h.offset=pos;
+  return h.length && h.length==n-2-pos?GroupCheck::Valid:GroupCheck::Invalid;
+}
 // Gregorian arithmetic independent of host timezone/time_t width.
 static int64_t daysFromCivil(int y, unsigned m, unsigned d) {
   y -= m<=2; const int era=(y>=0?y:y-399)/400;
@@ -68,17 +82,20 @@ bool parseIso(const char* text, uint32_t& utc, int16_t& offset) {
 static uint32_t bits(Bytes p, unsigned offset, unsigned count) {
   uint32_t v=0; for(unsigned i=0;i<count;++i) v=(v<<1)|((p[(offset+i)/8]>>(7-(offset+i)%8))&1); return v;
 }
-bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& off) {
+bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& off, bool& ltoPresent) {
   if(n<4) return false;
-  const bool longForm=bits(p,18,1), lto=bits(p,19,1);
+  const bool longForm=bits(p,20,1), lto=bits(p,19,1);
   const unsigned len=longForm?6:4;
   if(n!=len+(lto?1:0) || (lto && (p[len]&31)>28)) return false;
-  const uint32_t mjd=bits(p,1,17); const unsigned h=bits(p,20,5), m=bits(p,25,6), s=longForm?bits(p,31,6):0;
-  if(mjd<40587 || h>23 || m>59 || s>59) return false;
+  const uint32_t mjd=bits(p,1,17); const unsigned h=bits(p,21,5), m=bits(p,26,6), s=longForm?bits(p,32,6):0;
+  if(mjd<40587 || mjd>99999 || h>23 || m>59 || s>59) return false;
   const uint64_t seconds=uint64_t(mjd-40587)*86400+h*3600+m*60+s;
   if(seconds>UINT32_MAX) return false;
   off=lto?int16_t((p[len]&31)*30*((p[len]&32)?-1:1)):0;
-  utc=uint32_t(seconds); return true;
+  utc=uint32_t(seconds); ltoPresent=lto; return true;
+}
+bool timePoint(Bytes p,size_t n,uint32_t& utc,int16_t& off) {
+  bool present=false;return timePoint(p,n,utc,off,present);
 }
 bool bearerValue(Bytes p, size_t n, uint64_t& out) {
   // DAB ID: top two flags, SCIdS, ECC, EId, 16/32-bit SId (TS 102 371 fig.4).
@@ -232,23 +249,49 @@ void Core::clearCache() {
   context_=0; activateContext();
 }
 void Core::reset() {
-  identityConflict=false;
+  identityConflict=false; transportSeen_=false; transportTouched_=0; archiveDay_=clockDay_=0; acquisitionTid_=acquisitionSkip_=0; acquisitionAt_=0;
   stats=Stats{}; entryCount_=serviceCount_=0; directoryHash_=0; browseOffset_=0; focus_=0;
   dirAssembly_.reset(); bodyAssembly_.reset(); phase_=0; clearCache();
 }
+uint32_t Core::selectionDay(uint64_t bearer,uint32_t utc,int16_t off) const {
+  int64_t civil=int64_t(utc)+int32_t(off)*60;
+  uint32_t day=utc && civil>=0?uint32_t(civil/86400):day_;
+  if(archiveDay_) return archiveDay_/86400;
+  if(liveMode_) {
+    bool covers=false; uint32_t first=UINT32_MAX;
+    for(size_t i=0;i<entryCount_;++i) {
+      const Entry& e=entries_[i];
+      if(e.type!=7 || e.subtype!=1 || e.bearer!=bearer || !e.start) continue;
+      const int64_t start=int64_t(e.start)+int32_t(e.startLto)*60;
+      const int64_t end=e.stop?int64_t(e.stop)+int32_t(e.stopLto)*60:start+86400;
+      if(start<0) continue;
+      if(start/86400<first) first=uint32_t(start/86400);
+      if(start<int64_t(day+1)*86400 && end>int64_t(day)*86400) covers=true;
+    }
+    // Browse original archive dates, while now_ remains the real clock.
+    if(!covers && first!=UINT32_MAX) day=first;
+  }
+  return day;
+}
 void Core::select(uint64_t bearer, uint32_t utc, int16_t off) {
   if(bearer!=selected_) browseOffset_=0;
-  const uint32_t day=uint32_t((int64_t(utc)+int32_t(off)*60)/86400+browseOffset_);
-  if(bearer!=selected_ || day!=day_) { selected_=bearer; day_=day; activateContext(); }
-  now_=utc; offset_=off;
+  if(utc && int64_t(utc)+int32_t(off)*60>=0) clockDay_=uint32_t((int64_t(utc)+int32_t(off)*60)/86400);
+  const int64_t base=selectionDay(bearer,utc,off);
+  const int64_t target=base+browseOffset_;
+  const uint32_t day=target>=0 && target<=UINT32_MAX/86400?uint32_t(target):uint32_t(base);
+  if(bearer!=selected_ || day!=day_) { selected_=bearer; day_=day; acquisitionTid_=acquisitionSkip_=0; activateContext(); }
+  if(utc) now_=utc;
+  offset_=off;
 }
 void Core::setTime(uint32_t utc, int16_t off) { browseOffset_=0; select(selected_,utc,off); }
 void Core::browseDay(int delta) {
   const int next=browseOffset_+delta;
   if(next < -7 || next > 7 || !delta) return;
-  browseOffset_=next;
-  day_=uint32_t((int64_t(now_)+int32_t(offset_)*60)/86400+browseOffset_);
-  activateContext();
+  browseOffset_=next; select(selected_,now_,offset_);
+}
+bool Core::archivePreview(uint32_t date) {
+  if(date && date%86400) return false;
+  archiveDay_=date; browseOffset_=0; select(selected_,now_,offset_); ++revision; return true;
 }
 bool Core::selectSid(uint32_t sid) {
   uint64_t match=0;
@@ -284,7 +327,9 @@ bool Core::header(Bytes p, size_t n, Entry& e, size_t& used) const {
     if((tag&63)==0x27) bearerValue(p+pos,length,e.bearer);
     if((tag&63)==0x25 || (tag&63)==0x26) {
       uint32_t value=0; int16_t lto=0;
-      if(timePoint(p+pos,length,value,lto)) { if((tag&63)==0x25) { e.start=value; e.startLto=lto; } else { e.stop=value; e.stopLto=lto; } }
+      bool present=false;
+      if(timePoint(p+pos,length,value,lto,present)) { if((tag&63)==0x25) { e.start=value; e.startLto=lto; e.startLtoPresent=present; } else { e.stop=value; e.stopLto=lto; e.stopLtoPresent=present; } }
+      else return false;
     }
     pos+=length;
   }
@@ -307,7 +352,7 @@ bool Core::directory(Bytes p, size_t n) {
   for(size_t i=0;i<count;++i) { Entry e; size_t used=0; e.tid=be16(p+pos); header(p+pos+2,n-pos-2,e,used); entries_[i]=e; pos+=2+used; }
   for(size_t i=0;i<count;++i) if(entries_[i].start && !entries_[i].stop)
     for(size_t j=0;j<count;++j) if(entries_[j].bearer==entries_[i].bearer && entries_[j].start>entries_[i].start &&
-       (!entries_[i].stop || entries_[j].start<entries_[i].stop)) { entries_[i].stop=entries_[j].start; entries_[i].stopLto=entries_[j].startLto; }
+       (!entries_[i].stop || entries_[j].start<entries_[i].stop)) { entries_[i].stop=entries_[j].start; entries_[i].stopLto=entries_[j].startLto; entries_[i].stopLtoPresent=entries_[j].startLtoPresent; }
   const uint32_t period=(uint32_t(p[6])<<16)|(uint32_t(p[7])<<8)|p[8];
   const uint64_t timeout=uint64_t(period)*300+60000;
   assemblyTimeoutMs_=period?uint32_t(timeout>1800000?1800000:timeout<120000?120000:timeout):300000;
@@ -339,46 +384,111 @@ static bool pngValid(Bytes p,size_t n) {
   }
   return false;
 }
-uint16_t Core::wanted() const {
-  if(focus_) return focus_;
-  // Acquire one relevant object across carousel turns. Other bodies are drained,
-  // not allowed to evict missing segments of the requested object.
-  if(!serviceCount_) for(size_t i=0;i<entryCount_;++i) if(entries_[i].type==7 && entries_[i].subtype==0 && entries_[i].epoch!=cacheEpoch_ &&
-      (!entries_[i].start || !now_ || (entries_[i].start<=now_ && entries_[i].stop>now_))) return entries_[i].tid;
+bool Core::hasPI() const {
+  for(size_t i=0;i<entryCount_;++i) if(entries_[i].type==7 && entries_[i].subtype==1 && entries_[i].bearer==selected_) return true;
+  return false;
+}
+bool Core::scheduleRange(uint32_t& first,uint32_t& last) const {
+  first=UINT32_MAX; last=0;
   for(size_t i=0;i<entryCount_;++i) {
     const Entry& e=entries_[i];
-    if(e.type==7 && e.subtype==1 && e.bearer==selected_ && e.epoch!=cacheEpoch_ &&
-       (!e.start || (int64_t(e.start)+int32_t(e.startLto)*60<int64_t(day_+1)*86400 &&
-                    (!e.stop || int64_t(e.stop)+int32_t(e.stopLto)*60>int64_t(day_)*86400)))) return e.tid;
+    if(e.type!=7 || e.subtype!=1 || e.bearer!=selected_ || !e.start) continue;
+    const int64_t start=int64_t(e.start)+int32_t(e.startLto)*60;
+    const int64_t stop=e.stop?int64_t(e.stop)+int32_t(e.stopLto)*60:start+86400;
+    if(start<0 || stop<=0 || stop>UINT32_MAX) continue;
+    if(uint32_t(start)<first) first=uint32_t(start);
+    if(uint32_t(stop)>last) last=uint32_t(stop);
   }
+  return last>first;
+}
+bool Core::scheduleDateValid() const {
+  if(!now_) return false;
+  const int64_t start=int64_t(clockDay_)*86400, end=start+86400;
+  for(size_t i=0;i<entryCount_;++i) {
+    const Entry& e=entries_[i];
+    if(e.type==7 && e.subtype==1 && e.bearer==selected_ && e.start &&
+       int64_t(e.start)+int32_t(e.startLto)*60<end &&
+       (!e.stop || int64_t(e.stop)+int32_t(e.stopLto)*60>start)) return true;
+  }
+  // Unscoped PI: prove date coverage from the cached original intervals.
+  for(size_t i=0;i<viewCount_;++i) {
+    const auto& p=at(i);const int64_t local=int64_t(p.start)+int32_t(p.lto)*60;
+    if(!p.uncertain && local<end && local+p.duration>start) return true;
+  }
+  return false;
+}
+uint64_t Core::findStation(uint32_t sid,uint16_t eid,uint8_t ecc,int scids,bool& conflict) const {
+  conflict=false; uint64_t match=0;
+  auto consider=[&](uint64_t b,bool bad) {
+    if(!b || b>0xffffffffffffULL || (uint8_t(b>>40)&0x10) || uint16_t(b)!=sid ||
+       uint16_t(b>>16)!=eid || uint8_t(b>>32)!=ecc || (scids>=0 && int((b>>48)&15)!=scids)) return;
+    if(bad || (match && match!=b)) conflict=true;
+    match=b;
+  };
+  for(size_t i=0;i<entryCount_;++i) consider(entries_[i].bearer,false);
+  for(size_t i=0;i<serviceCount_;++i) consider(services_[i].bearer,services_[i].conflict);
+  return conflict?0:match;
+}
+Availability Core::availability(bool present) const {
+  if(ambiguous()) return Availability::IdentityConflict;
+  if(!present) return Availability::NoSpi;
+  if(!stats.directories) return Availability::WaitDirectory;
+  if(!entryCount_) return Availability::DirectoryEmpty;
+  if(!selected_) return Availability::PendingIdentity;
+  if(!hasPI()) return hasSI()?Availability::SiOnly:Availability::PendingIdentity;
+  if(!clockTrusted_) return Availability::TimeUnknown;
+  if(archiveDay_ || (liveMode_ && !scheduleDateValid())) {
+    for(size_t i=0;i<entryCount_;++i) if(entries_[i].bearer==selected_ && entries_[i].type==7 && entries_[i].subtype==1 && entries_[i].seen) return Availability::PiDateStale;
+    return Availability::PiLoading;
+  }
+  if(fresh() && (current()>=0 || next()>=0)) return Availability::ReadyLive;
+  return Availability::PiLoading;
+}
+const char* availabilityName(Availability state) {
+  static const char* const names[]={"NO_SPI","SPI_PRESENT_WAIT_DIR","DIRECTORY_EMPTY","PENDING_IDENTITY","SI_ONLY","PI_DECLARED_LOADING","PI_DATE_STALE","READY_LIVE","IDENTITY_CONFLICT","TIME_UNKNOWN"};
+  return names[unsigned(state)];
+}
+uint16_t Core::wanted() {
+  if(focus_) return focus_;
+  if(bodyAssembly_.active && uint32_t(monotonicMs_-bodyAssembly_.touched)<=5000U) return bodyAssembly_.tid;
+  // PI first, but a missing object cannot starve SI/logo on every rotation.
+  // One bounded assembly; after five seconds without completion rotate priority.
+  unsigned best=80;int bestScore=100;
   const Service* s=station();
-  if(s && !s->conflict && s->png && !logoSize())
-    for(size_t i=0;i<entryCount_;++i) if(entries_[i].type==2 && entries_[i].subtype==3 && !strcmp(entries_[i].name,s->logo)) return entries_[i].tid;
-  return 0;
+  for(size_t j=0;j<entryCount_;++j) {
+    const size_t i=(j+acquisitionSkip_)%entryCount_;const Entry& e=entries_[i];
+    if(e.type&128 || e.size>kObjectBytes || (e.seen && e.epoch==cacheEpoch_)) continue;
+    int score=100;
+    if(selected_ && e.type==7 && e.subtype==1 && e.bearer==selected_ && !ambiguous()) {
+      const bool matches=!e.start || (int64_t(e.start)+int32_t(e.startLto)*60<int64_t(day_+1)*86400 && (!e.stop || int64_t(e.stop)+int32_t(e.stopLto)*60>int64_t(day_)*86400));
+      if(matches) score=0;
+    }
+    if(e.type==7 && e.subtype==0) score=1;
+    if(e.type==2 && e.subtype==3 && s && !s->conflict && s->png && !logoSize() && !strcmp(e.name,s->logo)) score=2;
+    if(e.tid==acquisitionTid_ && uint32_t(monotonicMs_-acquisitionAt_)>5000U) score=99;
+    if(score<bestScore) {best=unsigned(i);bestScore=score;}
+  }
+  const uint16_t tid=best<entryCount_ && bestScore<99?entries_[best].tid:0;
+  if(!tid && acquisitionTid_) { acquisitionTid_=0; acquisitionAt_=monotonicMs_; acquisitionSkip_=uint16_t((acquisitionSkip_+1)% (entryCount_?entryCount_:1)); bodyAssembly_.reset(); return wanted(); }
+  if(tid!=acquisitionTid_) {acquisitionTid_=tid;acquisitionAt_=monotonicMs_;}
+  return tid;
 }
 Feed Core::feed(Bytes p, size_t n, uint32_t now) {
   if(busy()) { ++stats.busy; return Feed::Busy; }
   monotonicMs_=now;
   ++stats.frames;
-  if(!p || n<11 || n>kMaxGroup) { ++stats.invalid; return Feed::Rejected; }
-  if(crc16(p,n-2)!=be16(p+(n-2))) { ++stats.crcBad; return Feed::Rejected; }
-  const uint8_t type=p[0]&15;
-  // Require CRC, segmentation and user-access transport ID. Extension supported.
-  if((p[0]&0x70)!=0x70 || (type!=4 && type!=6)) { ++stats.invalid; return Feed::Rejected; }
-  const unsigned stream=type==6?1:0;
-  const uint8_t continuity=p[1]>>4;
-  const uint8_t previous=stats.lastContinuity[stream];
-  if(previous!=255 && continuity!=previous && continuity!=((previous+1)&15)) ++stats.continuityJumps;
-  stats.lastContinuity[stream]=continuity; stats.lastRepetition[stream]=p[1]&15;
-  size_t pos=(p[0]&128)?4:2;
-  if(pos+3>n-2) { ++stats.invalid; return Feed::Rejected; }
-  const uint16_t segment=be16(p+pos); pos+=2;
-  const uint8_t ua=p[pos++]; const size_t uaLen=ua&15;
-  if(!(ua&16) || uaLen<2 || uaLen>n-2-pos || pos+uaLen+2>n-2) { ++stats.invalid; return Feed::Rejected; }
-  const uint16_t tid=be16(p+pos); pos+=uaLen;
-  stats.lastMotRepetition=p[pos]>>5;
-  const size_t length=be16(p+pos)&8191; pos+=2;
-  if(length!=n-2-pos || !length) { ++stats.invalid; return Feed::Rejected; }
+  GroupEnvelope envelope;const auto checked=inspectGroup(p,n,envelope);
+  if(checked!=GroupCheck::Valid) {
+    if(checked==GroupCheck::Crc)++stats.crcBad;else ++stats.invalid;
+    return Feed::Rejected;
+  }
+  const uint8_t type=envelope.type;const unsigned stream=type==6?1:0;
+  const uint8_t continuity=p[1]>>4,previous=stats.lastContinuity[stream];
+  if(previous!=255 && continuity!=previous && continuity!=((previous+1)&15))++stats.continuityJumps;
+  stats.lastContinuity[stream]=continuity;stats.lastRepetition[stream]=p[1]&15;stats.lastMotRepetition=envelope.repetition;
+  const uint16_t tid=envelope.tid,segment=envelope.segment;
+  const size_t pos=envelope.offset,length=envelope.length;
+  transportSeen_=true;transportTouched_=now;
   Assembly& a=type==6?dirAssembly_:bodyAssembly_;
   Buffer buffer=type==6?directory_:body_; const size_t cap=type==6?kDirectoryBytes:kObjectBytes;
   size_t index=0;
@@ -392,7 +502,13 @@ Feed Core::feed(Bytes p, size_t n, uint32_t now) {
       if(!fresh()) ++revision;
       contexts_[context_].touched=now;
     }
-    if(tid!=wanted()) return Feed::Accepted;
+    if(tid!=wanted()) {
+      const Entry& e=entries_[index];const Service* s=station();
+      const bool si=e.type==7 && e.subtype==0;
+      const bool logo=e.type==2 && e.subtype==3 && s && !s->conflict && s->png && !strcmp(s->logo,e.name) && !logoSize();
+      // Consume available metadata while the preferred PI has not begun.
+      if(focus_ || bodyAssembly_.active || (!si && !logo)) return Feed::Accepted;
+    }
     if(entries_[index].seen && entries_[index].epoch==cacheEpoch_) { ++stats.duplicate; return Feed::Accepted; }
   }
   const int result=a.add(tid,segment&32767,(segment&32768)!=0,p+pos,uint16_t(length),buffer,cap,now,stats);
@@ -473,8 +589,8 @@ void Core::cache(const Programme& p) {
   }
   rebuildView();
   if(count_==kMaxProgrammes || titleBytes>kTextBytes-textUsed_) { limited=true; return; }
-  CachedProgramme c; c.start=p.start; c.duration=p.duration; c.actual=p.actual;
-  c.actualDuration=p.actualDuration; c.id=p.id; c.version=p.version; c.lto=p.lto; c.uncertain=p.uncertain || !p.duration;
+  CachedProgramme c{}; c.start=p.start; c.duration=p.duration; c.actual=p.actual;
+  c.actualDuration=p.actualDuration; c.id=p.id; c.version=p.version; c.lto=p.lto; c.uncertain=p.uncertain || !p.duration; c.ltoPresent=p.ltoPresent; c.actualLto=p.actualLto; c.actualLtoPresent=p.actualLtoPresent;
   c.context=context_;
   c.title=store(p.name); c.description=store(p.description);
   if(!c.title) return;
@@ -485,10 +601,14 @@ void Core::cache(const Programme& p) {
   ++revision;
 }
 void Core::service(const Service& s) {
-  if(!s.bearer || !s.name[0]) return;
+  if(!s.bearer || (!s.name[0] && !s.shortName[0])) return;
   if(observer.service) observer.service(observer.user,entries_[objectIndex_].tid,s);
   for(size_t i=0;i<serviceCount_;++i) if(services_[i].bearer==s.bearer) {
-    if(strcmp(services_[i].name,s.name)) { services_[i].conflict=true; if(s.bearer==selected_) clearCache(); }
+    if(strcmp(services_[i].name,s.name)) { services_[i].conflict=true; if(s.bearer==selected_) {logoBytes_=0;viewCount_=0;++revision;} }
+    if(!services_[i].conflict) {
+      if(strcmp(services_[i].logo,s.logo) && selected_==s.bearer) {logoBytes_=0;++revision;}
+      services_[i]=s;
+    }
     return;
   }
   if(serviceCount_==16) { limited=true; return; }
@@ -497,7 +617,7 @@ void Core::service(const Service& s) {
   if(s.bearer==selected_) for(size_t i=0;i<entryCount_;++i) if(!strcmp(entries_[i].name,s.logo)) entries_[i].epoch=0;
 }
 void Core::close(uint8_t tag) {
-  if(tag==0x28 && rootService_) service(service_);
+  if(tag==0x28 && rootService_) {if(!service_.name[0]) snprintf(service_.name,sizeof(service_.name),"%s",service_.shortName);service(service_);}
   if(tag==0x1c || tag==0x2e) {
     Programme& p=programme_[tag==0x2e?1:0];
     if(!p.name[0]) snprintf(p.name,sizeof(p.name),"%s",p.medium[0]?p.medium:p.shortName);
@@ -527,12 +647,12 @@ void Core::attribute(uint8_t tag,Bytes p,size_t n) {
   }
   if(parent==0x2c || parent==0x2f) {
     if(tag==0x80 || tag==0x82) {
-      uint32_t seconds=0; int16_t offset=0;
-      bool valid=parent==0x2c?timePoint(p,n,seconds,offset):(n<=4 && programmeDepth_==2 && programme_[0].start && value<=604800);
+      uint32_t seconds=0; int16_t offset=0; bool present=false;
+      bool valid=parent==0x2c?timePoint(p,n,seconds,offset,present):(n<=4 && programmeDepth_==2 && programme_[0].start && value<=604800);
       if(valid) {
-        if(parent==0x2f) { seconds=programme_[0].start+value; offset=programme_[0].lto; }
-        if(tag==0x82) prog.actual=seconds;
-        else { if(prog.start && prog.start!=seconds) prog.uncertain=true; else { prog.start=seconds; prog.lto=offset; } }
+        if(parent==0x2f) { const uint64_t relative=uint64_t(programme_[0].start)+value; if(relative>UINT32_MAX) {prog.uncertain=true;return;} seconds=uint32_t(relative); offset=programme_[0].lto; present=programme_[0].ltoPresent; }
+        if(tag==0x82) {prog.actual=seconds;prog.actualLto=offset;prog.actualLtoPresent=present;}
+        else { if(prog.start && prog.start!=seconds) prog.uncertain=true; else { prog.start=seconds; prog.lto=offset; prog.ltoPresent=present; } }
       } else { prog.uncertain=true; if(n<=sizeof(prog.rejectedTime)) { p.copyTo(prog.rejectedTime,n); prog.rejectedTimeLength=uint8_t(n); } }
     }
     if(tag==0x81) { if(n==2) prog.duration=value; else prog.uncertain=true; }
@@ -591,7 +711,8 @@ void Core::pump(unsigned budget) {
       if(phase_==2) {
         Programme& p=programme_[programmeDepth_==2?1:0];
         char* dest=nullptr; size_t cap=0;
-        if(rootService_ && (parent==0x10 || parent==0x11 || parent==0x12)) { dest=service_.name; cap=sizeof(service_.name); }
+        if(rootService_ && parent==0x10) {dest=service_.shortName;cap=sizeof(service_.shortName);}
+        else if(rootService_ && (parent==0x11 || parent==0x12)) { dest=service_.name; cap=sizeof(service_.name); }
         else if(parent==0x10) { dest=p.shortName; cap=sizeof(p.shortName); }
         else if(parent==0x11) { dest=p.medium; cap=sizeof(p.medium); }
         else if(parent==0x12) { dest=p.name; cap=sizeof(p.name); }
@@ -608,6 +729,7 @@ void Core::pump(unsigned budget) {
         if(tag==0x28 && rootService_) service_=Service{};
         if(tag==0x2b && rootService_) { service_.png=false; service_.logo[0]=0; }
         if(rootService_ && (tag==0x11 || tag==0x12)) service_.name[0]=0;
+        if(rootService_ && tag==0x10) service_.shortName[0]=0;
         if(tag==0x1c || tag==0x2e) { programmeDepth_=tag==0x1c?1:2; Programme& p=programme_[programmeDepth_-1]; p=Programme{}; p.bearer=scope_; p.event=tag==0x2e; }
         if(tag==0x1b) programme_[programmeDepth_==2?1:0].description[0]=0;
       }
@@ -616,7 +738,7 @@ void Core::pump(unsigned budget) {
 }
 int Core::current(bool* overlap) const {
   int chosen=-1; unsigned active=0;
-  if(now_ && fresh() && !ambiguous()) for(size_t i=0;i<viewCount_;++i) {
+  if(now_ && clockTrusted_ && !archiveDay_ && fresh() && !ambiguous() && (!liveMode_ || scheduleDateValid())) for(size_t i=0;i<viewCount_;++i) {
     const auto& p=at(i);
     if(p.uncertain) continue;
     // Explicit policy: original planned interval, latest start wins, then lower ID.
@@ -628,7 +750,7 @@ int Core::current(bool* overlap) const {
   return chosen;
 }
 int Core::next() const {
-  if(!now_ || !fresh() || ambiguous()) return -1;
+  if(!now_ || !clockTrusted_ || archiveDay_ || !fresh() || ambiguous() || (liveMode_ && !scheduleDateValid())) return -1;
   for(size_t i=0;i<viewCount_;++i) if(!at(i).uncertain && at(i).start>now_) return int(i);
   return -1;
 }

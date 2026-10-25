@@ -96,7 +96,7 @@ class Probe {
   bool running() const { return state != State::Idle && state != State::CleanupFailed; }
 
   bool request(const Endpoint& audioContext, const Endpoint& slsContext,
-               const Endpoint& spiContext, uint32_t contextId, uint32_t now) {
+               const Endpoint& spiContext, uint32_t contextId, uint32_t now, uint32_t baselineMs = 5000U) {
     if (state != State::Idle || !audioContext.valid || !spiContext.valid ||
         audioContext.matches(spiContext.sid, spiContext.cid) ||
         slsContext.matches(spiContext.sid, spiContext.cid)) return false;
@@ -109,7 +109,7 @@ class Probe {
     stopAttempts = 0;
     cancel_ = false;
     state = State::Baseline;
-    nextActionMs = now + 5000U;
+    nextActionMs = now + baselineMs;
     return true;
   }
 

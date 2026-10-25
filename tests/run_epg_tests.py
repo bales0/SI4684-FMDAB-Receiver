@@ -23,7 +23,14 @@ for name,extra in [('errors',[]),('cache',[]),('uart',['src/epg_uart.cpp'])]:
  exe=out/(name+'.exe')
  run('compile '+name,[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_epg_'+name+'.cpp','src/epg_core.cpp',*extra,'-o',str(exe)])
  run(name,[str(exe),str(ROOT/'.pio/epg_test/objects')])
+run('compile SPI probe',[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_dab_spi_probe.cpp','-o',str(out/'spi_probe.exe')])
+run('SPI probe/router',[str(out/'spi_probe.exe')])
+for name in ('dab_spi_discovery','dab_packet_inventory'):
+ exe=out/(name+'.exe')
+ run('compile '+name,[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_'+name+'.cpp','-o',str(exe)])
+ run(name,[str(exe)])
+run('DAB clock contract',[sys.executable,'tests/test_dab_clock.py',a.compiler])
 run('X-PAD config/diagnostics',[sys.executable,'tests/test_dab_xpad_integration.py',a.compiler])
-for name in ['runtime','ui','transport','synthetic_paths','synthetic_uart','storage','png_adam7']+([] if a.skip_pc else ['pc']):
+for name in ['live','priority','runtime','ui','transport','coexistence','synthetic_paths','synthetic_uart','storage','png_adam7']+([] if a.skip_pc else ['pc']):
  run(name,[sys.executable,'tests/test_epg_'+name+'.py',a.compiler])
 print('All EPG host checks passed. Reports: .pio/epg_acceptance/results.log and results.json')

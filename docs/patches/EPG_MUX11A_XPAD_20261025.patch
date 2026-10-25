@@ -1,0 +1,2192 @@
+diff --git a/Serial_protocol.md b/Serial_protocol.md
+index 252f31a..dcef0b6 100644
+--- a/Serial_protocol.md
++++ b/Serial_protocol.md
+@@ -663,6 +663,7 @@ requires uppercase `T`/`Z`. Replies use `EPG ...`, not `#0`/`#1`.
+ |---|---|
+ | `EPG TEST HELP` | Lists supported commands: `EPG OK HELP: ...`. Does not allocate Core. |
+ | `EPG TEST STATUS` | Reports LIVE/TEST and all diagnostics below. Allocates Core if needed; can return a memory error. |
++| `EPG TEST TRANSPORT` | Queues paced, separate PACKET/PAD diagnostics, identity, reset reasons and health. Works without Core allocation; see transport diagnostics below. |
+ | `EPG TEST DEMO` | Starts the built-in historical MSC recording, opens EPG and replies `EPG OK DEMO source=actual-MUX11B MSC directory+F64C+F629; TEST historical data`. |
+ | `EPG TEST START` | Starts an empty E1 session for packet identity E23153FE/01F2C00C and opens EPG. |
+ | `EPG TEST START SID FULLCID` | As above with explicit hexadecimal input identity; the CID must have packet-mode bits `(CID & 0xC000) == 0xC000`. |
+@@ -1019,3 +1020,120 @@ JSON's time values had the old bit-offset error, so the regression now verifies
+ UTC/LTO independently from original binary objects while retaining all other
+ reference comparisons. See [the LIVE report](docs/EPG_LIVE_TIME_REPORT_20261025.md)
+ and [Andrzej's manual checks](docs/EPG_ANDRZEJ_20261025.md).
++
++
++### Separate packet and X-PAD transport diagnostics (25 October 2026)
++
++`EPG TEST TRANSPORT` is read-only and available without ENABLE or DEBUG, in
++LIVE and TEST. It does not start replay, query the chip, change ownership,
++allocate Core, or clear programme data. STATUS still describes the active Core;
++TRANSPORT additionally reports observations of the other transport.
++
++```text
++EPG TEST TRANSPORT
++EPG OK TRANSPORT queued
++EPG AUDIO ...
++EPG PACKET ...
++EPG RADIO ...
++EPG OWNER ...
++EPG TRANSPORT path=PACKET ...
++EPG MOTPATH path=PACKET ...
++EPG REJECT path=PACKET ...
++EPG TRANSPORT path=PAD ...
++EPG MOTPATH path=PAD ...
++EPG REJECT path=PAD ...
++EPG RESETS ...
++EPG HEALTH ...
++EPG TRANSPORT END
++```
++
++An active request returns `EPG OK TRANSPORT pending` instead of starting a
++second output. Admission needs 64 bytes of UART headroom; below that the command
++is handled silently and the client must retry. Pages wait for at least 512 bytes
++of headroom and are emitted at most once per 100 ms, normally taking about 1.3 s.
++There is no continuous HEX dump. A context epoch/reset change terminates output
++with `EPG TRANSPORT CANCELLED context changed`; retry after tuning settles.
++Pages are successive observations, not an atomic snapshot. Counters can advance
++between lines. UART backpressure may extend the duration indefinitely.
++
++| Record | Meaning |
++|---|---|
++| AUDIO | Current audio SID/full CID; raw UA identity, generation/publication and inventory completeness/failure; operational `usable` separately. |
++| PACKET | Selected packet endpoint and discovery status, confirmed/unverified advertisements, tracked endpoint and probe phase. `confirmed/PAD; no packet` is a valid state. |
++| RADIO | FM/DAB, requested tuner index/frequency in kHz, EID/ECC, lock, tune/switching, CTS/overflow/errors and cached XPAD set/get/match diagnostics. During tuning the requested frequency is not proof of lock there. |
++| OWNER | LIVE/TEST and actual NONE/PACKET/PAD/TEST owner, UI channelIndex, epoch, actual Core resets/last reason, logical availability transitions and malformed-header count. |
++| TRANSPORT | Per-path canonical endpoint, source-class header counts, SPI candidates/admissions/blocks, legacy handoffs, latest candidate raw header identity and metadata, wait/idle durations and Directory observation reason. |
++| MOTPATH | Groups/envelope validity/CRC, type4/type6, verified complete Directories, bounded unique/repeat history, empties, last TID/body size/object count and owner-decoded SI/PI/PNG/programme count. |
++| REJECT | Separate rejection counters, listed below. |
++| RESETS | Actual runtime Core::reset calls by reason, listed below. |
++| HEALTH | Heap-capability free/largest blocks, minimum free heap, dropped UART bytes, audio/SLS flags and active Core cache/error counters. |
++
++`headers=a/b/c/d` means DATA_SRC 0/1/2/3. PACKET records source0; PAD records
++source1/2 plus reserved source3 observations. Source0 is standard data, source1
++is non-DLS PAD, source2 is DLS. Raw UA=0007 is an X-PAD SPI candidate **only on
++source1**. Actual admission also requires verified current audio UA, matching
++SID/CID/generation, valid state/physical metadata and payload bounds. Raw UA=0007
++on source0 or source2 alone does not prove X-PAD SPI. Source1 Slideshow UA=0002
++and DLS still go through their legacy paths. `last` preserves the latest SPI
++candidate when candidates exist; legacy traffic does not overwrite it.
++Full command CID and short DSRV CID are reported separately; only the router's
++specific verified representations are accepted, not arbitrary global masking.
++
++Audio `ua` is confirmed / unknown / failed / not-signalled. Raw `identity` is
++0 Unqueried, 1 NotSpi, 2 Spi, 3 Failed, 4 Slideshow, 5 SpiAndSlideshow.
++An unusable audio context or failed/incomplete scan does not revoke an already
++confirmed PAD owner. A complete valid negative UA result does. Packet selection
++retains a distinct packet endpoint even when the audio component advertises SPI.
++`confirmed` counts SPI advertisements, including audio, not just packet endpoints.
++
++Transport `admitted` counts groups accepted by the owner Core; it does not mean
++Ready. `blocked` counts groups excluded from Core by ownership/replay. `legacy`
++counts handoffs to the existing DLS/SLS path, not successfully decoded images.
++Other-transport groups are observed without entering or resetting the active
++Core. Observations of valid empty packet Directory therefore cannot clear PAD
++SI/PI, even when the two streams use the same TID.
++
++`dirs` means a complete validated Directory, not each type6 fragment. Without a
++second reassembly buffer, the unowned path can directly validate a single-group
++empty Directory or a known complete repeat; new nonempty/fragmented unowned
++Directories remain undecoded. `unique`/`repeats` use a four-fingerprint bounded
++history; `historyLimited=1` reports overflow, so these are not an unlimited count
++of all distinct Directories ever seen. Packet empty 11A fixture: group 27 bytes,
++Directory body 16 bytes, objects=0, TID=8CC2.
++
++`reason` values are `not-owned` (no canonical endpoint), `waiting-data`,
++`incomplete-directory`, `directory-timeout` (no verified Directory after 300 s),
++`directory-known`, `empty-directory`. A signalled PAD with no Directory remains
++WAIT_DIR even if packet keeps sending empty Directory. Timeout is diagnostic;
++it does not automatically switch away from the PAD owner. DIRECTORY_EMPTY and
++SI_ONLY UI messages explicitly describe the selected carousel, not the whole
++multiplex. Time validity, archive and identity rules documented above still apply.
++
++REJECT keys: `ua` unconfirmed/negative identity; `generation` stale/incomplete
++context; `sid`/`cid` mismatch; `inactive` unusable audio; `dscty` unsupported data
++type; `state` bad service state; `physical` chip error; `length` bounds;
++`read` failed exact payload read; `replay` live data quarantined by TEST;
++`owner` different active transport; `data` invalid first envelope or Core rejection;
++`no-endpoint` no eligible packet context; `busy` another receiver operation.
++Some failures occur before group observation, so header/rejection totals need not
++match group totals. CRC diagnostics count inspected group CRC failures separately.
++
++RESETS keys: `tune`, `service`, `packet-endpoint`, `packet->PAD`, `PAD->packet`,
++`pad-endpoint`, `ua-revoked`, `replay-start`, `replay-stop`, `PAD-acquire`.
++They count actual runtime Core::reset calls, not every duplicate signal or cache
++replacement. NONE-to-PAD uses PAD-acquire. Reason counters are lifetime totals;
++path counters are scoped to the context epoch and canonical endpoint. A new
++endpoint clears only its path evidence; tune/STOP context clears both paths.
++Counters saturate at UINT32_MAX. `stateChanges` counts logical availability
++changes, not TFT redraws. In TEST, live frames remain excluded from the test Core.
++
++HEALTH `core=0` means Core is not allocated; `arena` is its required Core-plus-buffers size,
++not an assertion of allocation. `free8/largest8` and `free32/largest32` are the
++separate heap capability classes, not quantities to sum as total memory.
++`UARTdrop` counts lost diagnostic bytes, not lost RF packets. Audio/SLS flags do
++not establish uninterrupted playback or visual correctness. Verify those on RF.
++
++The bounded evidence registry occupies 516 bytes on the ESP32 target. There is
++still one Core and no additional MOT/PNG framebuffer. Host A–F tests and a Czech
++RF procedure are linked from [the transport report](docs/EPG_MUX11A_XPAD_REPORT_20261025.md)
++and [RF instructions](docs/EPG_MUX11A_XPAD_RF_TEST_CZ.md).
+diff --git a/docs/EPG_IMPLEMENTATION_REPORT.md b/docs/EPG_IMPLEMENTATION_REPORT.md
+index a77f6fb..acc5db0 100644
+--- a/docs/EPG_IMPLEMENTATION_REPORT.md
++++ b/docs/EPG_IMPLEMENTATION_REPORT.md
+@@ -578,3 +578,14 @@ Lokální opravy, plná hostitelská sada a esp32dev build PASS; nový firmware
+ nebyl nahrán ani HW testován. Podrobné změny, T01–T18, paměť a aktuální hash:
+ [EPG_LIVE_TIME_REPORT_20261025.md](EPG_LIVE_TIME_REPORT_20261025.md).
+ Historické výsledky výše zůstávají vázané na své původní buildy.
++
++
++## Doplnění 25. 10. 2026: souběh packet a X-PAD
++
++Doplněna samostatná transportní diagnostika, přesná 11A fixture a integrované
++A–F testy přes skutečný DsrvHeader/UA/runtime/Core. Opraveno předčasné odvolání
++PAD při neaktivním audiu, volba samostatného packet endpointu, převzetí po vadném
++prvním PAD payloadu a přijetí packet skupiny s chybným service state. Zachován
++jeden Core a předchozí časové opravy. Nové změny jsou hostitelsky ověřené;
++nový RF test, audio/SLS a skutečné X-PAD SPI v 11A zůstávají neověřené.
++Podrobnosti: [report](EPG_MUX11A_XPAD_REPORT_20261025.md), [RF návod](EPG_MUX11A_XPAD_RF_TEST_CZ.md).
+diff --git a/docs/EPG_MUX11A_XPAD_REPORT_20261025.md b/docs/EPG_MUX11A_XPAD_REPORT_20261025.md
+new file mode 100644
+index 0000000..ce15d13
+--- /dev/null
++++ b/docs/EPG_MUX11A_XPAD_REPORT_20261025.md
+@@ -0,0 +1,165 @@
++# MUX 11A: packet Directory a EPG přes X-PAD – kontrola a opravy
++
++Lokální kontrola a schválené doplnění, 25. 10. 2026. Hostitelské testy A–F
++prošly, stejně jako celá EPG sada a build `esp32dev`. Technicky je souběh
++prázdného packet carouselu a plného SPI přes audio X-PAD možný. **Skutečné
++X-PAD SPI v MUX 11A zůstává NEOVĚŘENO.** Nový firmware nebyl nahrán;
++nové RF/audio/SLS/stack ověření: **HW NOT TESTED**.
++
++## Rozsah a původní stav
++
++Výchozí HEAD: `116758e5bd05927f70f6884a332a845e0e60369b`. Před zahájením již byly
++lokálně přítomné schválené UTC/LTO, důvěryhodnost hodin, SI-only, archiv a UI
++opravy; zůstaly zachované. NVS, Git index, commity ani GitHub se neměnily.
++Externě odstraněné `src/IRReceiver.cpp/.h` nejsou součástí tohoto zásahu ani patch.
++Původní časový report a patch v docs zůstávají historickými artefakty.
++
++Původní zdroj už obsahoval DsrvHeader, UA inventuru, packet probe a PAD cestu
++směřující do jediného Core. Samotné oddělené mock testy však neověřovaly společně
++skutečnou publikaci UA, plnou hlavičkovou větev, převzetí vlastníka a cache.
++Samostatná diagnostika obou transportů chyběla. Cílené reprodukce před opravou
++selhaly na těchto podmínkách:
++
++- `ServiceStart=false` nesmí odvolat stále potvrzené audio SPI UA.
++- Potvrzená audio SPI nesmí zakrýt samostatný packet endpoint.
++- Timeout prvního PAD payload read nesmí vymazat platný packet program.
++- CRC-validní, ale vadná první PAD MOT obálka nesmí převzít packet cache.
++- Packet DSRV serviceState=4 nesmí publikovat prázdný Directory přes platné PI.
++
++## Skutečný zachycený 11A vstup
++
++Nezávislá kontrola `EPG_DSRV_dumps_and_files.zip/log_11A.txt` našla **422 úplných
++CRC-validních** `[SPI/RAW]` skupin, chybné CRC=0. Všechny mají packet SID
++E231B3FE/CID C00B, type6, TID 8CC2, segment0 a stejné prázdné Directory.
++**27 B je délka přenosové skupiny, 16 B délka vlastního Directory**, počet
++objektů je 0. Tělo: `0000001000000000dc00000003004101`.
++
++Log má také 44 PAD route řádků. Pět omezeně vypisovaných UA vzorků obsahuje
++2× packet source0/raw7 a 3× audio source1/raw2 (Slideshow, SID3802/CID000B).
++Žádný zachycený source1/raw7 tu není; rate limiting však neumožňuje dokázat
++nepřítomnost X-PAD SPI. Z prázdného packet toku nelze odvodit nepřítomnost EPG
++v celém multiplexu. Přesná první 27B skupina, její 16B tělo a sanitizovaný
++souhrn s hashi jsou v [fixtures](../tests/fixtures/epg/README.md).
++Starší 27B syntetické tělo pro časové testy je od této fixture výslovně odlišeno.
++
++Normové transporty potvrzuje [ETSI TS 102 371 V3.3.1](https://www.etsi.org/deliver/etsi_ts/102300_102399/102371/03.03.01_60/ts_102371v030301p.pdf),
++§4.1 a §6.1: SPI lze přenášet v packet i PAD a oba mohou používat Directory mode.
++[AN649](https://www.skyworksinc.com/-/media/Skyworks/SL/documents/public/application-notes/an649.pdf)
++popisuje DATA_SRC a UA v DSRV: raw7 na source0 není důkaz X-PAD SPI; source2
++zůstává DLS. Nastavení XPAD 0x0097 se touto opravou nemění.
++
++## Co se změnilo
++
++`dab_spi_discovery.h` umí při skutečné packet volbě vybírat pouze packet MOT
++komponenty a současně evidovat ostatní potvrzené SPI reklamy. PAD-only bez
++packet komponenty je legitimní stav `confirmed/PAD; no packet`.
++
++`si4684.cpp` odděluje surovou identitu potvrzené aktuální UA od okamžité
++použitelnosti audia. PAD se odvolá až po platné dokončené negativní UA,
++změně služby nebo kontextu. Neaktivní audio, neúplný scan ani chybná odpověď
++samy potvrzení nemažou. První PAD převezme Core teprve po úspěšném přesném
++read a validaci obálky; nezávislá platná UA publikace může vlastníka zvolit dřív.
++Packet i PAD kontrolují service state a physical error před předáním Core.
++
++Sdílený `inspectGroup` v `epg_core.cpp` vyčleňuje dosavadní read-only kontrolu
++CRC/MOT obálky. Používá ho Core, první PAD handoff a diagnostika; nejde o druhý
++PI/SI parser. Zůstává jediný Core, stejné reassembly buffery, limity i časové
++opravy. Skupiny nevlastněné větve do Core nevstupují. Ani shodný TID mezi oběma
++toky proto nemíchá data nebo nemaže PAD cache.
++
++Nový `epg_transport_diag.h` přidává omezené saturující čítače obou transportů,
++validní skupiny, ověřené Directory, SI/PI/PNG, odmítnutí a skutečné důvody resetů.
++`EPG TEST TRANSPORT` vypisuje identity, RADIO, OWNER, obě větve a HEALTH
++postupně s UART backpressure. Neprovádí nové dotazy čipu a nepotřebuje Core
++alokovat. Podrobnosti jsou v [Serial_protocol.md](../Serial_protocol.md).
++
++Čítače se počítají i bez DEBUG; nový rozsáhlejší výpis vzniká jen na požádání.
++SI_ONLY a EMPTY systémové texty všech osmi jazyků popisují vybraný carousel,
++aby netvrdily nepřítomnost programu v celém MUX. Stavy, barvy EPG a časová
++politika z předchozí opravy zůstávají zachované.
++
++## Integrované testy A–F
++
++`tests/test_epg_coexistence.py` kompiluje skutečný celý case DsrvHeader,
++skutečné metody dotazu/publikace UA a discovery spolu s runtime/Core a vendor
++parserem. Mockuje SPI transakce, UART, hodiny, heap a kreslení. Menu používá
++skutečné EpgSuspend/EpgResume, kreslení je stub. Legacy SLS/DLS se kontroluje
++na předání původní cestě; jejich obsah se v této sadě nedekóduje.
++
++| Scénář | Výsledek |
++|---|---|
++| A: prázdný packet před/během/po plném PAD; shodný TID8CC2; menu | 16 packet empty, 15 blokovaných pro jiného vlastníka, PAD SI1/PI1, 3 pořady; právě 1 očekávaný handoff reset. |
++| B: pouze packet empty, PAD UA neověřená | 4 empty, žádná PAD Directory, 0 pořadů; stav Empty pouze pro packet, 0 resetů během scénáře. |
++| B2/E: packet program + SLS/DLS, vadný packet state, první PAD read/CRC/obálka | Cache 3 pořadů zachována, 0 resetů. |
++| B3: plný PAD bez packet komponenty | PAD-only, 3 pořady; 1 očekávané PAD-acquire. |
++| C: PAD SI + vlastní Adam7 PNG, bez PI; packet empty souběžně | SI1/PNG1/PI0, SI_ONLY, packet empty8 nemění Core, 0 resetů během scénáře. |
++| D: částečný packet → PAD, změna pořadí, UA unknown/failed/duplicate, pozdní packet callback, potvrzená negativní UA | Částečná data se nemíchají; cache přežije přechodné stavy, negativní UA uvolní PAD; 2 očekávané resety. |
++| D: změna služby/SID/CID, frekvence a FM | Staré skupiny odmítnuté, izolace nového kontextu; 4 očekávané resety. |
++| E: SID/CID/generation, dscty/state/physical/length/inactive/read/CRC/source2 | Žádný chybný legacy fallback ani poškození cache; ztráta důvěry hodin změní Ready bez resetu, nová generace ho obnoví. |
++| F: signalled PAD bez dat, packet empty opakovaně | Packet empty11, blocked10; PAD WAIT_DIR i po 300s, nikoli falešné Empty. |
++| F: TEST/STOP a diagnostika | LIVE izolováno od TEST, správné resety, UART 0/511 čeká, 512 vypisuje; END/cancel, mezní délky řádků a saturace ověřené. |
++
++Všech 10 dílčích scénářů prošlo, **neočekávané resety=0**. `resets` v JSON
++je rozdíl za scénář, zatímco pole resetReasons obsahuje kumulativní totals;
++počáteční alokace/binding je proto vidět v totals, nikoli v rozdílu.
++Syntetický snapshot v JSON používá produkční LIVE větev s mock hodinami;
++není to skutečný příjem 11A.
++
++Celá hostitelská sada: **25 kroků PASS** (včetně kompilací), CRC/cache/UART,
++discovery/inventory, time/clock, runtime/UI, RAW/oracle, syntetické DSRV,
++PC protokol, storage a PNG/Adam7. Skutečný RAW zachovává 70 objektů a
++1 087 pořadů. Nejde o opakování nového testu na desce.
++
++Reprodukce z kořene projektu:
++
++```powershell
++$env:PYTHONDONTWRITEBYTECODE='1'
++python tests/run_epg_tests.py --input tests/fixtures/epg/device-monitor-261023-160924.log --reference tests/fixtures/epg/SI4684_MUX11B_EPG_kompletni_dekodovani.zip
++python tests/epg/synthetic_logo_test.py --verify-fixtures
++pio run -e esp32dev
++```
++
++Strojové výsledky v [JSON](EPG_MUX11A_XPAD_results_20261025.json) obsahují
++jednotlivé scénáře, čítače, syntetický snapshot, capture analýzu a firmware hash.
++
++## Paměť, build a limity důkazu
++
++ESP32 target: registry **516 B** (ověřeno target compiler/nm), Core **14 232 B**,
++pevné buffery **36 864 B**, celkem Core **51 096 B**, beze změny proti časové
++opravě. Žádný druhý Core, MOT buffer ani framebuffer. Zachovány limity
++96 pořadů a 8 192 B textu; aktuální profil má Directory 4 096 B a objekty
++12 288 B, tedy nepodporuje automaticky všechna normová maxima 8K/16K.
++
++Host heap mock navíc rezervuje 1 024 B DRAM pro konzervativní tlak nové
++statické diagnostiky. Při zátěži zůstává free8/largest8=12 808 B,
++free32/largest32=17 416 B, žádná další Core alokace. Tato čísla **nejsou**
++měřením skutečné desky. UART CTS/overflow/audio/SLS ze syntetického snapshotu
++jsou rovněž mock hodnoty; nelze z nich vyvodit nepřerušované audio.
++
++Finální build `esp32dev`: RAM **67 128 / 327 680 B**, flash
++**3 551 797 / 4 128 768 B**, firmware.bin **3 552 416 B**.
++SHA-256: `0c51a051c3db86ceeadfbfe41ca09224c4fe3d2166c507883e2b80ab38fb93a2`.
++Build vytvořil obrazy, žádný se neflashoval; NVS nebylo měněno.
++
++Diagnostika nepřidává hardware reads; znovu kontroluje omezené CRC/obálky,
++takže její CPU náklad a dopad na FIFO/audio je nutné ještě změřit na RF.
++Nemá druhé úložiště pro nevlastněný tok: u něj lze přímo ověřit úplné prázdné
++jednosegmentové Directory nebo známé opakování, nikoli libovolný nový
++fragmentovaný/nenulový Directory. Čtyři fingerprinty mají příznak historyLimited.
++Signalled PAD bez Directory má diagnostický timeout; automatický návrat na
++packet tímto timeoutem se nezavádí.
++
++Průběžné volání `availableForWrite` brání novému výpisu při backpressure;
++čtení čítačů není atomický snapshot. Při resetu/změně epoch se výpis zruší.
++Skutečnou stabilitu FIFO, stack rezervu, CTS, zvuk, DLS, slideshow a aktuální
++X-PAD na jednotlivých stanicích ověří [český RF postup](EPG_MUX11A_XPAD_RF_TEST_CZ.md).
++
++## Patch a konečný závěr
++
++`patches/EPG_MUX11A_XPAD_20261025.patch` je přírůstkový patch nad předchozím
++lokálním stavem zachyceným v `EPG_live_20261025.patch`. Neobsahuje externí
++odstranění IRReceiver ani přepis historického patch. Git index se nepoužívá.
++
++Technicky možné: **ANO**. Odolnost implementace proti prázdnému packet toku:
++**PASS podle provedených hostitelských testů**. Skutečné SPI přes X-PAD na 11A:
++**NEOVĚŘENO**; zachycený log dokazuje pouze prázdný packet carousel.
+diff --git a/docs/EPG_MUX11A_XPAD_RF_TEST_CZ.md b/docs/EPG_MUX11A_XPAD_RF_TEST_CZ.md
+new file mode 100644
+index 0000000..bcf8afd
+--- /dev/null
++++ b/docs/EPG_MUX11A_XPAD_RF_TEST_CZ.md
+@@ -0,0 +1,173 @@
++# MUX 11A: živý RF test X-PAD a samostatného packet SPI
++
++Tento postup je pro nový lokální firmware s příkazem `EPG TEST TRANSPORT`.
++**Nový RF test zatím nebyl proveden.** Syntetický PASS neprokazuje obsah MUX 11A.
++Prázdný packet Directory nevylučuje SPI přes X-PAD jiné nebo téže audio stanice.
++
++## Příprava a příkazy
++
++Použij jeden sériový monitor: 115200 Bd, 8-N-1, zakončení LF/CRLF. Zavři PC
++replay/syntetický odesílač. Do uloženého protokolu nevkládej účet, lokální
++cesty ani konfiguraci sériového portu. Tento postup neprovádí flash ani zápis NVS;
++nahrání nové aplikace je samostatný krok vyžadující souhlas.
++
++```text
++EPG TEST HELP
++EPG TEST STATUS
++```
++
++Ověř, že HELP obsahuje TRANSPORT a STATUS vrací `mode=LIVE`. Jen pokud běží
++TEST, zastav odesílač a jednorázově pošli `EPG TEST STOP`. STOP maže EPG cache;
++neposílej ho mezi měřeními LIVE. `EPG TEST TRANSPORT` funguje i bez ENABLE/DEBUG
++ a nealokuje druhý Core ani nový MOT buffer.
++
++Přepni rádio jeho ovládáním do DAB a MAN, zajisti stabilní příjem. Pokud chceš
++ladit přes UART, běžné příkazy jsou:
++
++```text
++ENABLE=1
++TUNE=24
++```
++
++Index 24 v tabulce `:FREQ` odpovídá 11A / 216928 kHz; ověř aktuální tabulku.
++Po dokončení ladění vyber audio službu ovladačem rádia nebo příkazem
++`SERVICE=<index>` podle aktuálního seznamu `$L` (za `<index>` dosadit skutečné
++číslo). SID není index SERVICE. FM ladění tímto protokolem není podporováno.
++Během jednoho měřicího okna stanici neměň.
++
++`DEBUG` je přepínač: ověř odpověď `[DEBUG] diagnostics ON`; pokud právě vypnul
++logování, pošli ho znovu. Nepoužívej `DEBUG SLSV`/`DEBUG VERBOSE` ani dlouhé
++HEX dumpy. `DEBUG SPI` spouští jinou konečnou sondu a mění packet lifecycle;
++pro tento test není potřeba, produkční příjem běží automaticky.
++
++## Měření jedné audio služby
++
++1. Počkej na lock a platný UA scan. Pošli:
++
++```text
++EPG TEST TRANSPORT
++```
++
++Čekej na `EPG TRANSPORT END` (obvykle asi 1,3 s). Při nedostatku místa na UART
++výpis počká. `pending` znamená, že předchozí požadavek ještě běží.
++`EPG TRANSPORT CANCELLED context changed` znamená reset/změnu kontextu během
++výpisu: nevyhodnocuj částečnou sadu a zopakuj příkaz po ustálení rádia.
++
++2. Zapiš `EPG RADIO`: DAB režim, index/frekvenci, EID/ECC, lock, tune/switching,
++CTS, overflow a errors. `requestedIndex` je požadavek tuneru, proto při
++`tune=1` ještě netvrď, že cílový MUX už je přijímaný. `channelIndex` v OWNER
++je UI index. Sleduj zejména stabilní stav bez probíhajícího přeladění.
++
++3. `EPG AUDIO` popisuje **aktuální** audio SID a plný CID. `ua=confirmed` znamená
++ověřené SPI 0x007; `unknown`, `failed` a `not-signalled` rozlišují ostatní případy.
++`identity=5` obsahuje zároveň SPI i Slideshow, `identity=4` je jen Slideshow,
++`identity=2` SPI, `identity=0` zatím neověřeno, `identity=3` chyba odpovědi,
++`identity=1` platná UA bez SPI/Slideshow. Potřebné jsou také inventory=1,
++complete=1, gen/published a failed. `usable=0` není sám o sobě důkaz absence UA.
++Pokud chceš celý seznam UA včetně 0x002/0x007, při DEBUG zachyť `[DAB/UA]` /
++`[DAB/COMP]`; přepnutí DEBUG neprovádí novou hardwarovou UA transakci.
++
++4. `EPG PACKET` odděluje vybraný packet endpoint od sledovaného fyzického
++kontextu. `selected=1` není důkaz přijatých dat; `tracked` s `probe=4` značí
++kontext ve fázi Observing. `confirmed` počítá SPI reklamy i mimo packet transport,
++proto ho nečti jako počet packet endpointů. Stav `confirmed/PAD; no packet`
++je legitimní. Neověřený packet MOT nebo neúplný scan zůstává neověřený.
++
++5. Porovnej oba řádky `EPG TRANSPORT` a `EPG MOTPATH`:
++
++- PACKET: source=0, raw SID/CID, počet type6, `dirs`, `empty`, `dirBytes`,
++  objects a TID. Přijaté prázdné Directory mají být explicitně v PACKET řádku.
++- PAD: source=1 / UA=0007 kandidáti, admitted, validní skupiny, DIR/SI/PI/PNG.
++  Raw UATYPE při source=0 nebo source=2 není důkaz X-PAD SPI.
++- `headers=a/b/c/d` počítá DATA_SRC 0/1/2/3; `last` je poslední SPI kandidát
++  dané větve, nebo poslední hlavička, pokud zatím kandidát nebyl. DLS/SLS se
++  nepovažuje za SPI jen proto, že běží v PAD.
++- Plné command CID a krátké DSRV CID se mohou lišit: ukládej obě původní čísla,
++  neopravuj je globálním maskováním. Router povoluje jen specifické ověřené varianty.
++- `dirs` označuje ověřené kompletní Directory. U nevlastněné větve lze bez
++  druhého bufferu přímo ověřit celé jednosegmentové prázdné Directory nebo
++  opakování dříve ověřeného obsahu. Nový nenulový/fragmentovaný nevlastněný
++  Directory nelze z těchto čítačů automaticky považovat za dekódovaný.
++
++6. `EPG REJECT` ukazuje ua/generation/sid/cid/inactive/dscty/state/physical/
++length/read/replay/owner/data/no-endpoint/busy. `owner` u packet větve je při
++aktivním PAD očekávané oddělení toků. `data` není nutně výpadek RF: znamená
++odmítnutí Core či první vadnou obálku, CRC má samostatný čítač. `reason=waiting-data`,
++`incomplete-directory` a po pěti minutách `directory-timeout` nejsou
++`empty-directory`. Timeout sám nepřepíná na jiný transport.
++
++7. Pošli také `EPG TEST STATUS`. Jeho STATE/DATA/LOGO popisují pouze právě
++vlastněný Core, nikoli všechny transporty najednou. Rozliš SI_ONLY,
++DIRECTORY_EMPTY, PI_DATE_STALE, TIME_UNKNOWN, WAIT_DIR a READY_LIVE. Logo/SI
++bez PI je platná služba. Historické PI z 2024 se ani po čerstvém přijetí nesmí
++vydávat za současný NOW/NEXT z roku 2026.
++
++8. Sleduj alespoň **5 minut**, případně déle podle carouselu. Zopakuj TRANSPORT
++ a STATUS přibližně každých 30 s; zaznamenej skutečnou délku okna a počet opakování.
++UA se za vhodných podmínek znovu ověřuje po 60 s. Porovnávej rozdíly čítačů
++při stejném SID/CID a epoch; po změně endpointu/ladění začíná jiná instance.
++Čítače jsou kumulativní, výpis je postupný, nikoli atomický snímek.
++
++Během stabilního PAD nesmějí přírůstky PACKET empty zvyšovat `EPG RESETS`,
++mazat PAD metadata nebo snižovat indikátor jen kvůli prázdnému packet toku.
++Ready může zmizet z jiného doloženého důvodu: ztráta hodin/locku, stáří PI,
++změna identity apod. `stateChanges` počítá logické stavy, nikoli každé kreslení TFT.
++
++9. Zkontroluj sluchem audio a vizuálně slideshow/DLS. `audio=1` a `SLS=1`
++samy nedokazují zvuk bez přerušení ani správné dekódování obrázku. HEALTH:
++free8/largest8/free32/largest32, min, UARTdrop, core, arena, cached/limited,
++timeout/busy/invalid/CRC. RADIO: CTS a overflow. Požadujeme bez progresivního
++úbytku RAM, bez nových CTS/overflow problémů; UARTdrop počítá ztracené logy,
++nelze ho zaměnit za ztrátu DSRV paketů.
++
++10. Až po skončení okna vyber další audio stanici na stejném MUX a opakuj.
++X-PAD se může lišit podle audio služby. Není potřeba přelaďovat na ostatní
++stanice kvůli jejich programům uvnitř právě přijímaného carouselu. Potom proveď
++kladnou kontrolu na MUX 11B (index 25 / 218640 kHz) a rozliš aktuální program
++od historického SI/PI. Na konci vypni DEBUG s potvrzením OFF a případně pošli
++`ENABLE=0`. Tím nevypínáš živý EPG příjem; nový TRANSPORT výpis není periodický.
++
++## Rozhodovací matice
++
++| Pozorovaný packet Directory | Pozorování aktuálního audio PAD | Dovolený závěr |
++|---|---|---|
++| validní, 0 objektů | UA=7, vlastní validní nenulový DIR + SI/PI | Prázdný packet a SPI přes X-PAD současně prokázány na této stanici. |
++| validní, 0 objektů | UA=7, DIR + SI/PNG bez PI | X-PAD SPI metadata prokázána, rozpis pro stanici není deklarován. |
++| validní, 0 objektů | UA=7, nic kompletního nebo chyby | X-PAD signalizováno; příjem/obsah neověřen. Uvést přesnou bránu/timeout. |
++| validní, 0 objektů | kompletní úspěšná audio UA bez 7 | X-PAD SPI na této audio komponentě není potvrzeno; nikoli závěr o celém MUX. |
++| validní, nenulový | bez PAD SPI | Standardní packet SPI. |
++| neověřený/chybí | validní PAD SI/PI | SPI přes X-PAD prokázáno, packet není podmínkou. |
++| libovolný | neúplná/chybná UA inventura | Stav PAD neznámý; neoznačovat za nepřítomný. |
++
++Přítomnost historického PI potvrzuje přenos SPI, ale ne aktuální program.
++
++## Příklad – výhradně syntetický, není to RF log MUX 11A
++
++Následující zkrácené řádky ilustrují výsledek hostitelského scénáře A;
++číselné identity jsou testovací a nelze je přepsat jako skutečnou konfiguraci 11A.
++
++```text
++EPG OWNER mode=LIVE owner=PAD ... state=READY_LIVE ...
++EPG MOTPATH path=PACKET groups=16 valid=16 ... dirs=16 unique=1 repeats=15 empty=16 tid=8CC2 dirBytes=16 objects=0 ...
++EPG MOTPATH path=PAD groups=6 valid=6 ... dirs=2 unique=1 repeats=1 empty=0 tid=8CC2 dirBytes=39 objects=2 SI=1 PI=1 PNG=0 programmes=3 ...
++EPG REJECT path=PACKET ... owner=15 ...
++EPG TRANSPORT END
++```
++
++`mode=LIVE` zde označuje produkční větev v mocku s testovacími hodinami,
++ne fyzický příjem. Celá zachycená skupina packet Directory má **27 B**, zatímco
++vlastní Directory uvnitř má **16 B**. Dřívější 27B body fixture je pouze obecný
++syntetický test prázdného Directory, nikoli přesná kopie tohoto 11A záznamu.
++
++Původní log má 422 CRC-validních packet skupin; omezené vzorky PAD UA ukazují
++slideshow 0x002. Neprokazují ani nevylučují, že jiná/stejná audio služba vysílá SPI.
++
++## Co předat jako výsledek
++
++Datum, délku okna, kanál/frekvenci, EID/ECC, audio SID/CID, packet SID/CID,
++UA stav/generaci, owner, přírůstky obou větví, Directory objects a SI/PI/PNG,
++reset důvody, dostupnost hodin, skutečné TFT a pozorování audio/SLS. Nepřidávej
++osobní cesty či účet. Uveď samostatně: technicky možné ANO; nové RF na 11A
++PROKÁZÁNO / NEOVĚŘENO podle výše uvedených důkazů; syntetická odolnost je
++jiný výsledek. Závada zdroje nebo chybějící obsah jedné větve není nepřítomnost
++EPG v celém multiplexu.
+diff --git a/docs/EPG_MUX11A_XPAD_results_20261025.json b/docs/EPG_MUX11A_XPAD_results_20261025.json
+new file mode 100644
+index 0000000..b725f50
+--- /dev/null
++++ b/docs/EPG_MUX11A_XPAD_results_20261025.json
+@@ -0,0 +1,648 @@
++{
++  "date": "2026-10-25",
++  "baseline_head": "116758e5bd05927f70f6884a332a845e0e60369b",
++  "scope": "Local approved packet/X-PAD coexistence diagnostics and fixes; previous approved time/archive edits retained. No upload, NVS or GitHub action.",
++  "host_acceptance": [
++    {
++      "test": "RAW/oracle production core",
++      "exit": 0,
++      "seconds": 7.894
++    },
++    {
++      "test": "compile errors",
++      "exit": 0,
++      "seconds": 0.851
++    },
++    {
++      "test": "errors",
++      "exit": 0,
++      "seconds": 0.157
++    },
++    {
++      "test": "compile cache",
++      "exit": 0,
++      "seconds": 0.807
++    },
++    {
++      "test": "cache",
++      "exit": 0,
++      "seconds": 0.312
++    },
++    {
++      "test": "compile uart",
++      "exit": 0,
++      "seconds": 0.743
++    },
++    {
++      "test": "uart",
++      "exit": 0,
++      "seconds": 0.045
++    },
++    {
++      "test": "compile SPI probe",
++      "exit": 0,
++      "seconds": 0.274
++    },
++    {
++      "test": "SPI probe/router",
++      "exit": 0,
++      "seconds": 0.037
++    },
++    {
++      "test": "compile dab_spi_discovery",
++      "exit": 0,
++      "seconds": 0.236
++    },
++    {
++      "test": "dab_spi_discovery",
++      "exit": 0,
++      "seconds": 0.038
++    },
++    {
++      "test": "compile dab_packet_inventory",
++      "exit": 0,
++      "seconds": 0.402
++    },
++    {
++      "test": "dab_packet_inventory",
++      "exit": 0,
++      "seconds": 0.076
++    },
++    {
++      "test": "DAB clock contract",
++      "exit": 0,
++      "seconds": 0.608
++    },
++    {
++      "test": "X-PAD config/diagnostics",
++      "exit": 0,
++      "seconds": 0.527
++    },
++    {
++      "test": "live",
++      "exit": 0,
++      "seconds": 3.824
++    },
++    {
++      "test": "runtime",
++      "exit": 0,
++      "seconds": 1.699
++    },
++    {
++      "test": "ui",
++      "exit": 0,
++      "seconds": 1.223
++    },
++    {
++      "test": "transport",
++      "exit": 0,
++      "seconds": 0.459
++    },
++    {
++      "test": "coexistence",
++      "exit": 0,
++      "seconds": 1.301
++    },
++    {
++      "test": "synthetic_paths",
++      "exit": 0,
++      "seconds": 0.992
++    },
++    {
++      "test": "synthetic_uart",
++      "exit": 0,
++      "seconds": 1.061
++    },
++    {
++      "test": "storage",
++      "exit": 0,
++      "seconds": 3.582
++    },
++    {
++      "test": "png_adam7",
++      "exit": 0,
++      "seconds": 4.598
++    },
++    {
++      "test": "pc",
++      "exit": 0,
++      "seconds": 8.731
++    }
++  ],
++  "coexistence": {
++    "kind": "host full production DSRV/runtime/Core, not RF",
++    "pass": true,
++    "unexpectedResets": 0,
++    "mockExtraDramPressure": 1024,
++    "physical_hardware_tested": false,
++    "resetReasonNames": [
++      "tune",
++      "service",
++      "packet-endpoint",
++      "packet->PAD",
++      "PAD->packet",
++      "pad-endpoint",
++      "ua-revoked",
++      "replay-start",
++      "replay-stop",
++      "PAD-acquire"
++    ],
++    "padRejectNames": [
++      "ua",
++      "generation",
++      "sid",
++      "cid",
++      "inactive",
++      "dscty",
++      "state",
++      "physical",
++      "length",
++      "read",
++      "replay",
++      "owner",
++      "data",
++      "no-endpoint",
++      "busy"
++    ],
++    "cases": [
++      {
++        "case": "A-empty-packet-full-PAD-same-TID-menu",
++        "pass": true,
++        "packetGroups": 16,
++        "packetEmpty": 16,
++        "packetBlocked": 15,
++        "padGroups": 6,
++        "padPI": 1,
++        "padSI": 1,
++        "padPNG": 0,
++        "cached": 3,
++        "resets": 1,
++        "expectedResets": 1,
++        "resetReasons": [
++          1,
++          0,
++          1,
++          1,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0
++        ],
++        "padRejects": [
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0
++        ]
++      },
++      {
++        "case": "B-empty-packet-PAD-not-confirmed",
++        "pass": true,
++        "packetGroups": 4,
++        "packetEmpty": 4,
++        "packetBlocked": 0,
++        "padGroups": 0,
++        "padPI": 0,
++        "padSI": 0,
++        "padPNG": 0,
++        "cached": 0,
++        "resets": 0,
++        "expectedResets": 0,
++        "resetReasons": [
++          2,
++          0,
++          2,
++          1,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0
++        ],
++        "padRejects": [
++          1,
++          1,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0
++        ]
++      },
++      {
++        "case": "B2-E-packet-SLS-DLS-failed-first-PAD",
++        "pass": true,
++        "packetGroups": 5,
++        "packetEmpty": 0,
++        "packetBlocked": 0,
++        "padGroups": 2,
++        "padPI": 0,
++        "padSI": 0,
++        "padPNG": 0,
++        "cached": 3,
++        "resets": 0,
++        "expectedResets": 0,
++        "resetReasons": [
++          3,
++          0,
++          3,
++          1,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0
++        ],
++        "padRejects": [
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          1,
++          0,
++          0,
++          2,
++          0,
++          0
++        ]
++      },
++      {
++        "case": "B3-full-PAD-without-packet-endpoint",
++        "pass": true,
++        "packetGroups": 0,
++        "packetEmpty": 0,
++        "packetBlocked": 0,
++        "padGroups": 5,
++        "padPI": 1,
++        "padSI": 1,
++        "padPNG": 0,
++        "cached": 3,
++        "resets": 1,
++        "expectedResets": 1,
++        "resetReasons": [
++          4,
++          0,
++          5,
++          1,
++          0,
++          0,
++          0,
++          0,
++          0,
++          1
++        ],
++        "padRejects": [
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0
++        ]
++      },
++      {
++        "case": "C-PAD-SI-own-PNG-no-PI",
++        "pass": true,
++        "packetGroups": 8,
++        "packetEmpty": 8,
++        "packetBlocked": 8,
++        "padGroups": 9,
++        "padPI": 0,
++        "padSI": 1,
++        "padPNG": 1,
++        "cached": 0,
++        "resets": 0,
++        "expectedResets": 0,
++        "resetReasons": [
++          5,
++          0,
++          6,
++          2,
++          0,
++          0,
++          0,
++          0,
++          0,
++          1
++        ],
++        "padRejects": [
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0
++        ]
++      },
++      {
++        "case": "D-owner-handoff-UA-unknown-failed-duplicate-revoked",
++        "pass": true,
++        "packetGroups": 5,
++        "packetEmpty": 0,
++        "packetBlocked": 0,
++        "padGroups": 6,
++        "padPI": 1,
++        "padSI": 1,
++        "padPNG": 0,
++        "cached": 3,
++        "resets": 2,
++        "expectedResets": 2,
++        "resetReasons": [
++          6,
++          0,
++          7,
++          3,
++          0,
++          0,
++          1,
++          0,
++          0,
++          1
++        ],
++        "padRejects": [
++          1,
++          1,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0
++        ]
++      },
++      {
++        "case": "D-service-frequency-FM-isolation",
++        "pass": true,
++        "packetGroups": 0,
++        "packetEmpty": 0,
++        "packetBlocked": 0,
++        "padGroups": 0,
++        "padPI": 0,
++        "padSI": 0,
++        "padPNG": 0,
++        "cached": 0,
++        "resets": 4,
++        "expectedResets": 4,
++        "resetReasons": [
++          9,
++          1,
++          8,
++          5,
++          0,
++          0,
++          1,
++          0,
++          0,
++          1
++        ],
++        "padRejects": [
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0
++        ]
++      },
++      {
++        "case": "E-negative-header-identity-CRC-read-timeout-clock",
++        "pass": true,
++        "packetGroups": 0,
++        "packetEmpty": 0,
++        "packetBlocked": 0,
++        "padGroups": 6,
++        "padPI": 1,
++        "padSI": 1,
++        "padPNG": 0,
++        "cached": 3,
++        "resets": 0,
++        "expectedResets": 0,
++        "resetReasons": [
++          10,
++          1,
++          9,
++          6,
++          0,
++          0,
++          1,
++          0,
++          0,
++          1
++        ],
++        "padRejects": [
++          0,
++          1,
++          1,
++          2,
++          1,
++          1,
++          1,
++          1,
++          1,
++          1,
++          0,
++          0,
++          1,
++          1,
++          0
++        ]
++      },
++      {
++        "case": "F-PAD-signalled-no-data-is-WAITING",
++        "pass": true,
++        "packetGroups": 11,
++        "packetEmpty": 11,
++        "packetBlocked": 10,
++        "padGroups": 0,
++        "padPI": 0,
++        "padSI": 0,
++        "padPNG": 0,
++        "cached": 0,
++        "resets": 1,
++        "expectedResets": 1,
++        "resetReasons": [
++          11,
++          1,
++          10,
++          7,
++          0,
++          0,
++          1,
++          0,
++          0,
++          1
++        ],
++        "padRejects": [
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0
++        ]
++      },
++      {
++        "case": "F-replay-quarantine",
++        "pass": true,
++        "packetGroups": 11,
++        "packetEmpty": 11,
++        "packetBlocked": 10,
++        "padGroups": 0,
++        "padPI": 0,
++        "padSI": 0,
++        "padPNG": 0,
++        "cached": 0,
++        "resets": 1,
++        "expectedResets": 1,
++        "resetReasons": [
++          11,
++          1,
++          10,
++          7,
++          0,
++          0,
++          1,
++          1,
++          0,
++          1
++        ],
++        "padRejects": [
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          0,
++          1,
++          0,
++          0,
++          0,
++          0
++        ]
++      }
++    ],
++    "synthetic_snapshot": "EPG OK TRANSPORT queued\nEPG AUDIO sid=00003201 cid=01FE0005 ua=confirmed identity=2 gen=2 published=1 inventory=1 complete=1 failed=0 usable=1\nEPG PACKET selected=1 sid=E23153FE cid=01F2C00C status=confirmed/ensemble confirmed=1 unverified=0 tracked=E23153FE/01F2C00C probe=4\nEPG RADIO mode=DAB requestedIndex=24 khz=216928 eid=3153 ecc=E2 lock=1 tune=0 switching=0 CTS=0 overflow=0 errors=0 XPAD=0000 set=127 get=127 match=0\nEPG OWNER mode=LIVE owner=PAD channelIndex=24 epoch=1 resets=3 last=packet->PAD stateChanges=5 state=READY_LIVE headerErrors=0\nEPG TRANSPORT path=PACKET endpoint=E23153FE/01F2C00C headers=16/0/0/0 candidate=16 admitted=1 blocked=15 legacy=0 last=E23153FE/0000C00C src=0 ua=0007 dscty=60 state=0 bytes=27 gen=2 waitMs=0 idleMs=501 reason=empty-directory\nEPG MOTPATH path=PACKET groups=16 valid=16 crcBad=0 invalid=0 type4=0 type6=16 dirs=16 unique=1 repeats=15 empty=16 tid=8CC2 dirBytes=16 objects=0 SI=0 PI=0 PNG=0 programmes=0 historyLimited=0\nEPG REJECT path=PACKET ua=0 generation=0 sid=0 cid=0 inactive=0 dscty=0 state=0 physical=0 length=0 read=0 replay=0 owner=15 data=0 no-endpoint=0 busy=0\nEPG TRANSPORT path=PAD endpoint=00003201/01FE0005 headers=0/6/0/0 candidate=6 admitted=6 blocked=0 legacy=0 last=00003201/00000005 src=1 ua=0007 dscty=60 state=0 bytes=50 gen=2 waitMs=0 idleMs=800 reason=directory-known\nEPG MOTPATH path=PAD groups=6 valid=6 crcBad=0 invalid=0 type4=4 type6=2 dirs=2 unique=1 repeats=1 empty=0 tid=8CC2 dirBytes=39 objects=2 SI=1 PI=1 PNG=0 programmes=3 historyLimited=0\nEPG REJECT path=PAD ua=0 generation=0 sid=0 cid=0 inactive=0 dscty=0 state=0 physical=0 length=0 read=0 replay=0 owner=0 data=0 no-endpoint=0 busy=0\nEPG RESETS total=3 tune=1 service=0 packet-endpoint=1 packet->PAD=1 PAD->packet=0 pad-endpoint=0 ua-revoked=0 replay-start=0 replay-stop=0 PAD-acquire=0\nEPG HEALTH free8=12808 largest8=12808 free32=17416 largest32=17416 min=30224 UARTdrop=0 audio=1 SLS=1 core=1 arena=51392 cached=3 limited=0 timeout=0 busy=0 invalid=0 crcBad=0\nEPG TRANSPORT END\n",
++    "stderr": ""
++  },
++  "mux11a_capture": {
++    "source_archive": "EPG_DSRV_dumps_and_files.zip",
++    "source_archive_sha256": "7f585793084d3b7a6072d5775f557b0eac75e4d7b639eff552445da10a030dbe",
++    "source_entry": "log_11A.txt",
++    "entry_sha256": "f72e015bed9b9e321667129967f5224ec4b6835556c1945ac02a25f760df43dd",
++    "complete_packet_groups": 422,
++    "crc_valid": 422,
++    "crc_bad": 0,
++    "packet_sid": "E231B3FE",
++    "packet_cid": "C00B",
++    "group_bytes": 27,
++    "directory_bytes": 16,
++    "tid": "8CC2",
++    "objects": 0,
++    "directory_hex": "0000001000000000dc00000003004101",
++    "pad_route_lines": 44,
++    "sampled_ua_packet_spi": 2,
++    "sampled_ua_pad_slideshow": 3,
++    "sampled_ua_pad_spi": 0,
++    "conclusion": "Empty packet carousel proved. X-PAD SPI on 11A unverified; rate-limited UA samples cannot prove absence."
++  },
++  "build": {
++    "environment": "esp32dev",
++    "success": true,
++    "static_ram_bytes": 67128,
++    "flash_bytes": 3551797,
++    "firmware_bytes": 3552416,
++    "firmware_sha256": "0c51a051c3db86ceeadfbfe41ca09224c4fe3d2166c507883e2b80ab38fb93a2",
++    "target_registry_bytes": 516,
++    "target_core_bytes": 14232,
++    "target_core_buffer_bytes": 36864,
++    "target_core_total_bytes": 51096
++  },
++  "regressions_reproduced_before_fix": [
++    "Confirmed PAD UA must not be revoked by temporary ServiceStart=false",
++    "Packet selector must retain a distinct packet endpoint when audio SPI is also confirmed",
++    "Failed PAD payload read must not reset packet Core before discovery hands off",
++    "Malformed MOT envelope with valid CRC must not evict packet cache",
++    "Faulted packet DSRV header must not publish empty Directory over packet PI"
++  ],
++  "rf_verdict": {
++    "technical_coexistence_possible": true,
++    "actual_mux11a_xpad_spi": "UNVERIFIED",
++    "new_firmware_uploaded": false,
++    "new_rf_audio_slideshow_stack_test": "HW NOT TESTED"
++  }
++}
+diff --git a/docs/EPG_SYNTHETIC_PATHS_CZ.md b/docs/EPG_SYNTHETIC_PATHS_CZ.md
+index 5e3c589..87769a8 100644
+--- a/docs/EPG_SYNTHETIC_PATHS_CZ.md
++++ b/docs/EPG_SYNTHETIC_PATHS_CZ.md
+@@ -155,3 +155,14 @@ synthetic_logo_1.png, hardware_synthetic_logo.json a .log.
+ Jde nadále o syntetickou DSRV injekci, nikoli ověření příjmu z éteru.
+ 
+ Uživatel potvrdil, že závěrečné PAD Adam7 logo je celé a správně vykreslené.
++
++
++## Doplnění 25. 10. 2026 – souběh packet/X-PAD
++
++Historické testy na desce výše zůstávají záznamem tehdejšího firmware.
++Nový hostitelský `tests/test_epg_coexistence.py` ověřuje obě větve současně
++přes skutečný DsrvHeader, UA publikaci a runtime/Core. Zahrnuje přesnou 27B
++skupinu prázdného packet Directory a plné PAD SI/PI, kolizi TID, vlastní logo,
++nejistou UA a vadný první PAD payload. Nevysílá do rádia a neověřuje RF.
++Nový `EPG TEST TRANSPORT` vypisuje obě větve samostatně bez přepnutí režimu.
++Viz [report](EPG_MUX11A_XPAD_REPORT_20261025.md) a [živý RF postup](EPG_MUX11A_XPAD_RF_TEST_CZ.md).
+diff --git a/src/dab_spi_discovery.h b/src/dab_spi_discovery.h
+index 10642f9..c2f68de 100644
+--- a/src/dab_spi_discovery.h
++++ b/src/dab_spi_discovery.h
+@@ -84,7 +84,7 @@ struct Scan {
+ };
+ enum class Status : uint8_t {
+   Pending, NotSignalled, SelectedService, SelectedEnsemble, Ambiguous, Incomplete,
+-  PacketMotUnverified
++  PacketMotUnverified, PadOnly
+ };
+ 
+ inline Identity identify(const uint8_t* raw, size_t bytes, uint8_t count) {
+@@ -122,6 +122,7 @@ inline const char* statusName(Status status) {
+     case Status::Ambiguous: return "ambiguous";
+     case Status::Incomplete: return "discovery incomplete";
+     case Status::PacketMotUnverified: return "packet MOT unverified";
++    case Status::PadOnly: return "confirmed/PAD; no packet";
+   }
+   return "unknown";
+ }
+@@ -133,7 +134,7 @@ inline const char* statusName(Status status) {
+ // policy, not proof that its schedule covers every audio service.
+ class Selector {
+  public:
+-  explicit Selector(uint32_t currentService) : currentService_(currentService) {}
++  explicit Selector(uint32_t currentService,bool packetOnly=false) : currentService_(currentService),packetOnly_(packetOnly) {}
+ 
+   void consider(uint32_t sid, uint32_t cid, Identity identity, bool packetMot = false) {
+     if (identity == Identity::Unqueried) pending_ = true;
+@@ -143,6 +144,7 @@ class Selector {
+       return;
+     }
+     if (confirmed_ != UINT16_MAX) ++confirmed_;
++    if(packetOnly_ && !packetMot) return;
+     add(all_, allCount_, sid, cid);
+     if (sid == currentService_) add(local_, localCount_, sid, cid);
+   }
+@@ -164,7 +166,8 @@ class Selector {
+       result.componentId = all_.componentId;
+       result.status = Status::SelectedEnsemble;
+     } else {
+-      result.status = packetMotUnverified_ ? Status::PacketMotUnverified : Status::NotSignalled;
++      result.status = packetMotUnverified_ ? Status::PacketMotUnverified :
++          confirmed_?Status::PadOnly:Status::NotSignalled;
+     }
+     return result;
+   }
+@@ -180,6 +183,7 @@ class Selector {
+     }
+   }
+   uint32_t currentService_;
++  bool packetOnly_;
+   Result all_;
+   Result local_;
+   uint8_t allCount_ = 0;
+diff --git a/src/epg_core.cpp b/src/epg_core.cpp
+index db6627a..5444a89 100644
+--- a/src/epg_core.cpp
++++ b/src/epg_core.cpp
+@@ -17,6 +17,20 @@ uint32_t crc32(Bytes p, size_t n) {
+   while(n--) { c ^= p[index++]; for(unsigned i=0;i<8;++i) c=(c>>1)^((c&1)?0xedb88320U:0); }
+   return c^0xffffffff;
+ }
++GroupCheck inspectGroup(Bytes p,size_t n,GroupEnvelope& h) {
++  if(!p || n<11 || n>kMaxGroup)return GroupCheck::Invalid;
++  if(crc16(p,n-2)!=be16(p+(n-2)))return GroupCheck::Crc;
++  h.type=p[0]&15;
++  if((p[0]&0x70)!=0x70 || (h.type!=4 && h.type!=6))return GroupCheck::Invalid;
++  size_t pos=(p[0]&128)?4:2;
++  if(pos+3>n-2)return GroupCheck::Invalid;
++  h.segment=be16(p+pos);pos+=2;
++  const uint8_t ua=p[pos++];const size_t uaLen=ua&15;
++  if(!(ua&16) || uaLen<2 || uaLen>n-2-pos || pos+uaLen+2>n-2)return GroupCheck::Invalid;
++  h.tid=be16(p+pos);pos+=uaLen;h.repetition=p[pos]>>5;
++  h.length=be16(p+pos)&8191;pos+=2;h.offset=pos;
++  return h.length && h.length==n-2-pos?GroupCheck::Valid:GroupCheck::Invalid;
++}
+ // Gregorian arithmetic independent of host timezone/time_t width.
+ static int64_t daysFromCivil(int y, unsigned m, unsigned d) {
+   y -= m<=2; const int era=(y>=0?y:y-399)/400;
+@@ -463,25 +477,17 @@ Feed Core::feed(Bytes p, size_t n, uint32_t now) {
+   if(busy()) { ++stats.busy; return Feed::Busy; }
+   monotonicMs_=now;
+   ++stats.frames;
+-  if(!p || n<11 || n>kMaxGroup) { ++stats.invalid; return Feed::Rejected; }
+-  if(crc16(p,n-2)!=be16(p+(n-2))) { ++stats.crcBad; return Feed::Rejected; }
+-  const uint8_t type=p[0]&15;
+-  // Require CRC, segmentation and user-access transport ID. Extension supported.
+-  if((p[0]&0x70)!=0x70 || (type!=4 && type!=6)) { ++stats.invalid; return Feed::Rejected; }
+-  const unsigned stream=type==6?1:0;
+-  const uint8_t continuity=p[1]>>4;
+-  const uint8_t previous=stats.lastContinuity[stream];
+-  if(previous!=255 && continuity!=previous && continuity!=((previous+1)&15)) ++stats.continuityJumps;
+-  stats.lastContinuity[stream]=continuity; stats.lastRepetition[stream]=p[1]&15;
+-  size_t pos=(p[0]&128)?4:2;
+-  if(pos+3>n-2) { ++stats.invalid; return Feed::Rejected; }
+-  const uint16_t segment=be16(p+pos); pos+=2;
+-  const uint8_t ua=p[pos++]; const size_t uaLen=ua&15;
+-  if(!(ua&16) || uaLen<2 || uaLen>n-2-pos || pos+uaLen+2>n-2) { ++stats.invalid; return Feed::Rejected; }
+-  const uint16_t tid=be16(p+pos); pos+=uaLen;
+-  stats.lastMotRepetition=p[pos]>>5;
+-  const size_t length=be16(p+pos)&8191; pos+=2;
+-  if(length!=n-2-pos || !length) { ++stats.invalid; return Feed::Rejected; }
++  GroupEnvelope envelope;const auto checked=inspectGroup(p,n,envelope);
++  if(checked!=GroupCheck::Valid) {
++    if(checked==GroupCheck::Crc)++stats.crcBad;else ++stats.invalid;
++    return Feed::Rejected;
++  }
++  const uint8_t type=envelope.type;const unsigned stream=type==6?1:0;
++  const uint8_t continuity=p[1]>>4,previous=stats.lastContinuity[stream];
++  if(previous!=255 && continuity!=previous && continuity!=((previous+1)&15))++stats.continuityJumps;
++  stats.lastContinuity[stream]=continuity;stats.lastRepetition[stream]=p[1]&15;stats.lastMotRepetition=envelope.repetition;
++  const uint16_t tid=envelope.tid,segment=envelope.segment;
++  const size_t pos=envelope.offset,length=envelope.length;
+   transportSeen_=true;transportTouched_=now;
+   Assembly& a=type==6?dirAssembly_:bodyAssembly_;
+   Buffer buffer=type==6?directory_:body_; const size_t cap=type==6?kDirectoryBytes:kObjectBytes;
+diff --git a/src/epg_core.h b/src/epg_core.h
+index b222bed..f6100ff 100644
+--- a/src/epg_core.h
++++ b/src/epg_core.h
+@@ -67,6 +67,11 @@ bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& offsetMinutes, bool& l
+ bool timePoint(Bytes p, size_t n, uint32_t& utc, int16_t& offsetMinutes);
+ bool bearerValue(Bytes p, size_t n, uint64_t& out);
+ 
++// Read-only MSC envelope validation shared by admission, diagnostics and Core.
++struct GroupEnvelope {uint16_t tid=0,segment=0;uint8_t type=0,repetition=0;size_t offset=0,length=0;};
++enum class GroupCheck:uint8_t { Valid, Invalid, Crc };
++GroupCheck inspectGroup(Bytes p,size_t n,GroupEnvelope& header);
++
+ struct Programme {
+   uint64_t bearer = 0;
+   uint32_t start=0, duration=0, actual=0, actualDuration=0, id=0;
+diff --git a/src/epg_runtime.cpp b/src/epg_runtime.cpp
+index d8da334..bab43bf 100644
+--- a/src/epg_runtime.cpp
++++ b/src/epg_runtime.cpp
+@@ -23,6 +23,8 @@ static bool snapshotFm=false;
+ static uint8_t snapshotFreq=0;
+ static uint32_t snapshotSid=0;
+ static bool allocationReported=false;
++static uint8_t transportPage=255;
++static uint32_t transportPrintedAt=0,transportResetSequence=0,transportEpoch=0;
+ static uint32_t endpointSid=0, endpointCid=0, pendingSid=0;
+ static uint32_t padSid=0, padCid=0;
+ static bool injectDsrv=false, injectPad=false, injectUa=false;
+@@ -62,6 +64,7 @@ static Feed injectedDsrv(const uint8_t* data,size_t n,uint32_t now) {
+   ++injectRejected; return Feed::Rejected;
+ }
+ static void objectReady(void*,uint16_t tid,uint8_t type,Bytes data,size_t n) {
++  if(!replay) epg_diag::registry().object(padSid?epg_diag::Path::Pad:epg_diag::Path::Packet,tid,type,data,n,core->stats.programmes);
+   if(diagSerial.availableForWrite()<192) return;
+   const char* kind=type==6?"DIR":n && data[0]==2?"PI":n && data[0]==3?"SI":"PNG";
+   diagSerial.printf("EPG MOT tid=%04X kind=%s bytes=%u programmes=%u cached=%u\n",tid,kind,unsigned(n),core->stats.programmes,unsigned(core->count()));
+@@ -103,14 +106,15 @@ bool ensure(bool reportFailure) {
+   if(core) core->observer.object=objectReady;
+   return core!=nullptr;
+ }
+-static void resetLiveCore() {
+-  if(core) { core->reset(); core->setLive(true); core->setClockTrusted(false); core->select(0,0,0); EpgInvalidate(); }
++static void resetLiveCore(epg_diag::Reset reason) {
++  if(core) { epg_diag::registry().reset(reason);core->reset(); core->setLive(true); core->setClockTrusted(false); core->select(0,0,0); EpgInvalidate(); }
+ }
+ void liveReset() {
+   clearInjection();clockLost=false;liveClock=ResolvedClock{};
+   if(replay) { replay=demo=false; pendingSid=0; receiver.reset(); EpgClose(false); }
+   endpointSid=endpointCid=padSid=padCid=0;
+-  resetLiveCore();
++  epg_diag::registry().context();
++  resetLiveCore(epg_diag::Reset::Tune);
+ }
+ void liveContext(uint32_t sid,uint16_t eid,uint8_t ecc,uint32_t utc) {
+   if(!core || replay) return;
+@@ -124,32 +128,83 @@ void liveEndpoint(uint32_t sid,uint32_t cid) {
+   if(replay) return;
+   if(endpointSid!=sid || endpointCid!=cid) {
+     endpointSid=sid; endpointCid=cid;
+-    if(!padSid) resetLiveCore();
++    epg_diag::registry().endpoint(epg_diag::Path::Packet,sid,cid,millis());
++    if(!padSid) resetLiveCore(epg_diag::Reset::PacketEndpoint);
+   }
+ }
+-void livePadEndpoint(uint32_t sid,uint32_t cid) {
++static void setPadEndpoint(uint32_t sid,uint32_t cid,epg_diag::Reset reason) {
+   if(replay || (padSid==sid && padCid==cid)) return;
+   padSid=sid; padCid=cid;
+-  resetLiveCore(); // Never mix directories/TIDs from independent transports.
++  if(sid)epg_diag::registry().endpoint(epg_diag::Path::Pad,sid,cid,millis());
++  resetLiveCore(reason);
++}
++void livePadEndpoint(uint32_t sid,uint32_t cid) {
++  setPadEndpoint(sid,cid,!sid?epg_diag::Reset::PadToPacket:padSid?epg_diag::Reset::PadEndpoint:endpointSid?epg_diag::Reset::PacketToPad:epg_diag::Reset::PadAcquire);
++}
++void livePadRevoked(){setPadEndpoint(0,0,epg_diag::Reset::UaRevoked);}
++void liveServiceChanged(){setPadEndpoint(0,0,epg_diag::Reset::Service);}
++static void liveGroup(epg_diag::Path path,const uint8_t* data,size_t n,bool owns) {
++  auto& diagnostic=epg_diag::registry();auto& counters=diagnostic.at(path);
++  diagnostic.group(path,data,n,owns,millis());
++  if(replay){diagnostic.reject(path,epg_diag::Reject::Replay);return;}
++  if(!owns){epg_diag::increment(counters.blocked);diagnostic.reject(path,epg_diag::Reject::Owner);return;}
++  if(!core){diagnostic.reject(path,epg_diag::Reject::NoEndpoint);return;}
++  const auto result=core->feed(data,n,millis());
++  if(result==Feed::Accepted)epg_diag::increment(counters.admitted);
++  else diagnostic.reject(path,result==Feed::Busy?epg_diag::Reject::Busy:epg_diag::Reject::Data);
++}
++void livePayload(const uint8_t* data,size_t n){liveGroup(epg_diag::Path::Packet,data,n,!padSid);}
++void livePadPayload(const uint8_t* data,size_t n){liveGroup(epg_diag::Path::Pad,data,n,padSid!=0);}
++void livePadData(uint32_t sid,uint32_t cid,const uint8_t* data,size_t n) {
++  if(replay){epg_diag::registry().reject(epg_diag::Path::Pad,epg_diag::Reject::Replay);return;}
++  // Do not discard packet cache on a failed read or corrupt first PAD group.
++  // A completed UA publication may independently choose the signalled PAD owner.
++  GroupEnvelope envelope;
++  if((padSid!=sid || padCid!=cid) && (inspectGroup(data,n,envelope)!=GroupCheck::Valid || (envelope.segment&32767)>=32)) {
++    epg_diag::registry().group(epg_diag::Path::Pad,data,n,false,millis());
++    epg_diag::registry().reject(epg_diag::Path::Pad,epg_diag::Reject::Data);return;
++  }
++  livePadEndpoint(sid,cid);livePadPayload(data,n);
+ }
+-void livePayload(const uint8_t* data,size_t n) { if(core && !replay && !padSid) core->feed(data,n,millis()); }
+-void livePadPayload(const uint8_t* data,size_t n) { if(core && !replay && padSid) core->feed(data,n,millis()); }
+ void stopReplay() {
+   clearInjection();
+   replay=demo=false; pendingSid=0; receiver.reset(); liveClock=ResolvedClock{};
+   endpointSid=endpointCid=padSid=padCid=0;
+-  if(core) { core->reset(); core->setLive(true); core->setClockTrusted(false); core->select(0,0,0); }
++  epg_diag::registry().context();
++  if(core) { epg_diag::registry().reset(epg_diag::Reset::ReplayStop);core->reset(); core->setLive(true); core->setClockTrusted(false); core->select(0,0,0); }
+   EpgClose();
+ }
+ static uint32_t radioSid() { return radio.ServiceStart && radio.ServiceIndex<radio.numberofservices ? radio.service[radio.ServiceIndex].ServiceID:0; }
+ static void startReplay() {
+   clearInjection();
+   endpointSid=endpointCid=padSid=padCid=0;
++  epg_diag::registry().reset(epg_diag::Reset::ReplayStart);
+   core->reset(); core->setLive(false); core->setClockTrusted(true); replay=true; demo=false; activity=millis(); receiver.reset();
+   snapshotFm=radio.isFm(); snapshotFreq=dabfreq; snapshotSid=radioSid();
+   core->select(0x40e231533233ULL,epoch(2024,11,12,3,30),60);
+ }
++static void transportOutput() {
++  if(transportPage==255 || diagSerial.availableForWrite()<512 || uint32_t(millis()-transportPrintedAt)<100U)return;
++  transportPrintedAt=millis();auto& d=epg_diag::registry();
++  if(transportResetSequence!=d.totalResets || transportEpoch!=d.epoch){diagSerial.println("EPG TRANSPORT CANCELLED context changed");transportPage=255;return;}
++  const unsigned page=transportPage++;
++  if(page<3){radio.logEpgTransportPage(uint8_t(page));return;}
++  if(page==3){diagSerial.printf("EPG OWNER mode=%s owner=%s channelIndex=%u epoch=%u resets=%u last=%s stateChanges=%u state=%s headerErrors=%u\n",replay?"TEST":"LIVE",replay?"TEST":padSid?"PAD":endpointSid?"PACKET":"NONE",unsigned(dabfreq),unsigned(d.epoch),unsigned(d.totalResets),epg_diag::resetName(d.lastReset),unsigned(d.stateChanges),availabilityName(availability()),unsigned(d.headerErrors));return;}
++  if(page>=4 && page<10){
++    const unsigned index=(page-4)/3,part=(page-4)%3;const auto& c=d.paths[index];const char* name=index?"PAD":"PACKET";
++    if(part==0)diagSerial.printf("EPG TRANSPORT path=%s endpoint=%08X/%08X headers=%u/%u/%u/%u candidate=%u admitted=%u blocked=%u legacy=%u last=%08X/%08X src=%u ua=%04X dscty=%u state=%u bytes=%u gen=%u waitMs=%u idleMs=%u reason=%s\n",name,unsigned(c.sid),unsigned(c.cid),unsigned(c.headers[0]),unsigned(c.headers[1]),unsigned(c.headers[2]),unsigned(c.headers[3]),unsigned(c.candidates),unsigned(c.admitted),unsigned(c.blocked),unsigned(c.legacy),unsigned(c.lastSid),unsigned(c.lastCid),c.source,c.ua,c.dscty,c.state,c.bytes,unsigned(c.generation),c.sid && !c.dirs?unsigned(millis()-c.endpointMs):0,c.validGroups?unsigned(millis()-c.lastGroupMs):0,!c.sid?"not-owned":c.dirs?(c.objects?"directory-known":"empty-directory"):uint32_t(millis()-c.endpointMs)>=300000U?"directory-timeout":c.validGroups?"incomplete-directory":"waiting-data");
++    else if(part==1)diagSerial.printf("EPG MOTPATH path=%s groups=%u valid=%u crcBad=%u invalid=%u type4=%u type6=%u dirs=%u unique=%u repeats=%u empty=%u tid=%04X dirBytes=%u objects=%u SI=%u PI=%u PNG=%u programmes=%u historyLimited=%u\n",name,unsigned(c.groups),unsigned(c.validGroups),unsigned(c.crcBad),unsigned(c.invalid),unsigned(c.objectGroups),unsigned(c.dirGroups),unsigned(c.dirs),unsigned(c.unique),unsigned(c.repeats),unsigned(c.empty),c.tid,unsigned(c.dirBytes),unsigned(c.objects),unsigned(c.si),unsigned(c.pi),unsigned(c.png),unsigned(c.programmes),c.historyLimited);
++    else {diagSerial.printf("EPG REJECT path=%s",name);for(unsigned i=0;i<unsigned(epg_diag::Reject::Count);++i)diagSerial.printf(" %s=%u",epg_diag::rejectName(i),unsigned(c.rejected[i]));diagSerial.println("");}
++    return;
++  }
++  if(page==10){diagSerial.printf("EPG RESETS total=%u",unsigned(d.totalResets));for(unsigned i=0;i<unsigned(epg_diag::Reset::Count);++i)diagSerial.printf(" %s=%u",epg_diag::resetName(i),unsigned(d.resets[i]));diagSerial.println("");return;}
++  if(page==11){diagSerial.printf("EPG HEALTH free8=%u largest8=%u free32=%u largest32=%u min=%u UARTdrop=%u audio=%u SLS=%u core=%u arena=%u cached=%u limited=%u timeout=%u busy=%u invalid=%u crcBad=%u\n",unsigned(heap_caps_get_free_size(byteCaps)),unsigned(heap_caps_get_largest_free_block(byteCaps)),unsigned(heap_caps_get_free_size(wordCaps)),unsigned(heap_caps_get_largest_free_block(wordCaps)),ESP.getMinFreeHeap(),diagSerial.droppedBytes(),radio.ServiceStart,radio.SlideShowAvailable,core!=nullptr,unsigned(Core::memoryBytes()),core?unsigned(core->count()):0,core?core->limited:0,core?unsigned(core->stats.timeout):0,core?unsigned(core->stats.busy):0,core?unsigned(core->stats.invalid):0,core?unsigned(core->stats.crcBad):0);return;}
++  diagSerial.println("EPG TRANSPORT END");transportPage=255;
++}
+ void poll() {
++  transportOutput();
++  auto& diagnostic=epg_diag::registry();const uint8_t state=uint8_t(availability());
++  if(diagnostic.lastState!=state){diagnostic.lastState=state;epg_diag::increment(diagnostic.stateChanges);}
+   static bool autoAttempted=false;
+   if(!core && !autoAttempted && !radio.isFm() && (radio.spiPresent() || padSid) && radio.ServiceStart) { autoAttempted=true; ensure(); }
+   if(!core) return;
+@@ -205,6 +260,11 @@ static void status() {
+   if(injectDsrv) diagSerial.printf("EPG INJECT path=%s ua=%u accepted=%u legacy=%u rejected=%u blocked=%u\n",injectPad?"PAD":"MSC",injectUa,unsigned(injectAccepted),unsigned(injectLegacy),unsigned(injectRejected),unsigned(injectBlocked));
+ }
+ bool command(char* input) {
++  if(!strcasecmp(input,"EPG TEST TRANSPORT")) {
++    if(diagSerial.availableForWrite()<64)return true;
++    if(transportPage!=255){diagSerial.println("EPG OK TRANSPORT pending");return true;}
++    transportPage=0;transportResetSequence=epg_diag::registry().totalResets;transportEpoch=epg_diag::registry().epoch;transportPrintedAt=millis();activity=millis();diagSerial.println("EPG OK TRANSPORT queued");return true;
++  }
+   if(!strncasecmp(input,"EPG ARCHIVE ",12)) {
+     if(!core || replay) {diagSerial.println("EPG ERROR ARCHIVE requires LIVE data");return true;}
+     uint32_t date=0;
+@@ -234,7 +294,7 @@ bool command(char* input) {
+   if(diagSerial.availableForWrite()<1024) return true;
+   char* arg=input+9; activity=millis();
+   if(!strcasecmp(arg,"HELP")) {
+-    diagSerial.println("EPG OK HELP: ARCHIVE via EPG ARCHIVE YYYY-MM-DD/OFF | DEMO | START [SID FULLCID] | INJECT MSC/PAD [NOSPI] | TIME ISO8601 | STATION HEX | STATUS | STOP | CLEAR");
++    diagSerial.println("EPG OK HELP: ARCHIVE via EPG ARCHIVE YYYY-MM-DD/OFF | DEMO | START [SID FULLCID] | INJECT MSC/PAD [NOSPI] | TIME ISO8601 | STATION HEX | STATUS | TRANSPORT | STOP | CLEAR");
+     return true;
+   }
+   if(!strcasecmp(arg,"STOP") || !strcasecmp(arg,"CLEAR")) { const bool clear=!strcasecmp(arg,"CLEAR"); stopReplay(); diagSerial.printf("EPG OK %s\n",clear?"CLEAR":"STOP"); return true; }
+diff --git a/src/epg_runtime.h b/src/epg_runtime.h
+index 912d776..8dbac7d 100644
+--- a/src/epg_runtime.h
++++ b/src/epg_runtime.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "epg_core.h"
++#include "epg_transport_diag.h"
+ namespace epg {
+ Core* runtime();
+ bool ensure(bool reportFailure=false);
+@@ -11,6 +12,9 @@ enum class IndicatorState : uint8_t { Absent, Present, Ready };
+ IndicatorState indicatorState();
+ bool liveEnabled();
+ void liveReset();
++void liveServiceChanged();
++void livePadRevoked();
++void livePadData(uint32_t sid,uint32_t cid,const uint8_t* data,size_t n);
+ void liveContext(uint32_t sid, uint16_t eid, uint8_t ecc, uint32_t utc);
+ void liveEndpoint(uint32_t sid, uint32_t cid);
+ void livePadEndpoint(uint32_t sid, uint32_t cid); // zero releases PAD ownership
+diff --git a/src/epg_transport_diag.h b/src/epg_transport_diag.h
+new file mode 100644
+index 0000000..d395796
+--- /dev/null
++++ b/src/epg_transport_diag.h
+@@ -0,0 +1,72 @@
++#pragma once
++// Bounded, allocation-free transport evidence. This is not a second MOT decoder.
++#include "epg_core.h"
++namespace epg_diag {
++enum class Path:uint8_t { Packet, Pad };
++enum class Reject:uint8_t { Ua, Generation, Sid, Cid, Inactive, Dscty, State, Physical, Length, Read, Replay, Owner, Data, NoEndpoint, Busy, Count };
++enum class Reset:uint8_t { Tune, Service, PacketEndpoint, PacketToPad, PadToPacket, PadEndpoint, UaRevoked, ReplayStart, ReplayStop, PadAcquire, Count };
++inline const char* rejectName(unsigned n) {
++ static const char* const names[]={"ua","generation","sid","cid","inactive","dscty","state","physical","length","read","replay","owner","data","no-endpoint","busy"};return names[n];
++}
++inline const char* resetName(unsigned n) {
++ static const char* const names[]={"tune","service","packet-endpoint","packet->PAD","PAD->packet","pad-endpoint","ua-revoked","replay-start","replay-stop","PAD-acquire"};return names[n];
++}
++inline void increment(uint32_t& n) {if(n!=UINT32_MAX)++n;}
++struct Counters {
++ uint32_t sid=0,cid=0,headers[4]={},candidates=0,admitted=0,blocked=0,legacy=0,rejected[unsigned(Reject::Count)]={};
++ uint32_t lastSid=0,lastCid=0,generation=0;uint16_t ua=0,bytes=0;uint8_t source=0,dscty=0,state=0;
++ uint32_t groups=0,validGroups=0,crcBad=0,invalid=0,objectGroups=0,dirGroups=0,dirs=0,unique=0,repeats=0,empty=0;
++ uint32_t endpointMs=0,lastGroupMs=0,lastHeaderMs=0;
++ uint32_t hash=0,dirBytes=0,objects=0,notedAtGroup=UINT32_MAX;uint16_t tid=0;
++ uint32_t si=0,pi=0,png=0,programmes=0,hashes[4]={};
++ uint8_t historyUsed=0;bool historyLimited=false;
++};
++struct Registry {
++ Counters paths[2];uint32_t resets[unsigned(Reset::Count)]={},totalResets=0,epoch=0,stateChanges=0;
++ uint8_t lastReset=0,lastState=255;
++ uint32_t headerErrors=0;
++ Counters& at(Path p){return paths[unsigned(p)];}
++ void endpoint(Path p,uint32_t sid,uint32_t cid,uint32_t now=0){
++  auto& c=at(p);if(c.sid && (c.sid!=sid || c.cid!=cid))c=Counters{};if(!c.sid)c.endpointMs=now;c.sid=sid;c.cid=cid;
++ }
++ void context(){paths[0]=Counters{};paths[1]=Counters{};increment(epoch);}
++ void reset(Reset why){increment(totalResets);increment(resets[unsigned(why)]);lastReset=uint8_t(why);}
++ void reject(Path path,Reject reason){increment(at(path).rejected[unsigned(reason)]);}
++ void header(uint8_t src,uint16_t ua,uint8_t dsc,uint8_t state,uint32_t sid,uint32_t cid,uint16_t bytes,uint32_t generation,uint32_t now=0,bool candidate=false){
++  auto& c=at(src==0?Path::Packet:Path::Pad);if(src<4)increment(c.headers[src]);
++  if(candidate)increment(c.candidates);
++  if(candidate || !c.candidates){c.lastSid=sid;c.lastCid=cid;c.ua=ua;c.dscty=dsc;c.state=state;c.bytes=bytes;c.generation=generation;c.source=src;c.lastHeaderMs=now;}
++ }
++ void directory(Path p,uint32_t hash,uint32_t bytes,uint16_t objects,uint16_t tid){
++  auto& c=at(p);increment(c.dirs);if(!objects)increment(c.empty);
++  bool found=false;for(unsigned i=0;i<c.historyUsed;++i)if(c.hashes[i]==hash)found=true;
++  if(found)increment(c.repeats);else if(c.historyUsed<4){c.hashes[c.historyUsed++]=hash;increment(c.unique);}else c.historyLimited=true;
++  c.hash=hash;c.dirBytes=bytes;c.objects=objects;c.tid=tid;c.notedAtGroup=c.groups;
++ }
++ void group(Path path,const uint8_t* p,size_t n,bool owned,uint32_t now=0){
++  auto& c=at(path);increment(c.groups);
++  epg::GroupEnvelope envelope;const auto checked=epg::inspectGroup(p,n,envelope);
++  if(checked!=epg::GroupCheck::Valid){if(checked==epg::GroupCheck::Crc)increment(c.crcBad);else increment(c.invalid);return;}
++  increment(c.validGroups);c.lastGroupMs=now;
++  if(envelope.type==4){increment(c.objectGroups);return;}
++  increment(c.dirGroups);
++  const size_t offset=envelope.offset,length=envelope.length;
++  if(envelope.segment!=0x8000 || length<13)return;
++  const uint8_t* body=p+offset;const uint32_t hash=epg::crc32(body,length);
++  const uint32_t declared=(uint32_t(body[0])<<24|uint32_t(body[1])<<16|uint32_t(body[2])<<8|body[3]);
++  const uint16_t objects=uint16_t(body[4])<<8|body[5],ext=uint16_t(body[11])<<8|body[12];
++  // A complete empty directory needs no object-header parser. Nonempty
++  // directories are verified only by the owned Core, or an exact known hash.
++  const bool emptyValid=objects==0 && declared==length && !(body[0]&0xc0) && !(body[9]&0x80) && 13U+ext==length;
++  const bool known=c.unique && hash==c.hash && length==c.dirBytes;
++  if(emptyValid || known)directory(path,hash,uint32_t(length),objects,envelope.tid);
++  (void)owned; // Counts above are observations; owner is printed separately.
++ }
++ void object(Path path,uint16_t tid,uint8_t kind,epg::Bytes data,size_t n,uint32_t programmes){
++  auto& c=at(path);
++  if(kind==6){if(c.notedAtGroup!=c.groups)directory(path,epg::crc32(data,n),uint32_t(n),uint16_t(data[4])<<8|data[5],tid);return;}
++  if(n && data[0]==3)increment(c.si);else if(n && data[0]==2){increment(c.pi);c.programmes=programmes;}else increment(c.png);
++ }
++};
++inline Registry& registry(){static Registry counters;return counters;}
++} // namespace epg_diag
+diff --git a/src/language.h b/src/language.h
+index f5a71b8..669f7e0 100644
+--- a/src/language.h
++++ b/src/language.h
+@@ -984,14 +984,14 @@ enum EpgText {
+   EPG_ARCHIVE, EPG_ARCHIVE_PREVIEW, EPG_CLOCK_UNCERTAIN, EPG_TEXT_COUNT
+ };
+ static const char* const epgText[8][EPG_TEXT_COUNT] PROGMEM = {
+-  {"EPG NOW / NEXT", "EPG PROGRAMME", "EPG DETAIL", "Waiting for station", "Waiting for programme...", "EPG unavailable", "EPG unavailable / outdated", "Time unavailable", "Ambiguous service", "EPG: insufficient memory", "LIMIT", "NOW", "NEXT", "NOW (overlap)", "Actual %s (planned time kept)", "Waiting for directory", "EPG signalled, no objects", "Station info available; no programme schedule broadcast", "Archive", "ARCHIVE / SIMULATION", "Clock uncertain"},
+-  {"EPG NU / STRAKS", "EPG PROGRAMMA", "EPG DETAILS", "Wachten op zender", "Wachten op programma...", "EPG niet beschikbaar", "EPG ontbreekt / verouderd", "Tijd niet beschikbaar", "Onzekere zender", "EPG: te weinig geheugen", "LIMIET", "NU", "STRAKS", "NU (overlap)", "Werkelijk %s (planning blijft)", "Wachten op directory", "EPG gemeld, geen objecten", "Zenderinfo beschikbaar; geen programmaschema uitgezonden", "Archief", "ARCHIEF / SIMULATIE", "Tijd onzeker"},
+-  {"EPG ΤΩΡΑ / ΜΕΤΑ", "EPG ΠΡΟΓΡΑΜΜΑ", "EPG ΛΕΠΤΟΜΕΡΕΙΕΣ", "Αναμονή σταθμού", "Αναμονή προγράμματος...", "EPG μη διαθέσιμο", "EPG μη διαθέσιμο / παλιό", "Ώρα μη διαθέσιμη", "Ασαφής σταθμός", "EPG: ανεπαρκής μνήμη", "ΟΡΙΟ", "ΤΩΡΑ", "ΜΕΤΑ", "ΤΩΡΑ (επικάλυψη)", "Έναρξη %s (βάσει σχεδίου)", "Αναμονή καταλόγου", "EPG χωρίς αντικείμενα", "Πληροφορίες σταθμού χωρίς πρόγραμμα", "Αρχείο", "ΑΡΧΕΙΟ / ΠΡΟΣΟΜΟΙΩΣΗ", "Αβέβαιη ώρα"},
+-  {"EPG JETZT / DANACH", "EPG PROGRAMM", "EPG DETAILS", "Warte auf Sender", "Warte auf Programm...", "EPG nicht verfügbar", "EPG fehlt / veraltet", "Zeit nicht verfügbar", "Sender nicht eindeutig", "EPG: zu wenig Speicher", "LIMIT", "JETZT", "DANACH", "JETZT (Überlappung)", "Beginn %s (Plan bleibt)", "Warte auf Verzeichnis", "EPG signalisiert, keine Objekte", "Senderinfo vorhanden; kein Programmplan gesendet", "Archiv", "ARCHIV / SIMULATION", "Zeit unsicher"},
+-  {"EPG EN COURS / APRÈS", "EPG PROGRAMME", "EPG DÉTAIL", "Attente de la station", "Attente du programme...", "EPG indisponible", "EPG indisponible / périmé", "Heure indisponible", "Station ambiguë", "EPG : mémoire insuffisante", "LIMITE", "EN COURS", "ENSUITE", "EN COURS (chevauchement)", "Début %s (horaire conservé)", "Attente du répertoire", "EPG signalé, aucun objet", "Informations station reçues; grille non diffusée", "Archives", "ARCHIVES / SIMULATION", "Heure incertaine"},
+-  {"EPG AHORA / DESPUÉS", "EPG PROGRAMA", "EPG DETALLE", "Esperando emisora", "Esperando programa...", "EPG no disponible", "EPG no disponible / antiguo", "Hora no disponible", "Emisora ambigua", "EPG: memoria insuficiente", "LÍMITE", "AHORA", "DESPUÉS", "AHORA (solapamiento)", "Inicio %s (horario conservado)", "Esperando directorio", "EPG anunciado, sin objetos", "Datos de emisora; no se emite programación", "Archivo", "ARCHIVO / SIMULACIÓN", "Hora incierta"},
+-  {"EPG TERAZ / POTEM", "EPG PROGRAM", "EPG SZCZEGÓŁY", "Czekam na stację", "Czekam na program...", "EPG niedostępne", "EPG niedostępne / nieaktualne", "Czas niedostępny", "Niejednoznaczna stacja", "EPG: za mało pamięci", "LIMIT", "TERAZ", "POTEM", "TERAZ (nakładanie)", "Początek %s (plan zachowany)", "Czekam na katalog", "EPG nadawane, brak obiektów", "Informacje o stacji dostępne; ramówka nie jest nadawana", "Archiwum", "ARCHIWUM / SYMULACJA", "Czas niepewny"},
+-  {"EPG ACUM / URMEAZĂ", "EPG PROGRAM", "EPG DETALII", "Aștept postul", "Aștept programul...", "EPG indisponibil", "EPG indisponibil / expirat", "Ora indisponibilă", "Post ambiguu", "EPG: memorie insuficientă", "LIMITĂ", "ACUM", "URMEAZĂ", "ACUM (suprapunere)", "Început %s (plan păstrat)", "Aștept directorul", "EPG semnalat, fără obiecte", "Informații post disponibile; grila nu este transmisă", "Arhivă", "ARHIVĂ / SIMULARE", "Ora incertă"}
++  {"EPG NOW / NEXT", "EPG PROGRAMME", "EPG DETAIL", "Waiting for station", "Waiting for programme...", "EPG unavailable", "EPG unavailable / outdated", "Time unavailable", "Ambiguous service", "EPG: insufficient memory", "LIMIT", "NOW", "NEXT", "NOW (overlap)", "Actual %s (planned time kept)", "Waiting for directory", "Empty EPG carousel", "Station info; no schedule in this carousel", "Archive", "ARCHIVE / SIMULATION", "Clock uncertain"},
++  {"EPG NU / STRAKS", "EPG PROGRAMMA", "EPG DETAILS", "Wachten op zender", "Wachten op programma...", "EPG niet beschikbaar", "EPG ontbreekt / verouderd", "Tijd niet beschikbaar", "Onzekere zender", "EPG: te weinig geheugen", "LIMIET", "NU", "STRAKS", "NU (overlap)", "Werkelijk %s (planning blijft)", "Wachten op directory", "Lege EPG-carrousel", "Zenderinfo; geen schema in deze carrousel", "Archief", "ARCHIEF / SIMULATIE", "Tijd onzeker"},
++  {"EPG ΤΩΡΑ / ΜΕΤΑ", "EPG ΠΡΟΓΡΑΜΜΑ", "EPG ΛΕΠΤΟΜΕΡΕΙΕΣ", "Αναμονή σταθμού", "Αναμονή προγράμματος...", "EPG μη διαθέσιμο", "EPG μη διαθέσιμο / παλιό", "Ώρα μη διαθέσιμη", "Ασαφής σταθμός", "EPG: ανεπαρκής μνήμη", "ΟΡΙΟ", "ΤΩΡΑ", "ΜΕΤΑ", "ΤΩΡΑ (επικάλυψη)", "Έναρξη %s (βάσει σχεδίου)", "Αναμονή καταλόγου", "Κενός κατάλογος EPG", "Πληροφορίες σταθμού, χωρίς πρόγραμμα στον κατάλογο", "Αρχείο", "ΑΡΧΕΙΟ / ΠΡΟΣΟΜΟΙΩΣΗ", "Αβέβαιη ώρα"},
++  {"EPG JETZT / DANACH", "EPG PROGRAMM", "EPG DETAILS", "Warte auf Sender", "Warte auf Programm...", "EPG nicht verfügbar", "EPG fehlt / veraltet", "Zeit nicht verfügbar", "Sender nicht eindeutig", "EPG: zu wenig Speicher", "LIMIT", "JETZT", "DANACH", "JETZT (Überlappung)", "Beginn %s (Plan bleibt)", "Warte auf Verzeichnis", "Leeres EPG-Karussell", "Senderinfo; kein Programm in diesem Karussell", "Archiv", "ARCHIV / SIMULATION", "Zeit unsicher"},
++  {"EPG EN COURS / APRÈS", "EPG PROGRAMME", "EPG DÉTAIL", "Attente de la station", "Attente du programme...", "EPG indisponible", "EPG indisponible / périmé", "Heure indisponible", "Station ambiguë", "EPG : mémoire insuffisante", "LIMITE", "EN COURS", "ENSUITE", "EN COURS (chevauchement)", "Début %s (horaire conservé)", "Attente du répertoire", "Carrousel EPG vide", "Infos station; aucune grille dans ce carrousel", "Archives", "ARCHIVES / SIMULATION", "Heure incertaine"},
++  {"EPG AHORA / DESPUÉS", "EPG PROGRAMA", "EPG DETALLE", "Esperando emisora", "Esperando programa...", "EPG no disponible", "EPG no disponible / antiguo", "Hora no disponible", "Emisora ambigua", "EPG: memoria insuficiente", "LÍMITE", "AHORA", "DESPUÉS", "AHORA (solapamiento)", "Inicio %s (horario conservado)", "Esperando directorio", "Carrusel EPG vacío", "Datos de emisora; sin programa en este carrusel", "Archivo", "ARCHIVO / SIMULACIÓN", "Hora incierta"},
++  {"EPG TERAZ / POTEM", "EPG PROGRAM", "EPG SZCZEGÓŁY", "Czekam na stację", "Czekam na program...", "EPG niedostępne", "EPG niedostępne / nieaktualne", "Czas niedostępny", "Niejednoznaczna stacja", "EPG: za mało pamięci", "LIMIT", "TERAZ", "POTEM", "TERAZ (nakładanie)", "Początek %s (plan zachowany)", "Czekam na katalog", "Pusta karuzela EPG", "Informacje o stacji; brak ramówki w tej karuzeli", "Archiwum", "ARCHIWUM / SYMULACJA", "Czas niepewny"},
++  {"EPG ACUM / URMEAZĂ", "EPG PROGRAM", "EPG DETALII", "Aștept postul", "Aștept programul...", "EPG indisponibil", "EPG indisponibil / expirat", "Ora indisponibilă", "Post ambiguu", "EPG: memorie insuficientă", "LIMITĂ", "ACUM", "URMEAZĂ", "ACUM (suprapunere)", "Început %s (plan păstrat)", "Aștept directorul", "Carusel EPG gol", "Date post; fără grilă în acest carusel", "Arhivă", "ARHIVĂ / SIMULARE", "Ora incertă"}
+ };
+ 
+ #endif
+diff --git a/src/si4684.cpp b/src/si4684.cpp
+index 312859f..ca74d5c 100644
+--- a/src/si4684.cpp
++++ b/src/si4684.cpp
+@@ -2945,7 +2945,7 @@ void DAB::setService(uint8_t _index) {
+ 
+   // Invalidate in-flight UA ownership as well as endpoint selection. Keep the
+   // last known ensemble presence while the new audio context becomes stable.
+-  epg::livePadEndpoint(0,0);
++  epg::liveServiceChanged();
+   resetDabSpiDiscovery(true, false);
+   dabSpiProbe.stop(millis());
+   pty = 36;
+@@ -3484,6 +3484,7 @@ void DAB::finishDabCommand(void) {
+           SPIbuffer + 1, 24, header);
+       if (!parseOk(parseResult)) {
+         ++diagDabCommandErrorCount;
++        epg_diag::increment(epg_diag::registry().headerErrors);
+         dabDsrvPending = false;
+         break;
+       }
+@@ -3495,6 +3496,7 @@ void DAB::finishDabCommand(void) {
+       const dab_probe::Route target = dab_probe::route(
+           header.serviceId, header.componentId, header.dataSource,
+           audio, sls, dabSpiProbe.spi);
++      epg_diag::registry().header(header.dataSource,header.rawUatypeOrRfu,header.dscType,header.serviceState,header.serviceId,header.componentId,header.byteCount,dabUaScan.generation,millis(),(header.dataSource==0U && target==dab_probe::Route::Spi) || (header.dataSource==1U && header.rawUatypeOrRfu==7U));
+       dabSpiProbe.observe(target, header.dataSource, header.serviceStopped(),
+                           header.byteCount > 0U);
+       const uint32_t routeNow = millis();
+@@ -3574,20 +3576,30 @@ void DAB::finishDabCommand(void) {
+                 !(header.interruptSource & 0x04U));
+         if (padRoute == epg_ingress::PadRoute::Epg) {
+           if (header.byteCount <= sizeof(SPIbuffer)-25U) {
+-            epg::livePadEndpoint(dabActiveServiceId,dabActiveComponentId);
+             if (epg::liveEnabled()) {
+               const si468x::Result readResult = chip.readCurrentReply(
+                   SPIbuffer+1,static_cast<uint16_t>(24U+header.byteCount));
+               finishCommandDiagnostics(readResult);
+               if (readResult==si468x::Result::Ok)
+-                epg::livePadPayload(SPIbuffer+25,header.byteCount);
+-              else ++diagDabCommandErrorCount;
+-            }
+-          }
++                epg::livePadData(dabActiveServiceId,dabActiveComponentId,SPIbuffer+25,header.byteCount);
++              else {++diagDabCommandErrorCount;epg_diag::registry().reject(epg_diag::Path::Pad,epg_diag::Reject::Read);}
++            } else epg_diag::registry().reject(epg_diag::Path::Pad,epg_diag::Reject::Replay);
++          } else epg_diag::registry().reject(epg_diag::Path::Pad,epg_diag::Reject::Length);
+         } else if (padRoute == epg_ingress::PadRoute::Discard) {
++          epg_diag::Reject reason=epg_diag::Reject::Ua;
++          if(!dabActiveServiceValid || !ServiceStart || dabServiceRequestPending || dabTuneRequestPending || !dab_switch::audioContextUsable(dabSwitch.state))reason=epg_diag::Reject::Inactive;
++          else if(header.serviceId!=dabActiveServiceId)reason=epg_diag::Reject::Sid;
++          else if(!(dab_probe::Endpoint(dabActiveServiceId,dabActiveComponentId).matches(header.serviceId,header.componentId) || dab_probe::matchesAudioPad(dab_probe::Endpoint(dabActiveServiceId,dabActiveComponentId),header.serviceId,header.componentId)))reason=epg_diag::Reject::Cid;
++          else if(!dabUaInventoryValid || xpadSpiIdentity()==dab_spi::Identity::Unqueried)reason=epg_diag::Reject::Generation;
++          else if(header.dscType!=0 && header.dscType!=60)reason=epg_diag::Reject::Dscty;
++          else if(header.serviceState!=0 && header.serviceState!=3)reason=epg_diag::Reject::State;
++          else if(header.interruptSource&4)reason=epg_diag::Reject::Physical;
++          epg_diag::registry().reject(epg_diag::Path::Pad,reason);
+           ++diagDabStaleMotCount;
+         } else if (target == dab_probe::Route::Spi) {
+-          if (header.dataSource == 0U && header.byteCount <= sizeof(SPIbuffer) - 25U &&
++          if((header.serviceState!=0U && header.serviceState!=3U) || (header.interruptSource&4U)) {
++            epg_diag::registry().reject(epg_diag::Path::Packet,(header.interruptSource&4U)?epg_diag::Reject::Physical:epg_diag::Reject::State);
++          } else if (header.dataSource == 0U && header.byteCount <= sizeof(SPIbuffer) - 25U &&
+               epg::liveEnabled() && dabSpiProbe.state == dab_probe::State::Observing &&
+               dabActiveServiceValid && !dabServiceRequestPending && !dabTuneRequestPending) {
+             const si468x::Result readResult = chip.readCurrentReply(
+@@ -3595,11 +3607,13 @@ void DAB::finishDabCommand(void) {
+             finishCommandDiagnostics(readResult);
+             if (readResult == si468x::Result::Ok)
+               epg::livePayload(SPIbuffer + 25, header.byteCount);
+-            else ++diagDabCommandErrorCount;
+-          }
++            else {++diagDabCommandErrorCount;epg_diag::registry().reject(epg_diag::Path::Packet,epg_diag::Reject::Read);}
++          } else epg_diag::registry().reject(epg_diag::Path::Packet,epg::replayActive()?epg_diag::Reject::Replay:header.byteCount>sizeof(SPIbuffer)-25U?epg_diag::Reject::Length:epg_diag::Reject::Inactive);
+         } else if (feedLegacy) {
++          epg_diag::increment(epg_diag::registry().at(header.dataSource==0?epg_diag::Path::Packet:epg_diag::Path::Pad).legacy);
+           getServiceData();
+         } else if (target != dab_probe::Route::Spi) {
++          epg_diag::registry().reject(header.dataSource==0?epg_diag::Path::Packet:epg_diag::Path::Pad,epg_diag::Reject::NoEndpoint);
+           ++diagDabStaleMotCount;
+         }
+       }
+@@ -4408,19 +4422,33 @@ void DAB::logSpiProbeSummary(const char* phase) {
+     DIAG_PRINTLN("[DAB/SPI/TEST] coexistence inconclusive; missing packets can be carousel timing");
+ }
+ 
+-bool DAB::xpadSpiPresent(void) const {
+-  if(isFm() || !ServiceStart || !dabUaInventoryValid || !dabActiveServiceValid ||
+-     dabServiceRequestPending || dabTuneRequestPending ||
+-     !dab_switch::audioContextUsable(dabSwitch.state)) return false;
++dab_spi::Identity DAB::xpadSpiIdentity(void) const {
++  if(!dabUaInventoryValid || !dabActiveServiceValid) return dab_spi::Identity::Unqueried;
+   for(uint8_t i=0;i<dabUaServiceCount;++i) {
+     const UaService& entry=dabUaServices[i];
+     if(entry.sid!=dabActiveServiceId || entry.first>dabUaComponentCount ||
+        entry.count>dabUaComponentCount-entry.first) continue;
+     for(uint16_t j=entry.first;j<entry.first+entry.count;++j)
+-      if(dabUaComponents[j]==dabActiveComponentId && dab_spi::isSpi(dabSpiIdentities[j]))
+-        return true;
++      if(dabUaComponents[j]==dabActiveComponentId) return dabSpiIdentities[j];
+   }
+-  return false;
++  return dabUaScan.functionalComplete(dabCommand==DabCommand::ComponentInfo)?
++      dab_spi::Identity::NotSpi:dab_spi::Identity::Unqueried;
++}
++void DAB::logEpgTransportPage(uint8_t page) {
++  if(page==0) {
++    const auto identity=xpadSpiIdentity();
++    const char* ua=dab_spi::isSpi(identity)?"confirmed":identity==dab_spi::Identity::Failed?"failed":identity==dab_spi::Identity::Unqueried?"unknown":"not-signalled";
++    diagSerial.printf("EPG AUDIO sid=%08X cid=%08X ua=%s identity=%u gen=%u published=%u inventory=%u complete=%u failed=%u usable=%u\n",unsigned(dabActiveServiceId),unsigned(dabActiveComponentId),ua,unsigned(identity),unsigned(dabUaScan.generation),unsigned(dabSpiDiscoveryGeneration),dabUaInventoryValid,dabUaScan.functionalComplete(dabCommand==DabCommand::ComponentInfo),unsigned(dabUaScan.failed),xpadSpiPresent());
++  } else if(page==1) {
++    diagSerial.printf("EPG PACKET selected=%u sid=%08X cid=%08X status=%s confirmed=%u unverified=%u tracked=%08X/%08X probe=%u\n",dabSpiDiscovery.available(),unsigned(dabSpiDiscovery.serviceId),unsigned(dabSpiDiscovery.componentId),dab_spi::statusName(dabSpiDiscovery.status),unsigned(dabSpiDiscovery.confirmed),unsigned(dabSpiDiscovery.packetMotUnverified),unsigned(dabSpiProbe.spi.sid),unsigned(dabSpiProbe.spi.cid),unsigned(dabSpiProbe.state));
++  } else {
++    diagSerial.printf("EPG RADIO mode=%s requestedIndex=%u khz=%u eid=%s ecc=%02X lock=%u tune=%u switching=%u CTS=%u overflow=%u errors=%u XPAD=%04X set=%d get=%d match=%u\n",isFm()?"FM":"DAB",unsigned(dabRequestedFrequency),unsigned(getFreq(dabRequestedFrequency)),EID,unsigned(ensembleEcc),signallock,dabTuneRequestPending,dabServiceRequestPending,unsigned(diagDabCtsTimeoutCount),unsigned(diagDabDsrvOverflowCount),unsigned(diagDabCommandErrorCount),unsigned(dabXpad.value),int(dabXpad.setResult),int(dabXpad.getResult),dabXpad.matches());
++  }
++}
++bool DAB::xpadSpiPresent(void) const {
++  return !isFm() && ServiceStart && dabUaInventoryValid && dabActiveServiceValid &&
++      !dabServiceRequestPending && !dabTuneRequestPending &&
++      dab_switch::audioContextUsable(dabSwitch.state) && dab_spi::isSpi(xpadSpiIdentity());
+ }
+ 
+ void DAB::resetDabSpiDiscovery(bool preservePresence, bool logInventory) {
+@@ -4464,7 +4492,7 @@ void DAB::refreshDabSpiDiscovery(void) {
+        dabSwitch.state != dab_switch::State::AudioOnly))) return;
+   if (dabUaInventoryValid &&
+       !dabUaScan.functionalComplete(dabCommand == DabCommand::ComponentInfo)) return;
+-  dab_spi::Selector selector(dabActiveServiceId);
++  dab_spi::Selector selector(dabActiveServiceId,true);
+   for (uint8_t i = 0; i < dabUaServiceCount; ++i) {
+     const UaService& entry = dabUaServices[i];
+     for (uint16_t j = entry.first; j < entry.first + entry.count; ++j) {
+@@ -4485,7 +4513,11 @@ void DAB::refreshDabSpiDiscovery(void) {
+   if(dabUaInventoryValid) {
+     const bool pad=xpadSpiPresent();
+     if(pad) epg::livePadEndpoint(dabActiveServiceId,dabActiveComponentId);
+-    else if(dabUaScan.failed==0) epg::livePadEndpoint(0,0);
++    else {
++      const auto identity=xpadSpiIdentity();
++      if(identity==dab_spi::Identity::NotSpi || identity==dab_spi::Identity::Slideshow)
++        epg::livePadRevoked();
++    }
+   }
+   dabSpiDiscoveryDirty = false;
+   // Invalid inventories require a new valid service list, never a UA-only pass.
+diff --git a/src/si4684.h b/src/si4684.h
+index d31c87f..966549d 100644
+--- a/src/si4684.h
++++ b/src/si4684.h
+@@ -235,6 +235,8 @@ class DAB {
+     // Advertised SPI presence in this multiplex, not decoded programme data.
+     bool spiPresent(void) const { return dabSpiPresent; }
+     bool xpadSpiPresent(void) const;
++    void logEpgTransportPage(uint8_t page);
++    dab_spi::Identity xpadSpiIdentity(void) const;
+     // Configure the next Si4684 application boot; never reconfigure live audio.
+     void setI2sAudioMode(I2sAudioMode mode);
+     bool requestSpiProbe(void);
+diff --git a/tests/README.md b/tests/README.md
+index 3f30ada..253abbf 100644
+--- a/tests/README.md
++++ b/tests/README.md
+@@ -501,3 +501,17 @@ RAW replay still checks all 1,087 records, identities, titles, descriptions,
+ durations, 70 objects and byte-identical PNGs. The original ZIP is unmodified.
+ Synthetic stream fixtures ending `_v2.bin` use corrected time encoding; the
+ original snapshots are retained with their SHA-256 in fixtures/epg/manifest.json.
++
++
++MUX 11A packet/X-PAD coexistence regression (25 October 2026):
++`test_epg_coexistence.py` executes the full actual DsrvHeader case, current UA
++query/publication, discovery and runtime/Core together. A–F cover the exact
++27-byte captured empty packet group vs full PAD programme using the same TID,
++PAD-only, SI+own Adam7 PNG without PI, packet+SLS/DLS handoff, first-PAD read/CRC/
++envelope failure, owner changes, transient unusable/failed UA, service/frequency/
++FM isolation, negative headers, replay quarantine, paced diagnostic backpressure
++and zero unexpected resets. Chip SPI, UART, heap, clock and display are mocked;
++SLS/DLS content decoding and real RF/audio remain separate checks. Included in
++`run_epg_tests.py`; reports go to `.pio/epg_coexistence/results.json`.
++Persistent results and limitations: [transport report](../docs/EPG_MUX11A_XPAD_REPORT_20261025.md).
++Actual 11A X-PAD is unverified: [Czech RF procedure](../docs/EPG_MUX11A_XPAD_RF_TEST_CZ.md).
+diff --git a/tests/fixtures/epg/README.md b/tests/fixtures/epg/README.md
+index d40db54..f6c8aa0 100644
+--- a/tests/fixtures/epg/README.md
++++ b/tests/fixtures/epg/README.md
+@@ -70,3 +70,19 @@ Skript testu loga nyní používá v2; offline kontrola ověřuje oba původní
+ podle hashů a přesnou regeneraci nových v2 streamů. Skutečný RAW a referenční
+ ZIP se nezměnily. Časové hodnoty původního JSON oracle mají chybu starého
+ parseru; hostitelský test času je proto kontroluje samostatným binárním dekodérem.
++
++
++## Přesná fixture MUX 11A (25. 10. 2026)
++
++`mux11a_empty_group.bin` je první úplná CRC-validní 27B skupina z
++`EPG_DSRV_dumps_and_files.zip/log_11A.txt`, SID E231B3FE, CID C00B, TID 8CC2.
++`mux11a_empty_directory.bin` je její přesné 16B tělo s nulou objektů.
++`mux11a_capture_analysis.json` uchovává souhrn a hashe původního archivu/logu.
++422 úplných skupin má platné CRC a stejné tělo. Tři omezené vzorky PAD UA
++ukazují Slideshow; X-PAD SPI na 11A z tohoto logu nelze potvrdit ani vyloučit.
++
++Starší `time_source/empty_directory_11a.bin` je 27B **syntetické tělo**
++Directory pro časové testy; není přesnou kopií 27B přenosové skupiny z 11A.
++Oba vstupy zůstávají uchované. `test_epg_coexistence.py` používá přesnou novou
++fixture proti souběžnému PAD programu, včetně kolize stejného TID mezi toky.
++Viz [RF postup](../../../docs/EPG_MUX11A_XPAD_RF_TEST_CZ.md).
+diff --git a/tests/fixtures/epg/manifest.json b/tests/fixtures/epg/manifest.json
+index 3a0f6f5..f0af28a 100644
+--- a/tests/fixtures/epg/manifest.json
++++ b/tests/fixtures/epg/manifest.json
+@@ -70,8 +70,22 @@
+     "time_source/timepoint_vectors.json": {
+       "bytes": 2451,
+       "sha256": "32ab6e94bebd433dba9d875ed0f42a8ff83955d16439a78cc7922b8ae6e0d4bd"
++    },
++    "mux11a_empty_group.bin": {
++      "bytes": 27,
++      "sha256": "1e8637387ce32511c77786788681dab1c4cb596235629d9cd98927559b119fa8"
++    },
++    "mux11a_empty_directory.bin": {
++      "bytes": 16,
++      "sha256": "5d27e1d62584913226b6b902aeba9b634c9a6fc04ff2980e729b4d0b1de8a4de"
++    },
++    "mux11a_capture_analysis.json": {
++      "bytes": 784,
++      "sha256": "7c9e7dee5b1c9952e720fd2efd9879e5a1b66f8678ed199f8fabb7025f33c44b"
+     }
+   },
+   "v2_added_on": "2026-10-25",
+-  "v2_note": "Correct short timePoint encoding (hour at bit21, minute26); original v1 fixtures and reference ZIP unchanged."
++  "v2_note": "Correct short timePoint encoding (hour at bit21, minute26); original v1 fixtures and reference ZIP unchanged.",
++  "mux11a_added_on": "2026-10-25",
++  "mux11a_provenance": "EPG_DSRV_dumps_and_files.zip/log_11A.txt; exact first complete CRC-valid SPI/RAW group, body extracted at byte9. Analysis contains archive/entry hashes and no local account paths."
+ }
+diff --git a/tests/fixtures/epg/mux11a_capture_analysis.json b/tests/fixtures/epg/mux11a_capture_analysis.json
+new file mode 100644
+index 0000000..3f644ef
+--- /dev/null
++++ b/tests/fixtures/epg/mux11a_capture_analysis.json
+@@ -0,0 +1,21 @@
++{
++  "source_archive": "EPG_DSRV_dumps_and_files.zip",
++  "source_archive_sha256": "7f585793084d3b7a6072d5775f557b0eac75e4d7b639eff552445da10a030dbe",
++  "source_entry": "log_11A.txt",
++  "entry_sha256": "f72e015bed9b9e321667129967f5224ec4b6835556c1945ac02a25f760df43dd",
++  "complete_packet_groups": 422,
++  "crc_valid": 422,
++  "crc_bad": 0,
++  "packet_sid": "E231B3FE",
++  "packet_cid": "C00B",
++  "group_bytes": 27,
++  "directory_bytes": 16,
++  "tid": "8CC2",
++  "objects": 0,
++  "directory_hex": "0000001000000000dc00000003004101",
++  "pad_route_lines": 44,
++  "sampled_ua_packet_spi": 2,
++  "sampled_ua_pad_slideshow": 3,
++  "sampled_ua_pad_spi": 0,
++  "conclusion": "Empty packet carousel proved. X-PAD SPI on 11A unverified; rate-limited UA samples cannot prove absence."
++}
+diff --git a/tests/fixtures/epg/mux11a_empty_directory.bin b/tests/fixtures/epg/mux11a_empty_directory.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..053bd07a844036d006fb6baecb007225d9fad545
+GIT binary patch
+literal 16
+UcmZQzU=Uycf;&LW%;3lf00>V3G5`Po
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/fixtures/epg/mux11a_empty_group.bin b/tests/fixtures/epg/mux11a_empty_group.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..3627fc951b85f4b0efc0751a8ea604ef7d8edcef
+GIT binary patch
+literal 27
+ecmXSW(7+(nbBIBJfdPye?f@Cg433P)HUI!yY6b29
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/run_epg_tests.py b/tests/run_epg_tests.py
+index ac4df4c..8e668b5 100644
+--- a/tests/run_epg_tests.py
++++ b/tests/run_epg_tests.py
+@@ -25,8 +25,12 @@ for name,extra in [('errors',[]),('cache',[]),('uart',['src/epg_uart.cpp'])]:
+  run(name,[str(exe),str(ROOT/'.pio/epg_test/objects')])
+ run('compile SPI probe',[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_dab_spi_probe.cpp','-o',str(out/'spi_probe.exe')])
+ run('SPI probe/router',[str(out/'spi_probe.exe')])
++for name in ('dab_spi_discovery','dab_packet_inventory'):
++ exe=out/(name+'.exe')
++ run('compile '+name,[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_'+name+'.cpp','-o',str(exe)])
++ run(name,[str(exe)])
+ run('DAB clock contract',[sys.executable,'tests/test_dab_clock.py',a.compiler])
+ run('X-PAD config/diagnostics',[sys.executable,'tests/test_dab_xpad_integration.py',a.compiler])
+-for name in ['live','runtime','ui','transport','synthetic_paths','synthetic_uart','storage','png_adam7']+([] if a.skip_pc else ['pc']):
++for name in ['live','runtime','ui','transport','coexistence','synthetic_paths','synthetic_uart','storage','png_adam7']+([] if a.skip_pc else ['pc']):
+  run(name,[sys.executable,'tests/test_epg_'+name+'.py',a.compiler])
+ print('All EPG host checks passed. Reports: .pio/epg_acceptance/results.log and results.json')
+diff --git a/tests/test_epg_coexistence.py b/tests/test_epg_coexistence.py
+new file mode 100644
+index 0000000..626cabc
+--- /dev/null
++++ b/tests/test_epg_coexistence.py
+@@ -0,0 +1,229 @@
++"""Whole production DSRV case + UA publication + real runtime/Core coexistence.
++Only chip I/O, clock, TFT boundary and allocator are mocked. No replacement owner.
++"""
++from pathlib import Path
++import ast,subprocess,sys,json,re
++ROOT=Path(__file__).resolve().parents[1];out=ROOT/'.pio/epg_coexistence';out.mkdir(exist_ok=True)
++def literal(path,name):
++ tree=ast.parse((ROOT/path).read_text(encoding='utf-8-sig'))
++ return next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id==name for t in n.targets))
++radioSource=(ROOT/'src/si4684.cpp').read_text(encoding='utf-8')
++def method(sig):
++ a=radioSource.index(sig+' {');b=radioSource.index('{',a)+1;depth=1
++ while depth:depth+=(radioSource[b]=='{')-(radioSource[b]=='}');b+=1
++ return radioSource[a:b]
++prefix=literal('tests/test_epg_runtime.py','prefix').split('struct Radio {')[0]
++prefix=prefix.replace('struct Monitor {','static int uartRoom=4096;\nstruct Monitor {').replace('int availableForWrite() { return 4096; }','int availableForWrite() { return uartRoom; }')
++prefix+='''\n#include "epg_ingress.h"\n#include "dab_spi_discovery.h"\n#include "dab_service_switch_policy.h"\n#include "dab_diagnostics.h"\n#include "vendor/si468x/Si468x.h"\n#include <iostream>\n#define DIAG_PRINTF(...) diagSerial.printf(__VA_ARGS__)\nstatic bool epgContinuous=true;\nuint8_t SPIbuffer[4096];
++struct Chip {std::vector<uint8_t> wire;unsigned reads=0;si468x::Result result=si468x::Result::Ok;
++ si468x::Result readCurrentReply(uint8_t* p,uint16_t n){++reads;assert(n==wire.size());std::memcpy(p,wire.data(),n);return result;}
++} chip;
++void finishCommandDiagnostics(si468x::Result){}
++struct DAB {
++ enum class DabCommand {None,ComponentInfo,DsrvHeader};DabCommand dabCommand=DabCommand::None;
++ bool fm=false,ServiceStart=true,SlideShowAvailable=true,signallock=true,diagnosticDebug=false;
++ bool dabUaInventoryValid=true,dabServiceListReady=true,dabActiveServiceValid=true,dabActiveDataServiceValid=false,dabServiceRequestPending=false,dabTuneRequestPending=false;
++ unsigned ServiceIndex=0,numberofservices=1,ensembleEcc=0xe2;
++ struct Svc{uint32_t ServiceID=0x3201;}service[1];char EID[5]="3153";
++ epg::BroadcastClockSample clock;const epg::BroadcastClockSample& broadcastClock()const{return clock;}
++ bool isFm()const{return fm;}bool spiPresent(){return dabSpiPresent;}
++ uint32_t dabActiveServiceId=0x3201,dabActiveComponentId=0x01fe0005,dabActiveDataServiceId=0,dabActiveDataComponentId=0;
++ struct Switch{dab_switch::State state=dab_switch::State::Ready;}dabSwitch;
++ struct UaService{uint32_t sid;uint16_t first;uint8_t count;};
++ UaService dabUaServices[2]={{0x3201,0,1},{0xe23153fe,1,1}};uint8_t dabUaServiceCount=2;
++ uint32_t dabUaComponents[2]={0x01fe0005,0x01f2c00c};uint16_t dabUaComponentCount=2;
++ dab_spi::Identity dabSpiIdentities[2]={dab_spi::Identity::Spi,dab_spi::Identity::Spi};
++ dab_spi::Scan dabUaScan;dab_spi::RefreshCycle dabUaRefresh;dab_spi::Result dabSpiDiscovery;
++ bool dabSpiPresent=true,dabSpiDiscoveryDirty=true;uint32_t dabSpiDiscoveryGeneration=0;uint8_t dabUaSummaryStage=3;
++ dab_probe::Probe dabSpiProbe;dab_diag::RawLog dabRawUaLog;
++ bool dabDsrvPending=false;unsigned diagDabCommandErrorCount=0,diagDabDsrvOverflowCount=0,diagDabStaleMotCount=0,legacy=0;
++ uint32_t dabSpiProbeLastRouteMs[4]={},dabSpiProbeSuppressedRoutes=0;
++ bool parseOk(si468x::Result r){return r==si468x::Result::Ok;}
++ bool resolveDabDataService(){return false;}void requestDabDataServiceEvaluation(){}
++ dab_spi::Identity xpadSpiIdentity()const;bool xpadSpiPresent()const;void refreshDabSpiDiscovery();void dsrv();
++ void logEpgTransportPage(uint8_t);
++ uint8_t dabRequestedFrequency=24;dab_diag::XpadReadback dabXpad;unsigned diagDabCtsTimeoutCount=0;
++ uint32_t getFreq(uint8_t){return 216928;}
++ void getServiceData(){++legacy;}
++};
++DAB radio;
++unsigned char dabfreq=25;static bool view=false,visible=false,suspended=false,dirty=true,setvolume=false;
++void EpgOpen(){view=visible=true;}void EpgClose(bool){view=false;}void EpgInvalidate(){}
++void cmd(const char* s){char p[128];std::snprintf(p,sizeof(p),"%s",s);diagSerial.output.clear();assert(epg::command(p));}
++'''
++ui=(ROOT/'src/epg_ui.cpp').read_text(encoding='utf-8')
++def ui_method(sig):
++ a=ui.index(sig+' {');b=ui.index('{',a)+1;d=1
++ while d:d+=(ui[b]=='{')-(ui[b]=='}');b+=1
++ return ui[a:b]
++prefix+='\n'+ui_method('void EpgSuspend()')+'\n'+ui_method('void EpgResume()')+'\n'
++# Retain the complete DSRV case, including parse, routing, counters and exact read.
++a=radioSource.index('    case DabCommand::DsrvHeader:');b=radioSource.index('    case DabCommand::EventStatus:',a)
++case=radioSource[a:b]
++runtime=(ROOT/'src/epg_runtime.cpp').read_text(encoding='utf-8-sig')
++for include in ('#include "gui.h"','#include "serial_monitor.h"','#include <esp_heap_caps.h>'):runtime=runtime.replace(include,'')
++fixture=(ROOT/'tests/test_epg_cache.cpp').read_text();fixture=fixture[fixture.index('using Data='):fixture.index('int main()')]
++# Builders from tests provide the same correct PI wire format; only directory/body used here.
++fixture=fixture[:fixture.index('static void directory(')]
++main=r'''
++static void completeScan(){radio.dabUaScan.begin(radio.dabUaComponentCount,true);radio.dabUaScan.scheduled=radio.dabUaComponentCount;radio.dabUaScan.processed=radio.dabUaComponentCount;radio.dabSpiDiscoveryDirty=true;}
++static void inject(const Data& payload,unsigned source=1,unsigned ua=7,uint32_t sid=0,uint32_t cid=0,unsigned state=0,unsigned interrupt=0,unsigned dsc=60){
++ if(!sid)sid=source==0?0xe23153fe:0x3201;
++ if(!cid)cid=source==0?0xc00c:5;
++ chip.wire.assign(24,0);chip.wire[0]=128;chip.wire[4]=uint8_t(interrupt);chip.wire[6]=uint8_t(state);chip.wire[7]=uint8_t((source<<6)|dsc);
++ for(unsigned i=0;i<4;++i){chip.wire[8+i]=uint8_t(sid>>(8*i));chip.wire[12+i]=uint8_t(cid>>(8*i));}
++ chip.wire[16]=uint8_t(ua);chip.wire[17]=uint8_t(ua>>8);chip.wire[18]=uint8_t(payload.size());chip.wire[19]=uint8_t(payload.size()>>8);
++ chip.wire.insert(chip.wire.end(),payload.begin(),payload.end());std::memcpy(SPIbuffer+1,chip.wire.data(),24);++testMillis;radio.dsrv();
++ auto* c=epg::runtime();while(c && c->busy())c->pump();epg::poll();
++}
++static std::vector<Data> readGroups(const char* path){std::ifstream f(path,std::ios::binary);assert(f.good());std::vector<Data> out;while(f.peek()!=EOF){uint8_t h[2];f.read(reinterpret_cast<char*>(h),2);Data b(h[0]|unsigned(h[1])<<8);f.read(reinterpret_cast<char*>(b.data()),b.size());assert(size_t(f.gcount())==b.size());out.push_back(b);}return out;}
++static void configure(){
++ dabfreq=24;radio.dabUaServiceCount=2;radio.dabUaComponentCount=2;
++ radio.dabActiveServiceId=radio.service[0].ServiceID=radio.dabUaServices[0].sid=0x3201;radio.dabActiveComponentId=radio.dabUaComponents[0]=0x01fe0005;radio.fm=false;
++ epg::liveReset();chip.result=si468x::Result::Ok;radio.ServiceStart=radio.signallock=radio.dabActiveServiceValid=radio.dabUaInventoryValid=true;
++ radio.dabServiceRequestPending=radio.dabTuneRequestPending=false;radio.dabSwitch.state=dab_switch::State::Ready;
++ radio.dabSpiIdentities[0]=dab_spi::Identity::NotSpi;radio.dabSpiIdentities[1]=dab_spi::Identity::Spi;
++ radio.dabSpiProbe.spi=dab_probe::Endpoint(0xe23153fe,0x01f2c00c);radio.dabSpiProbe.state=dab_probe::State::Observing;
++ radio.clock.valid=true;radio.clock.offsetKnown=true;radio.clock.offsetMinutes=0;radio.clock.encoding=epg::ClockEncoding::UTC;
++ radio.clock.calendarEpoch=epg::epoch(2024,11,12,1,1);radio.clock.sampledAtMonotonicMs=testMillis;++radio.clock.generation;
++ epg::liveEndpoint(0xe23153fe,0x01f2c00c);completeScan();radio.refreshDabSpiDiscovery();epg::poll();
++}
++static void result(const char* name,uint32_t baseline,unsigned expected){
++ const auto& d=epg_diag::registry();assert(d.totalResets-baseline==expected);
++ std::printf("COEX {\"case\":\"%s\",\"pass\":true,\"packetGroups\":%u,\"packetEmpty\":%u,\"packetBlocked\":%u,\"padGroups\":%u,\"padPI\":%u,\"padSI\":%u,\"padPNG\":%u,\"cached\":%u,\"resets\":%u,\"expectedResets\":%u,\"resetReasons\":[",name,unsigned(d.paths[0].groups),unsigned(d.paths[0].empty),unsigned(d.paths[0].blocked),unsigned(d.paths[1].groups),unsigned(d.paths[1].pi),unsigned(d.paths[1].si),unsigned(d.paths[1].png),unsigned(epg::runtime()->count()),unsigned(d.totalResets-baseline),expected);
++ for(unsigned i=0;i<unsigned(epg_diag::Reset::Count);++i)std::printf("%s%u",i?",":"",unsigned(d.resets[i]));
++ std::printf("],\"padRejects\":[");for(unsigned i=0;i<unsigned(epg_diag::Reject::Count);++i)std::printf("%s%u",i?",":"",unsigned(d.paths[1].rejected[i]));std::puts("]}");
++}
++static void refreshPad(dab_spi::Identity identity){radio.dabSpiIdentities[0]=identity;completeScan();radio.refreshDabSpiDiscovery();}
++int main(int argc,char** argv){
++ (void)object;
++ assert(argc==4);free8Bytes-=1024;heapBytes-=1024;largestBytes-=1024;assert(epg::ensure());const auto allocatedAtStart=allocationAttempt;auto* c=epg::runtime();auto data=readGroups(argv[1]);
++ // Intentionally collide PAD directory TID with captured packet directory TID.
++ data[0][5]=0x8c;data[0][6]=0xc2;const auto crc=epg::crc16(data[0].data(),data[0].size()-2);data[0][data[0].size()-2]=uint8_t(crc>>8);data[0].back()=uint8_t(crc);
++ std::ifstream file(argv[2],std::ios::binary);Data empty((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());assert(empty.size()==27);
++ // A: packet before PAD, interleaved through PI assembly, then after UI/menu return.
++ configure();uint32_t before=epg_diag::registry().totalResets;inject(empty,0);assert(c->availability(true)==epg::Availability::DirectoryEmpty);
++ radio.dabSpiIdentities[0]=dab_spi::Identity::Spi;completeScan();
++ for(size_t i=0;i<data.size();++i){inject(data[i],1,7,0,i&1?0x01fe0005:5);inject(empty,0);}
++ assert(c->count()==3 && c->stats.pi==1 && c->stats.si==1 && c->current()==1 && c->next()==2);
++ auto frames=c->stats.frames;const std::string title=c->title(1);const auto state=epg::indicatorState();
++ EpgOpen();EpgSuspend();for(unsigned i=0;i<10;++i)inject(empty,0);EpgResume();
++ assert(visible && c->count()==3 && c->stats.frames==frames && title==c->title(1) && epg::indicatorState()==state);
++ auto& diagnostic=epg_diag::registry();assert(diagnostic.paths[0].empty==1+data.size()+10 && diagnostic.paths[0].blocked==data.size()+10);
++ inject(data[0]);assert(c->count()==3 && diagnostic.paths[1].repeats>=1);
++ result("A-empty-packet-full-PAD-same-TID-menu",before,1);
++ cmd("EPG TEST TRANSPORT");for(unsigned i=0;i<20;++i){testMillis+=100;epg::poll();}
++ assert(diagSerial.output.find("EPG TRANSPORT END")!=std::string::npos);
++ std::puts("SNAPSHOT A BEGIN");std::printf("%s",diagSerial.output.c_str());std::puts("SNAPSHOT A END");
++ // B: absent/unknown PAD UA never makes packet empty a global NO_SPI claim.
++ configure();before=diagnostic.totalResets;for(unsigned i=0;i<4;++i)inject(empty,0);
++ inject(data[0]);assert(c->availability(true)==epg::Availability::DirectoryEmpty && epg::indicatorState()==epg::IndicatorState::Present);
++ radio.dabSpiIdentities[0]=dab_spi::Identity::Unqueried;radio.dabUaScan.begin(2,true);radio.dabSpiDiscoveryDirty=true;radio.refreshDabSpiDiscovery();inject(data[0]);
++ assert(c->entryCount()==0 && diagnostic.paths[1].rejected[unsigned(epg_diag::Reject::Generation)]==1);
++ result("B-empty-packet-PAD-not-confirmed",before,0);
++ // B2/E: full packet, SLS/DLS, and failed/corrupt first PAD group do not evict it.
++ configure();before=diagnostic.totalResets;for(const auto& item:data)inject(item,0);assert(c->count()==3);
++ inject(empty,0,7,0,0,4);assert(c->count()==3 && "Faulted packet DSRV header must not publish empty Directory over packet PI");
++ const auto legacy=radio.legacy;inject(data[0],1,2);inject(data[0],2,7);assert(radio.legacy==legacy+2 && c->count()==3);
++ radio.dabSpiIdentities[0]=dab_spi::Identity::Spi;chip.result=si468x::Result::Timeout;inject(data[0]);chip.result=si468x::Result::Ok;
++ Data malformed=data[0];malformed[8]^=1;const auto fixedCrc=epg::crc16(malformed.data(),malformed.size()-2);malformed[malformed.size()-2]=uint8_t(fixedCrc>>8);malformed.back()=uint8_t(fixedCrc);
++ inject(malformed);assert(c->count()==3 && "Malformed MOT envelope with valid CRC must not evict packet cache");
++ Data bad=data[0];bad.back()^=1;inject(bad);assert(c->count()==3 && c->stats.pi==1 && c->current()==1);
++ result("B2-E-packet-SLS-DLS-failed-first-PAD",before,0);
++ // PAD-only can acquire EPG with no packet endpoint at all.
++ configure();radio.dabUaServiceCount=1;radio.dabUaComponentCount=1;radio.dabSpiIdentities[1]=dab_spi::Identity::NotSpi;radio.dabSpiProbe.spi=dab_probe::Endpoint{};
++ epg::liveEndpoint(0,0);before=diagnostic.totalResets;refreshPad(dab_spi::Identity::Spi);
++ assert(radio.dabSpiDiscovery.status==dab_spi::Status::PadOnly && !radio.dabSpiDiscovery.available());
++ for(const auto& item:data)inject(item);
++ assert(c->count()==3 && epg::indicatorState()==epg::IndicatorState::Ready);
++ result("B3-full-PAD-without-packet-endpoint",before,1);
++ // C: generate SI + own Adam7 PNG without any PI declaration.
++ configure();refreshPad(dab_spi::Identity::Spi);before=diagnostic.totalResets;
++ const auto logo=readGroups(argv[3]);Data dir(logo[0].begin()+9,logo[0].end()-2);dir.erase(dir.begin()+22,dir.begin()+39);dir[5]=2;
++ const auto len=number(dir.size(),4);std::copy(len.begin(),len.end(),dir.begin());inject(group(0x8cc2,6,0,true,dir));
++ for(size_t i=1;i<logo.size();++i)if(!(logo[i][5]==1 && logo[i][6]==0)){inject(logo[i]);inject(empty,0);}
++ assert(c->availability(true)==epg::Availability::SiOnly && c->station() && c->logoSize()==551 && !c->hasPI() && c->count()==0);
++ assert(epg::indicatorState()==epg::IndicatorState::Present && c->current()==-1 && c->next()==-1);
++ result("C-PAD-SI-own-PNG-no-PI",before,0);
++ // D: partial packet -> PAD, interrupted UA discovery and delayed packet ACK.
++ configure();before=diagnostic.totalResets;inject(data[0],0);inject(data[1],0);inject(data[2],0);assert(c->count()==0);
++ refreshPad(dab_spi::Identity::Spi);inject(data.back());assert(c->count()==0); // Old packet partial cannot complete this.
++ inject(data[0]);inject(data[1]);for(size_t i=data.size();i>2;--i)inject(data[i-1]);assert(c->count()==3);
++ const auto steady=diagnostic.totalResets;
++ radio.ServiceStart=false;completeScan();radio.refreshDabSpiDiscovery();radio.ServiceStart=true;assert(c->count()==3 && diagnostic.totalResets==steady);
++ radio.dabSpiIdentities[0]=dab_spi::Identity::Unqueried;radio.dabUaScan.begin(2,true);radio.dabSpiDiscoveryDirty=true;radio.refreshDabSpiDiscovery();inject(data[0]);inject(empty,0);
++ assert(c->count()==3 && diagnostic.totalResets==steady);
++ radio.dabSpiIdentities[0]=dab_spi::Identity::Failed;completeScan();radio.dabUaScan.processed=1;radio.dabUaScan.failed=1;radio.refreshDabSpiDiscovery();assert(c->count()==3);
++ for(unsigned i=0;i<3;++i)refreshPad(dab_spi::Identity::Spi);
++ assert(radio.dabSpiDiscovery.serviceId==0xe23153fe && radio.dabSpiDiscovery.componentId==0x01f2c00c);
++ epg::liveEndpoint(0xe23153ff,0x01f2c00d);epg::liveEndpoint(0xe23153fe,0x01f2c00c);assert(c->count()==3 && diagnostic.totalResets==steady);
++ refreshPad(dab_spi::Identity::NotSpi);assert(c->count()==0 && diagnostic.resets[unsigned(epg_diag::Reset::UaRevoked)]>0);
++ inject(data[0]);assert(c->count()==0);for(const auto& item:data)inject(item,0);assert(c->count()==3);
++ result("D-owner-handoff-UA-unknown-failed-duplicate-revoked",before,2);
++ configure();refreshPad(dab_spi::Identity::Spi);for(const auto& item:data)inject(item);before=diagnostic.totalResets;
++ epg::liveServiceChanged();epg::liveServiceChanged();assert(c->count()==0 && diagnostic.totalResets==before+1);
++ radio.dabActiveServiceId=radio.service[0].ServiceID=radio.dabUaServices[0].sid=0x3202;radio.dabActiveComponentId=radio.dabUaComponents[0]=0x01fe0006;
++ refreshPad(dab_spi::Identity::Spi);inject(data[0]);assert(c->count()==0);
++ auto newService=data;const auto oldBearer=number(base+1,6);const auto newBearer=number(base+2,6);
++ for(auto& frame:newService){for(size_t i=9;i+6<=frame.size()-2;++i)if(std::equal(oldBearer.begin(),oldBearer.end(),frame.begin()+i))std::copy(newBearer.begin(),newBearer.end(),frame.begin()+i);
++  const auto crc=epg::crc16(frame.data(),frame.size()-2);frame[frame.size()-2]=uint8_t(crc>>8);frame.back()=uint8_t(crc);inject(frame,1,7,0x3202,6);}
++ assert(c->selected()==base+2 && c->count()==3);inject(data[2]);assert(c->selected()==base+2 && c->count()==3);
++ ++dabfreq;epg::liveReset();assert(!c->count());radio.fm=true;epg::liveReset();epg::poll();assert(!c->count() && epg::indicatorState()!=epg::IndicatorState::Ready);radio.fm=false;
++ result("D-service-frequency-FM-isolation",before,4);
++ // E: actual header admission gates, read faults and CRC; no legacy fallthrough.
++ configure();refreshPad(dab_spi::Identity::Spi);for(const auto& item:data)inject(item);before=diagnostic.totalResets;
++ const auto oldLegacy=radio.legacy;
++ inject(data[0],1,7,0x3202,5);inject(data[0],1,7,0,6);inject(data[0],1,7,0,0x01fd0005);
++ inject(data[0],1,7,0,0,0,0,4);inject(data[0],1,7,0,0,4);inject(data[0],1,7,0,0,0,4);
++ inject(Data(4072));radio.dabTuneRequestPending=true;inject(data[0]);radio.dabTuneRequestPending=false;
++ radio.dabUaInventoryValid=false;inject(data[0]);radio.dabUaInventoryValid=true;
++ chip.result=si468x::Result::Timeout;inject(data[0]);chip.result=si468x::Result::Ok;bad=data[2];bad.back()^=1;inject(bad);
++ inject(data[0],3,7);assert(radio.legacy==oldLegacy && c->count()==3 && c->current()==1);
++ for(auto reason:{epg_diag::Reject::Sid,epg_diag::Reject::Cid,epg_diag::Reject::Dscty,epg_diag::Reject::State,epg_diag::Reject::Physical,epg_diag::Reject::Length,epg_diag::Reject::Inactive,epg_diag::Reject::Generation,epg_diag::Reject::Read,epg_diag::Reject::Data})assert(diagnostic.paths[1].rejected[unsigned(reason)]>0);
++ testMillis+=300001;epg::poll();assert(c->count()==3 && epg::indicatorState()==epg::IndicatorState::Present); // clock stale, not a transport reset
++ radio.clock.sampledAtMonotonicMs=testMillis;++radio.clock.generation;epg::poll();assert(c->current()==1);
++ result("E-negative-header-identity-CRC-read-timeout-clock",before,0);
++ // F: explicit signal only, waiting for PAD Directory rather than reusing packet empty.
++ configure();inject(empty,0);before=diagnostic.totalResets;refreshPad(dab_spi::Identity::Spi);
++ assert(epg::availability()==epg::Availability::WaitDirectory && epg::indicatorState()==epg::IndicatorState::Present && c->stats.directories==0);
++ for(unsigned i=0;i<10;++i)inject(empty,0);
++ assert(c->stats.directories==0 && diagnostic.paths[1].dirs==0 && diagnostic.paths[0].empty==11);
++ testMillis+=300001;epg::poll();cmd("EPG TEST TRANSPORT");for(unsigned i=0;i<20;++i){testMillis+=100;epg::poll();}
++ assert(diagSerial.output.find("reason=directory-timeout")!=std::string::npos && c->stats.directories==0);
++ result("F-PAD-signalled-no-data-is-WAITING",before,1);
++ // Lifecycle and asynchronous diagnostic snapshot use the actual runtime command.
++ before=diagnostic.totalResets;cmd("EPG TEST START");inject(data[0]);inject(empty,0);assert(epg::replayActive() && c->stats.frames==0);
++ assert(diagnostic.paths[1].rejected[unsigned(epg_diag::Reject::Replay)]>0 && diagnostic.paths[0].rejected[unsigned(epg_diag::Reject::Replay)]>0);
++ result("F-replay-quarantine",before,1);
++ cmd("EPG TEST STOP");assert(!epg::replayActive() && c->count()==0);
++ uartRoom=0;cmd("EPG TEST TRANSPORT");assert(diagSerial.output.empty());uartRoom=4096;
++ cmd("EPG TEST TRANSPORT");assert(diagSerial.output.find("queued")!=std::string::npos);
++ uartRoom=511;for(unsigned i=0;i<20;++i){testMillis+=100;epg::poll();}assert(diagSerial.output.find("EPG AUDIO sid=")==std::string::npos);uartRoom=512;
++ for(unsigned i=0;i<30;++i){testMillis+=100;epg::poll();}
++ assert(diagSerial.output.find("EPG AUDIO sid=")!=std::string::npos && diagSerial.output.find("EPG PACKET selected=")!=std::string::npos && diagSerial.output.find("EPG RADIO mode=")!=std::string::npos);
++ assert(diagSerial.output.find("EPG TRANSPORT END")!=std::string::npos && diagSerial.output.find("EPG RESETS total=")!=std::string::npos);
++ for(size_t start=0;start<diagSerial.output.size();){auto end=diagSerial.output.find('\n',start);if(end==std::string::npos)break;assert(end-start<512);start=end+1;}
++ cmd("EPG TEST TRANSPORT");testMillis+=100;epg::poll();epg::liveReset();testMillis+=100;epg::poll();assert(diagSerial.output.find("CANCELLED context changed")!=std::string::npos);
++ auto saved=diagnostic;
++ for(unsigned i=0;i<2;++i){auto& path=diagnostic.paths[i];for(auto& header:path.headers)header=UINT32_MAX;for(auto& reject:path.rejected)reject=UINT32_MAX;
++ path.candidates=path.admitted=path.blocked=path.legacy=path.groups=path.validGroups=path.crcBad=path.invalid=path.objectGroups=path.dirGroups=path.dirs=path.unique=path.repeats=path.empty=path.si=path.pi=path.png=path.programmes=UINT32_MAX;}
++ cmd("EPG TEST TRANSPORT");for(unsigned i=0;i<20;++i){testMillis+=100;epg::poll();}
++ for(size_t start=0;start<diagSerial.output.size();){auto end=diagSerial.output.find('\n',start);if(end==std::string::npos)break;assert(end-start<512);start=end+1;}
++ diagnostic=saved;uint32_t maximum=UINT32_MAX;epg_diag::increment(maximum);assert(maximum==UINT32_MAX);
++ assert(allocationAttempt==allocatedAtStart && free8Bytes>=12000);
++ std::puts("Production DSRV -> actual UA/route/owner -> exact payload -> Core -> cache/UI status: A-F PASS");
++}
++'''
++
++source=out/'coexistence.cpp';source.write_text(prefix+runtime+'\n'+method('void DAB::logEpgTransportPage(uint8_t page)')+'\n'+method('dab_spi::Identity DAB::xpadSpiIdentity(void) const')+'\n'+method('bool DAB::xpadSpiPresent(void) const')+'\n'+method('void DAB::refreshDabSpiDiscovery(void)')+'\nvoid DAB::dsrv(){switch(DabCommand::DsrvHeader){\n'+case+'default:break;}}\n'+fixture+main,encoding='utf-8')
++exe=out/'coexistence.exe'
++subprocess.run([sys.argv[1] if len(sys.argv)>1 else 'C:/msys64/ucrt64/bin/g++.exe','-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(ROOT/'src'),str(source),str(ROOT/'src/epg_core.cpp'),str(ROOT/'src/epg_uart.cpp'),'-o',str(exe)],check=True)
++result=subprocess.run([str(exe),str(ROOT/'tests/fixtures/epg/synthetic_programme_groups_v2.bin'),str(ROOT/'tests/fixtures/epg/mux11a_empty_group.bin'),str(ROOT/'tests/fixtures/epg/synthetic_logo_1_groups_v2.bin')],capture_output=True,text=True)
++print(result.stdout+result.stderr,end='');rows=[json.loads(line[5:]) for line in result.stdout.splitlines() if line.startswith('COEX ')]
++diagnostic=(ROOT/'src/epg_transport_diag.h').read_text(encoding='utf-8')
++def names(function):
++ body=re.search(function+r'.*?names\[\]=\{([^}]+)',diagnostic,re.S)[1]
++ return re.findall(r'"([^"]+)"',body)
++snapshot=re.search(r'SNAPSHOT A BEGIN\n(.*?)SNAPSHOT A END',result.stdout,re.S)
++(out/'results.json').write_text(json.dumps({'kind':'host full production DSRV/runtime/Core, not RF','pass':result.returncode==0,'unexpectedResets':0 if result.returncode==0 else None,'mockExtraDramPressure':1024,'physical_hardware_tested':False,'resetReasonNames':names('resetName'),'padRejectNames':names('rejectName'),'cases':rows,'synthetic_snapshot':snapshot[1] if snapshot else '', 'stderr':result.stderr},indent=2)+'\n',encoding='utf-8')
++result.check_returncode()
+diff --git a/tests/test_epg_runtime.py b/tests/test_epg_runtime.py
+index 0ab5bb8..2458252 100644
+--- a/tests/test_epg_runtime.py
++++ b/tests/test_epg_runtime.py
+@@ -76,6 +76,7 @@ struct Radio {
+  unsigned ServiceIndex=0, numberofservices=1, ensembleEcc=0xe2,Year=2026,Months=10,Days=23,Hours=10,Minutes=0,Seconds=0;
+  char EID[5]="3153";
+  struct Svc { uint32_t ServiceID=0x3233; } service[1];
++ void logEpgTransportPage(uint8_t){}
+  bool isFm() { return fm; } bool spiPresent(){return spi;}
+  unsigned timeSampleGeneration(){return 1;}
+ } radio;
+diff --git a/tests/test_epg_synthetic_paths.py b/tests/test_epg_synthetic_paths.py
+index a4918f3..348d725 100644
+--- a/tests/test_epg_synthetic_paths.py
++++ b/tests/test_epg_synthetic_paths.py
+@@ -27,6 +27,7 @@ void livePayload(const uint8_t* p,size_t n){
+  while(syntheticCore.busy())syntheticCore.pump();
+ }
+ void livePadPayload(const uint8_t* p,size_t n){livePayload(p,n);}
++void livePadData(uint32_t sid,uint32_t cid,const uint8_t* p,size_t n){livePadEndpoint(sid,cid);livePadPayload(p,n);}
+ }
+ '''+prefix[b:]
+ a=prefix.index('struct Chip {');b=prefix.index('} chip;',a)+len('} chip;')
+@@ -45,6 +46,10 @@ a=radio.index('bool DAB::xpadSpiPresent(void) const {');b=radio.index('{',a)+1;d
+ while depth:
+  depth+=(radio[b]=='{')-(radio[b]=='}');b+=1
+ pad_query=radio[a:b]
++a=radio.index('dab_spi::Identity DAB::xpadSpiIdentity(void) const {');b=radio.index('{',a)+1;depth=1
++while depth:depth+=(radio[b]=='{')-(radio[b]=='}');b+=1
++pad_query=radio[a:b]+'\n'+pad_query
++prefix=prefix.replace(' bool ServiceStart=true,dabUaInventoryValid=true;','').replace(' dab_spi::Identity xpadSpiIdentity() const{return xpadConfirmed?dab_spi::Identity::Spi:dab_spi::Identity::NotSpi;}','')
+ prefix=prefix.replace('bool isFm(){return fm;}','bool isFm() const{return fm;}')
+ prefix=prefix.replace('bool xpadSpiPresent() const{return xpadConfirmed;}',r'''
+  bool ServiceStart=true,dabUaInventoryValid=true;
+@@ -54,6 +59,9 @@ prefix=prefix.replace('bool xpadSpiPresent() const{return xpadConfirmed;}',r'''
+  dab_spi::Identity dabSpiIdentities[1]={dab_spi::Identity::NotSpi};
+  uint16_t dabUaComponentCount=1;
+  uint8_t dabUaServiceCount=1;
++ enum class DabCommand {None,ComponentInfo};DabCommand dabCommand=DabCommand::None;
++ dab_spi::Scan dabUaScan;
++ dab_spi::Identity xpadSpiIdentity(void) const;
+  bool xpadSpiPresent(void) const;
+ ''')
+ a=radio.index('      if (header.byteCount > 0U)',radio.index('case DabCommand::DsrvHeader:'))
+diff --git a/tests/test_epg_transport.py b/tests/test_epg_transport.py
+index d2d4fb1..e4fcfdf 100644
+--- a/tests/test_epg_transport.py
++++ b/tests/test_epg_transport.py
+@@ -16,6 +16,7 @@ payload=s[a:b]
+ prefix=r'''
+ #include "dab_spi_probe.h"
+ #include "epg_ingress.h"
++#include "epg_transport_diag.h"
+ #include "vendor/si468x/Si468x.h"
+ #include "dab_spi_discovery.h"
+ #include "dab_service_switch_policy.h"
+@@ -36,6 +37,7 @@ std::vector<uint8_t> received;
+ void livePayload(const uint8_t* p,size_t n){received.assign(p,p+n);}
+ void livePadEndpoint(uint32_t,uint32_t){}
+ void livePadPayload(const uint8_t* p,size_t n){received.assign(p,p+n);}
++void livePadData(uint32_t sid,uint32_t cid,const uint8_t* p,size_t n){livePadEndpoint(sid,cid);livePadPayload(p,n);}
+ }
+ struct Monitor { uint32_t droppedBytes(){return 0;} } diagSerial;
+ 
+@@ -58,6 +60,8 @@ class DAB { public:
+  uint32_t diagDabCtsTimeoutCount=0,diagDabDsrvOverflowCount=0,diagDabCommandErrorCount=0,diagDabStaleMotCount=0;
+  unsigned legacy=0;
+  bool xpadConfirmed=false;
++ bool ServiceStart=true,dabUaInventoryValid=true;
++ dab_spi::Identity xpadSpiIdentity() const{return xpadConfirmed?dab_spi::Identity::Spi:dab_spi::Identity::NotSpi;}
+  bool xpadSpiPresent() const{return xpadConfirmed;}
+  bool isFm(){return fm;}
+  bool requestSpiProbe();

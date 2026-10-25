@@ -16,6 +16,7 @@ payload=s[a:b]
 prefix=r'''
 #include "dab_spi_probe.h"
 #include "epg_ingress.h"
+#include "epg_transport_diag.h"
 #include "vendor/si468x/Si468x.h"
 #include "dab_spi_discovery.h"
 #include "dab_service_switch_policy.h"
@@ -24,10 +25,12 @@ prefix=r'''
 #include <cstdarg>
 #include <cstdio>
 #include <vector>
+#include <string>
 static bool epgContinuous=false, epgManualPending=false,epgProductionPaused=false;
 static uint32_t clockMs=0;
 uint32_t millis(){return clockMs;}
-static void discard(const char* format,...){char b[512];va_list args;va_start(args,format);vsnprintf(b,sizeof(b),format,args);va_end(args);}
+static std::string probeLog;
+static void discard(const char* format,...){char b[512];va_list args;va_start(args,format);vsnprintf(b,sizeof(b),format,args);va_end(args);probeLog+=b;}
 #define DIAG_PRINTF(...) discard(__VA_ARGS__)
 namespace epg {
 bool replay=false,enabled=true;
@@ -36,6 +39,7 @@ std::vector<uint8_t> received;
 void livePayload(const uint8_t* p,size_t n){received.assign(p,p+n);}
 void livePadEndpoint(uint32_t,uint32_t){}
 void livePadPayload(const uint8_t* p,size_t n){received.assign(p,p+n);}
+void livePadData(uint32_t sid,uint32_t cid,const uint8_t* p,size_t n){livePadEndpoint(sid,cid);livePadPayload(p,n);}
 }
 struct Monitor { uint32_t droppedBytes(){return 0;} } diagSerial;
 
@@ -58,9 +62,11 @@ class DAB { public:
  uint32_t diagDabCtsTimeoutCount=0,diagDabDsrvOverflowCount=0,diagDabCommandErrorCount=0,diagDabStaleMotCount=0;
  unsigned legacy=0;
  bool xpadConfirmed=false;
+ bool ServiceStart=true,dabUaInventoryValid=true;
+ dab_spi::Identity xpadSpiIdentity() const{return xpadConfirmed?dab_spi::Identity::Spi:dab_spi::Identity::NotSpi;}
  bool xpadSpiPresent() const{return xpadConfirmed;}
  bool isFm(){return fm;}
- bool requestSpiProbe();
+ bool requestSpiProbe(bool production=false);
  void advance();
  void handle(const si468x::DsrvHeader& header,dab_probe::Route target,bool feedLegacy);
  void getServiceData(){++legacy;}
@@ -68,13 +74,25 @@ class DAB { public:
 '''
 suffix=r'''
 int main(){
+ // Baseline cancellation uses the actual scheduler context predicate.
+ for(unsigned failure=0;failure<4;++failure){
+  DAB r;epgContinuous=false;epgManualPending=false;clockMs=100;r.advance();assert(r.dabSpiProbe.state==dab_probe::State::Baseline);
+  if(failure==0)r.signallock=false;else if(failure==1)r.dabTuneRequestPending=true;else if(failure==2)r.dabServiceRequestPending=true;else ++r.dabSwitch.requestId;
+  ++clockMs;r.advance();assert(r.dabSpiProbe.state==dab_probe::State::Idle && chip.reads==0);
+ }
+ epgContinuous=false;epgManualPending=false;clockMs=0;
  DAB radio;radio.advance();assert(epgContinuous && radio.dabSpiProbe.state==dab_probe::State::Baseline);
- clockMs=5000;radio.advance();assert(radio.dabSpiProbe.state==dab_probe::State::StartRequested);
+ assert(probeLog.find("mode=LIVE baseline=500 ms")!=std::string::npos);
+ clockMs=499;radio.advance();assert(radio.dabSpiProbe.state==dab_probe::State::Baseline);
+ clockMs=500;radio.advance();assert(radio.dabSpiProbe.state==dab_probe::State::StartRequested);
  radio.dabSpiProbe.state=dab_probe::State::Starting;radio.dabSpiProbe.started(clockMs,true,false);
  clockMs=100000;radio.advance();assert(radio.dabSpiProbe.state==dab_probe::State::Observing);
  assert(radio.requestSpiProbe() && epgManualPending && radio.dabSpiProbe.state==dab_probe::State::StopRequested);
  radio.dabSpiProbe.stopped(clockMs,true);radio.advance();assert(!epgContinuous && !epgManualPending && radio.dabSpiProbe.state==dab_probe::State::Baseline);
- clockMs+=5000;radio.advance();radio.dabSpiProbe.state=dab_probe::State::Starting;radio.dabSpiProbe.started(clockMs,true,false);
+ assert(probeLog.find("mode=DEBUG baseline=5000 ms")!=std::string::npos);
+ clockMs+=4999;radio.advance();assert(radio.dabSpiProbe.state==dab_probe::State::Baseline);
+ clockMs+=1;radio.advance();assert(radio.dabSpiProbe.state==dab_probe::State::StartRequested);
+ radio.dabSpiProbe.state=dab_probe::State::Starting;radio.dabSpiProbe.started(clockMs,true,false);
  clockMs+=30000;radio.advance();assert(radio.dabSpiProbe.state==dab_probe::State::StopRequested);
  radio.dabSpiProbe.stopped(clockMs,true);radio.advance();assert(epgContinuous);
  clockMs+=5000;radio.advance();radio.dabSpiProbe.state=dab_probe::State::Starting;radio.dabSpiProbe.started(clockMs,true,false);
@@ -102,7 +120,7 @@ int main(){
 }
 '''
 out=ROOT/'.pio/epg_transport_test';out.mkdir(parents=True,exist_ok=True)
-cpp=out/'transport.cpp';cpp.write_text(prefix+function('bool DAB::requestSpiProbe(void)')+'\nvoid DAB::advance(){\n'+schedule+'}\nvoid DAB::handle(const si468x::DsrvHeader& header,dab_probe::Route target,bool feedLegacy){\n'+payload+'}\n'+suffix,encoding='utf-8')
+cpp=out/'transport.cpp';cpp.write_text(prefix+function('bool DAB::requestSpiProbe(bool production)')+'\nvoid DAB::advance(){\n'+schedule+'}\nvoid DAB::handle(const si468x::DsrvHeader& header,dab_probe::Route target,bool feedLegacy){\n'+payload+'}\n'+suffix,encoding='utf-8')
 exe=out/'transport.exe'
 subprocess.run([(sys.argv[1] if len(sys.argv)>1 else 'g++'),'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(ROOT/'src'),str(cpp),'-o',str(exe)],check=True)
 subprocess.run([str(exe)],check=True)
