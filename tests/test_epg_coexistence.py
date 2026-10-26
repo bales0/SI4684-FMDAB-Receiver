@@ -14,17 +14,25 @@ def method(sig):
  return radioSource[a:b]
 prefix=literal('tests/test_epg_runtime.py','prefix').split('struct Radio {')[0]
 prefix=prefix.replace('struct Monitor {','static int uartRoom=4096;\nstruct Monitor {').replace('int availableForWrite() { return 4096; }','int availableForWrite() { return uartRoom; }')
-prefix+='''\n#include "epg_ingress.h"\n#include "dab_spi_discovery.h"\n#include "dab_service_switch_policy.h"\n#include "dab_diagnostics.h"\n#include "vendor/si468x/Si468x.h"\n#include <iostream>\n#define DIAG_PRINTF(...) diagSerial.printf(__VA_ARGS__)\nstatic bool epgContinuous=true;\nuint8_t SPIbuffer[4096];
-struct Chip {std::vector<uint8_t> wire;unsigned reads=0;si468x::Result result=si468x::Result::Ok;
- si468x::Result readCurrentReply(uint8_t* p,uint16_t n){++reads;assert(n==wire.size());std::memcpy(p,wire.data(),n);return result;}
+prefix+='''\n#include "dab_receive_health.h"
+#include "epg_ingress.h"\n#include "dab_spi_discovery.h"\n#include "dab_service_switch_policy.h"\n#include "dab_diagnostics.h"\n#include "vendor/si468x/Si468x.h"\n#include <iostream>\n#define DIAG_PRINTF(...) diagSerial.printf(__VA_ARGS__)\nstatic bool epgContinuous=true;\nuint8_t SPIbuffer[4096];
+static dab_health::Dsrv dabDsrvEvents;
+static dab_health::Watchdog dabProgress;
+static dab_health::Stall dabStallReason=dab_health::Stall::None;
+struct Chip {bool raiseDsrv=false;std::vector<uint8_t> wire;unsigned reads=0;si468x::Result result=si468x::Result::Ok;
+ si468x::Result readCurrentReply(uint8_t* p,uint16_t n){++reads;assert(n==wire.size());std::memcpy(p,wire.data(),n);if(raiseDsrv){dabDsrvEvents.status(false);dabDsrvEvents.status(true);raiseDsrv=false;}return result;}
 } chip;
 void finishCommandDiagnostics(si468x::Result){}
 struct DAB {
  enum class DabCommand {None,ComponentInfo,DsrvHeader};DabCommand dabCommand=DabCommand::None;
+ bool dabTransportStalled=false,SlideShowInit=false;
+ uint32_t slsDuplicateValid=0,slsDuplicateConflict=0,slsCrcBad=0,SlideShowLastActivity=0,slideshowFirstSegmentMs=0,SlideShowByteCounter=0,SlideShowLength=0,diagDabRecoveryRequestCount=0;uint16_t SlideShowTransportID=0;
  bool fm=false,ServiceStart=true,SlideShowAvailable=true,signallock=true;
+ uint32_t slsSignalSid=0,slsSignalCid=0;bool slsSignalPresent=false;
  bool dabUaInventoryValid=true,dabServiceListReady=true,dabActiveServiceValid=true,dabActiveDataServiceValid=false,dabServiceRequestPending=false,dabTuneRequestPending=false;
  unsigned ServiceIndex=0,numberofservices=1,ensembleEcc=0xe2;
  struct Svc{uint32_t ServiceID=0x3201;}service[1];char EID[5]="3153";
+ epg::ClockRefresh refresh;const epg::ClockRefresh& clockRefresh()const{return refresh;}
  epg::BroadcastClockSample clock;const epg::BroadcastClockSample& broadcastClock()const{return clock;}
  bool isFm()const{return fm;}bool spiPresent(){return dabSpiPresent;}
  uint32_t dabActiveServiceId=0x3201,dabActiveComponentId=0x01fe0005,dabActiveDataServiceId=0,dabActiveDataComponentId=0;
@@ -41,6 +49,8 @@ struct DAB {
  bool parseOk(si468x::Result r){return r==si468x::Result::Ok;}
  bool resolveDabDataService(){return false;}void requestDabDataServiceEvaluation(){}
  dab_spi::Identity xpadSpiIdentity()const;bool xpadSpiPresent()const;void refreshDabSpiDiscovery();void dsrv();
+ const dab_spi::Result& spiDiscovery()const{return dabSpiDiscovery;}
+ bool epgContextStable()const{return ServiceStart && dabActiveServiceValid && !dabServiceRequestPending && !dabTuneRequestPending;}
  void logEpgTransportPage(uint8_t);
  uint8_t dabRequestedFrequency=24;dab_diag::XpadReadback dabXpad;unsigned diagDabCtsTimeoutCount=0;
  uint32_t getFreq(uint8_t){return 216928;}
@@ -127,7 +137,7 @@ int main(int argc,char** argv){
  std::puts("SNAPSHOT A BEGIN");std::printf("%s",diagSerial.output.c_str());std::puts("SNAPSHOT A END");
  // B: absent/unknown PAD UA never makes packet empty a global NO_SPI claim.
  configure();before=diagnostic.totalResets;for(unsigned i=0;i<4;++i)inject(empty,0);
- inject(data[0]);assert(c->availability(true)==epg::Availability::DirectoryEmpty && epg::indicatorState()==epg::IndicatorState::Present);
+ inject(data[0]);assert(c->availability(true)==epg::Availability::DirectoryEmpty && epg::indicatorState()==epg::IndicatorState::Unavailable);
  radio.dabSpiIdentities[0]=dab_spi::Identity::Unqueried;radio.dabUaScan.begin(2,true);radio.dabSpiDiscoveryDirty=true;radio.refreshDabSpiDiscovery();inject(data[0]);
  assert(c->entryCount()==0 && diagnostic.paths[1].rejected[unsigned(epg_diag::Reject::Generation)]==1);
  result("B-empty-packet-PAD-not-confirmed",before,0);
@@ -153,7 +163,7 @@ int main(int argc,char** argv){
  const auto len=number(dir.size(),4);std::copy(len.begin(),len.end(),dir.begin());inject(group(0x8cc2,6,0,true,dir));
  for(size_t i=1;i<logo.size();++i)if(!(logo[i][5]==1 && logo[i][6]==0)){inject(logo[i]);inject(empty,0);}
  assert(c->availability(true)==epg::Availability::SiOnly && c->station() && c->logoSize()==551 && !c->hasPI() && c->count()==0);
- assert(epg::indicatorState()==epg::IndicatorState::Present && c->current()==-1 && c->next()==-1);
+ assert(epg::indicatorState()==epg::IndicatorState::Ready && c->current()==-1 && c->next()==-1);
  result("C-PAD-SI-own-PNG-no-PI",before,0);
  // D: partial packet -> PAD, interrupted UA discovery and delayed packet ACK.
  configure();before=diagnostic.totalResets;inject(data[0],0);inject(data[1],0);inject(data[2],0);assert(c->count()==0);
@@ -190,12 +200,12 @@ int main(int argc,char** argv){
  chip.result=si468x::Result::Timeout;inject(data[0]);chip.result=si468x::Result::Ok;bad=data[2];bad.back()^=1;inject(bad);
  inject(data[0],3,7);assert(radio.legacy==oldLegacy && c->count()==3 && c->current()==1);
  for(auto reason:{epg_diag::Reject::Sid,epg_diag::Reject::Cid,epg_diag::Reject::Dscty,epg_diag::Reject::State,epg_diag::Reject::Physical,epg_diag::Reject::Length,epg_diag::Reject::Inactive,epg_diag::Reject::Generation,epg_diag::Reject::Read,epg_diag::Reject::Data})assert(diagnostic.paths[1].rejected[unsigned(reason)]>0);
- testMillis+=300001;epg::poll();assert(c->count()==3 && epg::indicatorState()==epg::IndicatorState::Present); // clock stale, not a transport reset
+ testMillis+=300001;epg::poll();assert(c->count()==3 && epg::indicatorState()==epg::IndicatorState::Ready); // Valid SI survives a stale clock, not a transport reset
  radio.clock.sampledAtMonotonicMs=testMillis;++radio.clock.generation;epg::poll();assert(c->current()==1);
  result("E-negative-header-identity-CRC-read-timeout-clock",before,0);
  // F: explicit signal only, waiting for PAD Directory rather than reusing packet empty.
  configure();inject(empty,0);before=diagnostic.totalResets;refreshPad(dab_spi::Identity::Spi);
- assert(epg::availability()==epg::Availability::WaitDirectory && epg::indicatorState()==epg::IndicatorState::Present && c->stats.directories==0);
+ assert(epg::availability()==epg::Availability::WaitDirectory && epg::indicatorState()==epg::IndicatorState::Loading && c->stats.directories==0);
  for(unsigned i=0;i<10;++i)inject(empty,0);
  assert(c->stats.directories==0 && diagnostic.paths[1].dirs==0 && diagnostic.paths[0].empty==11);
  testMillis+=300001;epg::poll();cmd("EPG TEST TRANSPORT");for(unsigned i=0;i<20;++i){testMillis+=100;epg::poll();}
@@ -220,6 +230,11 @@ int main(int argc,char** argv){
  cmd("EPG TEST TRANSPORT");for(unsigned i=0;i<20;++i){testMillis+=100;epg::poll();}
  for(size_t start=0;start<diagSerial.output.size();){auto end=diagSerial.output.find('\n',start);if(end==std::string::npos)break;assert(end-start<512);start=end+1;}
  diagnostic=saved;uint32_t maximum=UINT32_MAX;epg_diag::increment(maximum);assert(maximum==UINT32_MAX);
+ // New DSRV status during the actual full-reply payload read survives dispatch.
+ configure();dabDsrvEvents.reset();dabDsrvEvents.status(true);dabDsrvEvents.start(testMillis);chip.raiseDsrv=true;
+ inject(empty,0);assert(radio.dabDsrvPending && dabDsrvEvents.newer);
+ dabDsrvEvents.start(testMillis);inject(Data{},0);assert(!radio.dabDsrvPending);
+ std::puts("Actual DSRV full-reply race -> pending rearm -> empty drain terminates: PASS");
  // DEBUG timeline output respects headroom; unknown milestones remain explicit.
  diagnosticDebug=true;auto& timing=epg_acq::trace();timing.enable(true);
  timing.audio(0x3201,0x01fe0005,testMillis);timing.endpoint(0,0xe23153fe,0x01f2c00c,testMillis+10);timing.mark(0,2,testMillis+20);

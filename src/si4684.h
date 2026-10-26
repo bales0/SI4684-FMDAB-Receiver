@@ -24,6 +24,7 @@
 #include "FmRegion.h"
 #include "fm_features.h"
 #include "dab_scheduler_policy.h"
+#include "dab_receive_health.h"
 #include "fm_af_policy.h"
 #include "dab_service_switch_policy.h"
 #include "dab_spi_discovery.h"
@@ -31,6 +32,7 @@
 #include "dab_diagnostics.h"
 #include "i2s_audio.h"
 #include "epg_time.h"
+#include "dab_clock_refresh.h"
 
 struct DABFrequencyLabel_DAB {
   uint32_t frequency;
@@ -149,6 +151,7 @@ class DAB {
     uint32_t signalSampleGeneration(void) const { return rfSampleGeneration; }
     uint32_t timeSampleGeneration(void) const { return dabTimeGeneration; }
     const epg::BroadcastClockSample& broadcastClock(void) const { return dabEpgClock; }
+    const epg::ClockRefresh& clockRefresh(void) const { return dabClockRefresh; }
     uint16_t samplerate;
     uint16_t Year;
     uint32_t getFreq(uint8_t freq);
@@ -234,7 +237,10 @@ class DAB {
     const dab_spi::Result& spiDiscovery(void) const { return dabSpiDiscovery; }
     // Advertised SPI presence in this multiplex, not decoded programme data.
     bool spiPresent(void) const { return dabSpiPresent; }
+    bool epgContextStable(void) const { return !isFm() && ServiceStart && dabActiveServiceValid && !dabServiceRequestPending && !dabTuneRequestPending; }
     bool xpadSpiPresent(void) const;
+    bool slideshowSignalled(void) const;
+    uint32_t slideshowGeneration(void) const { return dabGeneration; }
     void logEpgTransportPage(uint8_t page);
     dab_spi::Identity xpadSpiIdentity(void) const;
     // Configure the next Si4684 application boot; never reconfigure live audio.
@@ -297,7 +303,8 @@ class DAB {
     uint32_t rfSampleGeneration = 0;
     uint32_t dabTimeGeneration = 0;
     epg::BroadcastClockSample dabEpgClock;
-    uint32_t dabLocalClockEpoch=0, dabLocalClockMs=0;
+    epg::ClockRefresh dabClockRefresh;
+    void maintainDabClock(void);
     bool dabUtcRefreshPending=false, dabClockConfirmPending=false;
     int16_t dabRssi10;
     uint8_t fmPsSeenMask;
@@ -352,7 +359,9 @@ class DAB {
     bool slideshowPublishedPending;
     bool SlideShowLastSegmentValid;
     uint8_t SlideShowLastSegment;
-    uint32_t SlideShowLastActivity;       // millis() of last new segment received
+    uint32_t SlideShowLastActivity;       // last validated activity of current object
+    uint32_t slsDuplicateValid=0, slsDuplicateConflict=0, slsCrcBad=0;
+    bool acceptSlideshowDuplicate(uint8_t segment, bool last, const uint8_t* data, uint16_t length, bool crcValid);
 
     // Cooperative DAB command scheduler. startCommand() retains the reply
     // pointer until CTS, so every async reply is stored in the global,
@@ -436,6 +445,8 @@ class DAB {
     uint8_t dabUaServiceCount = 0;
     uint16_t dabUaListVersion = 0;
     bool dabUaInventoryValid = false;
+    uint32_t slsSignalSid=0, slsSignalCid=0;
+    bool slsSignalPresent=false;
     bool dabUaPacketLogPending = false;
     void invalidateDabInventory(void);
     uint16_t dabUaScanIndex = 0;
@@ -474,6 +485,7 @@ class DAB {
     uint8_t dabDsrvBurstCount = 0;
     uint8_t dabConsecutiveCtsTimeouts = 0;
     bool dabTransportStalled = false;
+    void requestDabRecovery(dab_health::Stall reason);
 
     // One RAM-only MOT buffer. Received segments are kept packed in ascending
     // SegmentNumber order, so all 51200 bytes are usable payload capacity even

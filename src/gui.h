@@ -172,6 +172,7 @@ void ShowSignalLevel(void);
 void ShowBitrate(void);
 void ShowClock(void);
 void ShowSlideShowIcon(void);
+void DrawSlideshowStatusIcon(int16_t x, int16_t y, uint16_t color, bool flatBackground);
 void ShowTuneMode(void);
 bool TakeMainDisplayChanges(void);
 void ShowRSSI(void);

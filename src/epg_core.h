@@ -134,6 +134,14 @@ struct Assembly {
   size_t size() const;
 };
 
+struct Reception {
+  uint32_t rx=0,duplicates=0,started=0,received=0,decoded=0,skipped=0,timeouts=0,evictions=0;
+  uint32_t first=0,progress=0,maxGap=0;
+  uint16_t index=0,tid=0;
+  uint8_t reason=0; // 0 active/complete, 1 idle timeout, 2 stalled under pressure
+  bool complete=false;
+};
+
 class Core {
  public:
   Stats stats;
@@ -145,12 +153,12 @@ class Core {
   ~Core();
   Core(const Core&) = delete;
   Core& operator=(const Core&) = delete;
-  bool ready() const { return body_ && directory_ && logo_ && text_; }
-  static size_t bufferBytes() { return 2*kObjectBytes+kDirectoryBytes+kTextBytes; }
+  bool ready() const { return bodies_[0] && bodies_[1] && directory_ && logo_ && text_; }
+  static size_t bufferBytes() { return 3*kObjectBytes+kDirectoryBytes+kTextBytes; }
   static size_t memoryBytes() { return sizeof(Core)+bufferBytes(); }
   static size_t largestBlock() { return sizeof(Core)>kObjectBytes?sizeof(Core):kObjectBytes; }
   void reset();
-  void focus(uint16_t tid) { if(focus_!=tid) { focus_=tid; bodyAssembly_.reset(); } } // bounded acquisition target; also used by host inventory test
+  void focus(uint16_t tid) { if(focus_!=tid) { focus_=tid; resetBodies(); } } // bounded acquisition target; also used by host inventory test
   void select(uint64_t bearer, uint32_t utc, int16_t displayOffset);
   bool selectSid(uint32_t sid); // rejects multiple identities or SI conflicts
   void setTime(uint32_t utc, int16_t displayOffset);
@@ -179,7 +187,12 @@ class Core {
   Feed feed(Bytes data, size_t size, uint32_t nowMs);
   void pump(unsigned budget=48);
   void expire(uint32_t nowMs);
-  bool busy() const { return phase_ != 0; }
+  bool busy() const { return phase_ != 0 || reception_[0].complete || reception_[1].complete; }
+  const Reception& reception(unsigned slot) const { return reception_[slot]; }
+  const Assembly& directoryAssembly() const { return dirAssembly_; } // read-only UI progress evidence
+  const Assembly& assembly(unsigned slot) const { return slot?secondAssembly_:bodyAssembly_; }
+  bool decoding(unsigned slot) const { return phase_ && decodeSlot_==slot; }
+  uint8_t slotHighWater=0;
   size_t count() const { return viewCount_; }
   const CachedProgramme& at(size_t i) const { return cache_[view_[i]]; }
   const char* title(size_t i) const; // valid until the next title() call
@@ -196,7 +209,7 @@ class Core {
  private:
   // Allocate only at construction; separate bounded blocks tolerate ESP32 heap regions.
   Release release_;
-  Buffer body_, directory_, logo_;
+  Buffer body_, bodies_[2], directory_, logo_;
   Entry entries_[kMaxEntries];
   Service services_[16];
   CachedProgramme cache_[kMaxProgrammes];
@@ -213,13 +226,20 @@ class Core {
   Buffer text_;
   mutable char titleCopy_[128]={}, descriptionCopy_[512]={};
   size_t entryCount_=0, serviceCount_=0, count_=0, textUsed_=1, logoBytes_=0;
-  Assembly dirAssembly_, bodyAssembly_;
+  Assembly dirAssembly_, bodyAssembly_, secondAssembly_;
+  Reception reception_[2];
+  uint8_t decodeSlot_=0;
+  bool slotPressure_=false;
+  void resetBodies();
+  void startBody(unsigned slot);
+  void releaseBody(bool decoded);
   uint64_t selected_=0;
   uint32_t now_=0, day_=0, directoryHash_=0, assemblyTimeoutMs_=300000;
   int16_t offset_=0;
   int browseOffset_=0;
   uint16_t cacheEpoch_=1, nextEpoch_=1, focus_=0;
   uint16_t wanted();
+  bool relevantPI(const Entry& entry) const;
   bool liveMode_=false, clockTrusted_=true, transportSeen_=false;
   uint32_t transportTouched_=0;
   uint32_t clockDay_=0, archiveDay_=0, acquisitionAt_=0;

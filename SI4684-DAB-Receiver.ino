@@ -370,7 +370,7 @@ void SlideshowReceptionState(bool active) {
   slsReceiving = active;
 
   if (!active) {
-    // The red loading bitmap is drawn directly over the normal icon. Force
+    // The cyan loading bitmap is drawn directly over the normal icon. Force
     // ShowSlideShowIcon() to repaint that region after a tune/service change,
     // timeout, or completed MOT even when availability stayed false.
     SlideShowAvailableOld = !radio.SlideShowAvailable;
@@ -408,9 +408,9 @@ static void DrawNeutralStatusPanel(void) {
   tft.drawRoundRect(25, 46, 270, 50, 8, ActiveColor);
 }
 
-static void DrawSlideshowLoadingIcon(int16_t x, int16_t y, bool flatBackground) {
+void DrawSlideshowStatusIcon(int16_t x, int16_t y, uint16_t color, bool flatBackground) {
   // Preserve the slideshow icon artwork and tint only its active
-  // pixels red. The neutral panel separately removes the volume loudspeaker.
+  // pixels to the EPG status colour. Preserve artwork shading and background.
   uint16_t loadingIcon[30 * 22];
   uint8_t maxLum = 1;
   for (uint16_t i = 0; i < 30U * 22U; ++i) {
@@ -425,11 +425,15 @@ static void DrawSlideshowLoadingIcon(int16_t x, int16_t y, bool flatBackground) 
   }
   for (uint16_t i = 0; i < 30U * 22U; ++i) {
     if (slideshowon[i] != slideshowoff[i])
-      loadingIcon[i] = tint565PreserveShade(slideshowon[i], TFT_RED, maxLum);
+      loadingIcon[i] = tint565PreserveShade(slideshowon[i], color, maxLum);
     else
       loadingIcon[i] = flatBackground ? BackgroundColor3 : slideshowoff[i];
   }
   tft.pushImage(x, y, 30, 22, loadingIcon);
+}
+
+static void DrawSlideshowLoadingIcon(int16_t x, int16_t y, bool flatBackground) {
+  DrawSlideshowStatusIcon(x, y, 0xF800U, flatBackground);
 }
 
 enum SlsProgressMode : uint8_t {
@@ -466,7 +470,7 @@ static void DrawSlideshowProgressRunner(uint8_t pos) {
   tft.fillRect(SLS_PROGRESS_X, SLS_PROGRESS_Y,
                SLS_PROGRESS_W, SLS_PROGRESS_H, GreyoutColor);
   tft.fillRect(SLS_PROGRESS_X + pos, SLS_PROGRESS_Y,
-               SLS_PROGRESS_RUNNER_W, SLS_PROGRESS_H, TFT_RED);
+               SLS_PROGRESS_RUNNER_W, SLS_PROGRESS_H, 0xF800U);
   slsProgressDrawn = true;
 }
 
@@ -483,17 +487,14 @@ static void ShowSlideshowReceiveIndicator(void) {
     return;
   }
 
-  if (!slsReceiveIndicatorDrawn || displayreset) {
-    DrawSlideshowLoadingIcon(10, 187, false);
-    slsReceiveIndicatorDrawn = true;
-  }
+  slsReceiveIndicatorDrawn = true;
 
   const uint32_t receivedBytes = radio.slideshowReceivedBytes();
   const uint32_t expectedBytes = radio.slideshowExpectedBytes();
 
   if (expectedBytes != 0U) {
-    // MOT BodySize is authoritative. From this point the bar is exact and uses
-    // the theme ActiveColor. Before BodySize is known we deliberately do not
+    // MOT BodySize is authoritative. The exact bar uses the same red as EPG
+    // waiting and the slideshow loading icon. Before BodySize is known we do not
     // estimate progress from segment numbers because that state is not useful
     // in the receiver's actual MOT delivery sequence.
     uint32_t clampedBytes = receivedBytes;
@@ -504,7 +505,7 @@ static void ShowSlideshowReceiveIndicator(void) {
 
     if (displayreset || slsProgressModeOld != SLS_PROGRESS_EXACT ||
         slsProgressPixelsOld != pixels) {
-      DrawSlideshowProgressTrack(pixels, static_cast<uint16_t>(ActiveColor));
+      DrawSlideshowProgressTrack(pixels, 0xF800U);
       slsProgressModeOld = SLS_PROGRESS_EXACT;
       slsProgressPixelsOld = pixels;
       slsProgressAnimPosOld = 0xFF;

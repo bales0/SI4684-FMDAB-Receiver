@@ -256,19 +256,44 @@ is processed. Retuning/reconfiguration discards stale dumps and summaries. Detec
 low-priority pass is scheduled. Loss of lock, switching or a tracked SPI probe
 postpones it until eligible. Invalid service-list structure requires a new valid
 service list instead of a UA-only retry. Retuning, changed list/version and audio
-selection invalidate in-flight UA ownership. Routine refreshes keep the last
-confirmed icon color and do not repeat an unchanged inventory dump.
+selection invalidate in-flight UA ownership. Routine refreshes retain the last
+confirmed presence and do not repeat an unchanged inventory dump.
 
-The main display shows only `EPG` below the codec. Grey means EPG has not
-been detected. Cyan means validated SPI presence was found, but the selected
-station/day has no fresh unambiguous cached programme. Green requires fresh cached programme data for a matching schedule date and
-a trusted clock (virtual in TEST, broadcast UTC plus confirmed current offset
-in LIVE). SI-only metadata, a logo or freshly received historical PI is not
-Ready. Loss of trusted clock/lock removes Ready even if programme data remains.
-The detector retains known presence during routine rescans and clears on retune
-or a valid topology/version change. In UART replay, presence follows the
-validated test directory and readiness follows the test station/day cache.
-The indicator is hidden in FM. It does not promise complete schedule coverage.
+The small `EPG` indicator below the codec now uses four static UI states:
+
+| Indicator | RGB565 | Meaning |
+|---|---|---|
+| Hidden | — | No confirmed SPI for the current context, or FM. |
+| Red | 0xF800 | Confirmed SPI, waiting for relevant data within the UI progress window. |
+| Cyan | 0x06DF | Usable current-service PI or decoded, unambiguous current-service SI. |
+| Muted grey | 0x3A4A | Empty Directory, unusable/ambiguous data, stale PI without usable SI, or a 120-second wait without progress. |
+
+Green is no longer used for this text. Codec colours/alternation, slideshow
+colours, font, coordinates and the rest of the layout are unchanged. Colour
+changes are not animated. The previous text is removed when the indicator hides.
+
+Cyan does not promise current NOW/NEXT: valid SI remains useful without PI,
+with historical PI, or while the broadcast clock is uncertain. Historical PI
+alone cannot establish current programme availability. A logo alone is not
+sufficient. Cached SI/PI must match the current audio/ensemble and active source;
+a newly selected source cannot borrow the previous source's cyan status.
+A routine incomplete UA refresh of an unchanged confirmed endpoint does not
+invalidate useful cached SI. The existing schedule/clock rules for READY_LIVE
+in STATUS and the EPG pages are unchanged.
+
+The compile-time UI limit is `epg::kIndicatorWaitMs = 120000`. Its monotonic
+clock starts with a new source/service/test context. Only new owned valid
+Directory content, new valid fragments, or a newly decoded object extend it.
+The first incomplete Directory also counts newly received segment bits; once
+known, identical repeats do not invent new content. Matching duplicates,
+invalid groups, clock updates, redraws and unowned packet/PAD traffic do not
+extend this window. Expiry changes only the indicator to grey: it never clears
+cache, fragments, TIDs, priority, or a physical data service. New real progress
+can restore red, and usable SI/PI takes precedence over the UI timeout.
+In replay, the validated Directory or explicitly confirmed synthetic INJECT
+source supplies presence; the physical radio service does not select the test
+station. FM still hides the main-screen indicator.
+
 For details and reproducible tests see
 [the packet-component report](tests/DAB_SPI_packet_components_report.md).
 
@@ -826,9 +851,10 @@ or -1 if unavailable. Fields mean:
 | `EPG POOLS` | Free/largest blocks for INTERNAL\|8BIT DRAM and INTERNAL\|32BIT\|EXEC IRAM. Aggregate free heap alone does not establish allocatability. |
 | `EPG INJECT` | Simulated UA confirmation and accepted, legacy-handoff, rejected and packet-blocked group counts for the injection session. |
 
-The current Core arena for ESP32 is 51,096 bytes (compiler layout check;
-current RF firmware has not been hardware-tested). The preceding tested build
-used 50,800 bytes. Object/image/text buffers retain their sizes. Capacity is shared across
+The current Core arena for ESP32 is 63,600 bytes (target compiler layout check;
+current RF firmware has not been hardware-tested). This includes two 12 KiB RX
+blocks, the existing 12 KiB cached logo, 4 KiB Directory and 8 KiB text cache.
+The preceding single-RX-block version used 51,096 bytes. Capacity is shared across
 station/day cache contexts; the decoder intentionally does not retain every
 programme/logo in a multiplex. `cached`, `fresh` and readiness apply to the
 selected context. They are not proof of complete programme coverage.
@@ -1050,7 +1076,7 @@ EPG TRANSPORT END
 An active request returns `EPG OK TRANSPORT pending` instead of starting a
 second output. Admission needs 64 bytes of UART headroom; below that the command
 is handled silently and the client must retry. Pages wait for at least 512 bytes
-of headroom and are emitted at most once per 100 ms, normally taking about 1.3 s.
+of headroom and are emitted at most once per 100 ms, normally taking about 1.7 s.
 There is no continuous HEX dump. A context epoch/reset change terminates output
 with `EPG TRANSPORT CANCELLED context changed`; retry after tuning settles.
 Pages are successive observations, not an atomic snapshot. Counters can advance
@@ -1199,3 +1225,125 @@ baseline reduction is **4500 ms**. The preceding local version already used
 500 ms, so this refactoring does not claim an additional 4500 ms gain over it.
 Total DIR/PI/UI latency depends on the broadcast carousel and has not been
 measured on hardware for this version. See [the acquisition report](docs/EPG_PI_PRIORITY_REPORT_20261025.md).
+
+
+### Multi-TID reception, SLS activity and receive health (26 October 2026)
+
+The existing `EPG TEST TRANSPORT` command now includes `EPG IO`, `EPG SLS`
+and two `EPG RX path=... slot=...` lines. No new ENABLE requirement or test-mode
+switch is introduced. The existing STATUS `EPG RX unmapped=...` aggregate line
+is unchanged; distinguish it from the per-slot TRANSPORT lines by their fields.
+Output remains queued at most one page per 100 ms with 512-byte headroom,
+ending in `EPG TRANSPORT END`; context changes still cancel the sequence.
+
+`EPG IO` fields:
+
+| Field | Meaning |
+|---|---|
+| reason / stalled | Recovery gate: NONE, CTS_NO_PROGRESS, CTS_GENUINE, SPI_TRANSPORT_ERROR. |
+| failures | Consecutive terminal command failures, independent of host-gap classification. |
+| known / lastCtsAgeMs | Whether an answering command has been observed in the current DAB generation; ignore the age if known=0. DeviceError is an answer as well as Ok. |
+| inFlight / inFlightAgeMs / op | Outstanding command and its operation identifier; age=0 when none. |
+| recovery | Recovery requests counted by the driver. This is not a count of completed physical resets. |
+| IRQ | Rising observations of the DSRV status bit, not GPIO edge count. Repeated latched high snapshots are coalesced. |
+| clearStart | Pending acknowledgements consumed when GET_DIGITAL_SERVICE_DATA starts. |
+| remaining | Rearms from nonzero buffersRemaining. |
+| newer | Rearms from a newer status sequence observed during the in-flight read/dispatch. |
+| suspect | Bounded verification reads after a payload/error while the acknowledged status remains high; not proof of a lost IRQ. |
+| drainMaxMs / errors | Largest command-start-to-dispatch drain interval, and malformed/physical/failed reply completions. |
+
+The progress watchdog trips after at least **8 terminal failures spanning 5000 ms**
+without an answering command, even when all timeouts are classified HostStarved.
+An answering command resets the failure window. It does not trip on idle time,
+a single delayed host service, or elapsed rendering time alone. Existing genuine
+CTS protection also remains. A trip gates new DAB commands and uses the existing
+sketch cold-recovery path, including shared tuner/TFT reset and its 60-second
+retry limit. No reset is issued inside a reply callback. On a DEBUG-visible trip,
+`[DAB/WATCHDOG]` prints the reason and relevant counters once. The last host gap
+is diagnostic evidence only; it is not the entire timeout and does not establish
+when CTS became ready. POLL and INTB use the same command-completion watchdog.
+
+DSRV pending is consumed on start, then rearmed by remaining buffers or a newer
+status sequence. A same-level sticky bit alone cannot create an unbounded drain
+loop. A suspect/error allows one verification read; malformed replies wait 20 ms
+before retry. An empty verification stops. New observed edges and genuine
+remaining buffers continue draining within the existing four-command fairness
+budget. Tune/stale-generation reset discards old pending state. Actual FW 6.0.9
+IRQ/ACK behaviour still needs RF verification; these host checks do not identify
+the cause of the tester's 11A CTS hang.
+
+`EPG SLS` fields include current `tid`, `active`, packed `bytes`, declared `body`,
+`SLS_DUP_VALID`, `SLS_DUP_CONFLICT`, `crcBad`, `SLS_LAST_ACTIVITY_AGE` and
+`SLS_FIRST_SEGMENT_AGE`, in milliseconds. Ages are meaningful for an active
+collector; the first-segment age also requires received body bytes. Counters are
+lifetime diagnostic totals. A duplicate refreshes activity only after CRC,
+current ownership/TID, segment length, packed contents, bounds and last-flag
+validation. It adds no bytes and does not alter the bitmap. New MOT body CRC
+failures are rejected as well. Completed/published objects and foreign/stale
+sources cannot keep an incomplete collector alive. Identical headers alone do
+not extend its lifetime. Actual silence still expires after 30 seconds.
+
+Per-slot `EPG RX` fields:
+
+| Field | Meaning |
+|---|---|
+| path / epoch / slot / tid | Active Core owner, context epoch and one of the two bounded slot identities. |
+| state / mask | idle, receiving, ready, or decoding; segment bitmap in hexadecimal. |
+| rx / duplicates / started | Admitted CRC-valid fragments, matching duplicates, and assembly attempts for that slot's retained TID. |
+| received / decoded | Complete bodies with the declared size versus successfully decoded/validated PI/SI/PNG. Received does not imply valid TLV or displayed data. |
+| skipped | Eligible groups deferred while this occupied slot contributed to capacity pressure; a deferred third TID is retried by the carousel. |
+| timeout / evictions | Expired attempts, and the subset evicted for no progress under capacity pressure. |
+| maxGap / age / progressAge | Largest interval between accepted fragments, age of the latest attempt and time since its last new segment. Matching duplicates refresh activity, not progress. |
+| reason / highWater | 0 normal; 1 inactivity timeout; 2 no-progress expiry under pressure. highWater is the peak occupied slot count, at most 2. |
+
+Counters belong to the retained TID in each slot and reset when a different TID
+claims it. Only two slot identities are retained, not an unbounded TID history;
+compare deltas only for matching path/epoch/slot/TID. Completed slot metadata
+can remain visible with state=idle. Global SI/PI/PNG counts describe decoded
+objects, so SI=0 alone does not establish that no SI fragments arrived.
+
+The two 12 KiB blocks allow independent PI and SI reception. The single bounded
+TLV pump pins its input block while the other receives; PNG uses a free block
+once its own SI association is known. Three simultaneous 12 KiB bodies do not
+fit and are deferred, never silently merged or overwritten. Five-second
+preference changes do not reset RX fragments. Inactivity follows the existing
+Directory-derived carousel timeout (120 s to 30 min, default 300 s). Under
+observed capacity pressure, the same timeout without any new segment permits
+an incomplete duplicate-only slot to expire. Finished programme/SI/logo cache
+survives preference changes and identical Directory repeats.
+
+EPG allocation remains one-time with rollback and separate capability-pool
+checks: at least 12000 bytes DRAM and 4096 bytes executable 32-bit IRAM reserve.
+`EPG HEALTH arena` now reports 63600 target bytes; heap and largest-block fields
+must be measured on the actual unit. `stackMinBytes` is the calling task's stack
+high-water free space, in **bytes** for this ESP-IDF port. There is no new image
+workspace, PSRAM dependency, per-segment allocation, EPG flash or NVS storage.
+The SLS 50 KiB buffer and shared 76800-byte decoder workspace remain unchanged.
+
+Use [the English RF test guide](docs/SI4684_RX_RF_TEST_EN.md) for live acceptance.
+Host simulation passing is separate from RF, audible playback, TFT and stack
+acceptance on the physical receiver.
+
+
+### Browsing directly in the NOW/NEXT overview
+
+ROT1 rotation on the overview now previews NEXT and further cached programmes.
+Rotate right to advance and left to return through earlier entries. Selecting
+the actual NOW entry resumes automatic NOW/NEXT following. Bounds do not wrap.
+If no timed NOW/NEXT is available, rotation browses stored entries without
+claiming they are currently broadcast.
+
+The preview uses the existing programme area. Actual NEXT is labelled NEXT;
+other preview entries use the localized programme label. Following entries
+are shown as programme information. Future/past previews have no live progress
+bar and never change broadcast UTC, programme times, cache selection or tuning.
+An overview-only movement repaints the programme region instead of the full
+screen. Valid preview identity is retained across cache updates; a changed
+station/day or removed entry returns to automatic following.
+
+Click ROT1 to open the programme list at the previewed entry, then click again
+for detail. The existing list/detail controls remain: ROT1 moves in the list
+or scrolls detail text; ROT2 changes the list day or moves between detail
+programmes. ROT2 does not move the overview. MODE back from the list, or closing
+and reopening EPG, returns the overview to automatic NOW/NEXT. Menu/volume
+suspension keeps the selected view.

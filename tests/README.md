@@ -457,7 +457,7 @@ selections. The UI test also returns from unloaded days/stations to loaded rows
 without feeding another frame and checks that the waiting panel is not redrawn.
 
 The runtime regression executes the actual ShowEpgIcon painter with recording
-sprite calls and checks grey/cyan/green colours, no repaint for an unchanged
+sprite calls and checks hidden/red/cyan/grey states and colours, no repaint for an unchanged
 state, FM hiding, fresh/ambiguous/expired data, an empty day and immediate cached
 return. It uses the production indicator query, not a duplicated colour policy.
 
@@ -527,3 +527,20 @@ boundaries and matching log text plus baseline cancellation guards. Coexistence
 now includes three packet STOP/START cycles while PAD remains Ready; UI tests
 record t7 only after actual overview drawing. The full runner includes priority.
 T01–T16 mapping, scope and HW NOT TESTED: [report](../docs/EPG_PI_PRIORITY_REPORT_20261025.md).
+
+
+Receive-path regressions (26 October 2026):
+`test_dab_receive_health.py` extracts the actual SLS body dispatch, collector,
+publication and timeout code. It tests valid duplicates over 90 seconds,
+CRC/content/last-flag conflicts, ownership, true silence and rollover. It also
+uses the production watchdog/DSRV helpers, the actual terminal-completion and
+recovery-gate prefix, and the sketch's 60-second recovery condition.
+`test_epg_multitid.py` feeds actual PI/SI/PNG through the two-slot Core with
+interleaving, reversed fragments, >5s gaps, pinned decode, CRC failures,
+capacity pressure and progress expiry. The coexistence harness additionally
+raises a newer DSRV event during the actual full reply read.
+These tests, `test_dab_packet_runtime.py` and `test_scheduler.cpp` are included
+in `run_epg_tests.py`. The UART arena bound is now 64 KiB for the approved extra
+12 KiB RX block; capability-pool reserve and six-allocation rollback checks
+remain enforced. The input fixture files and their hashes are unchanged.
+For physical acceptance, use [the English RF guide](../docs/SI4684_RX_RF_TEST_EN.md).

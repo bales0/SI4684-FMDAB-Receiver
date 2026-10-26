@@ -77,10 +77,74 @@ bool replayActive() { return replay; }
 bool indicatorPresent() { return replay ? core && core->stats.directories!=0 : radio.spiPresent() || padSid!=0; }
 Availability availability() {return core?core->availability(indicatorPresent()):(indicatorPresent()?Availability::WaitDirectory:Availability::NoSpi);}
 ResolvedClock clockStatus() {return liveClock;}
-IndicatorState indicatorState() {
-  if(core && availability()==Availability::ReadyLive) return IndicatorState::Ready;
-  return indicatorPresent()?IndicatorState::Present:IndicatorState::Absent;
+// UI wait evidence is separate from reception timeout and never mutates Core.
+struct IndicatorClock {
+  uint64_t bearer=0;
+  uint32_t since=0,directory=0,objects=0,dirMask=0,sourceSid=0,sourceCid=0,progress[2]={},masks[2]={};
+  bool valid=false,present=false,expired=false;
+};
+static IndicatorClock indicatorClock;
+static uint32_t radioSid();
+static bool iconPresent() {
+  if(radio.isFm())return false;
+  if(replay)return core && (core->stats.directories || (injectDsrv && (!injectPad || injectUa)));
+  const auto& discovered=radio.spiDiscovery();
+  const bool pending=discovered.status==dab_spi::Status::Pending || discovered.status==dab_spi::Status::Incomplete;
+  return padSid || discovered.available() || radio.xpadSpiPresent() ||
+    (endpointSid && radio.spiPresent() && pending) ||
+    (discovered.status==dab_spi::Status::Ambiguous && discovered.confirmedPresent());
 }
+static void resetIndicatorClock(){indicatorClock=IndicatorClock{};}
+static void updateIndicatorClock(){
+  const bool present=iconPresent();const uint64_t bearer=core?core->selected():0;
+  const auto& discovered=radio.spiDiscovery();
+  const uint32_t sourceSid=replay?0:padSid?padSid:discovered.available()?discovered.serviceId:endpointSid;
+  const uint32_t sourceCid=replay?0:padSid?padCid:discovered.available()?discovered.componentId:endpointCid;
+  const bool context=!indicatorClock.valid || indicatorClock.present!=present || indicatorClock.bearer!=bearer || indicatorClock.sourceSid!=sourceSid || indicatorClock.sourceCid!=sourceCid;
+  bool progress=false;
+  if(core){
+    if(core->stats.directories!=indicatorClock.directory)progress=true;
+    indicatorClock.directory=core->stats.directories;
+    if(core->stats.objects!=indicatorClock.objects)progress=true;
+    indicatorClock.objects=core->stats.objects;
+    const auto& directory=core->directoryAssembly();
+    if(!core->stats.directories && directory.mask && (directory.mask&~indicatorClock.dirMask))progress=true;
+    indicatorClock.dirMask=directory.mask;
+    for(unsigned slot=0;slot<2;++slot){const auto& r=core->reception(slot);const auto& a=core->assembly(slot);
+      // Only new admitted fragments count. Duplicates, rejected first segments
+      // and groups from the unowned transport cannot refresh the UI deadline.
+      if(a.mask && (r.progress!=indicatorClock.progress[slot] || (a.mask&~indicatorClock.masks[slot])))progress=true;
+      if(a.mask)indicatorClock.progress[slot]=r.progress;
+      indicatorClock.masks[slot]=a.mask;
+    }
+  }
+  if(context || progress){indicatorClock.since=millis();indicatorClock.expired=false;}
+  else if(uint32_t(millis()-indicatorClock.since)>=kIndicatorWaitMs)indicatorClock.expired=true;
+  indicatorClock.valid=true;indicatorClock.present=present;indicatorClock.bearer=bearer;indicatorClock.sourceSid=sourceSid;indicatorClock.sourceCid=sourceCid;
+}
+IndicatorState indicatorState() {
+  if(!iconPresent())return IndicatorState::Absent;
+  const bool waiting=!indicatorClock.valid || !indicatorClock.present || (core && core->selected()!=indicatorClock.bearer) || (!indicatorClock.expired && uint32_t(millis()-indicatorClock.since)<kIndicatorWaitMs);
+  if(!core)return waiting?IndicatorState::Loading:IndicatorState::Unavailable;
+  const auto state=core->availability(true);
+  if(state==Availability::DirectoryEmpty || core->ambiguous())return IndicatorState::Unavailable;
+  if(!replay && !padSid){const auto& discovered=radio.spiDiscovery();
+    if(discovered.status==dab_spi::Status::Ambiguous)return IndicatorState::Unavailable;
+    if(discovered.available() && (endpointSid!=discovered.serviceId || endpointCid!=discovered.componentId))return waiting?IndicatorState::Loading:IndicatorState::Unavailable;
+  }
+  // A test's explicit station is independent of the physical audio service.
+  // LIVE SI/PI must still match the current audio/ensemble, not a previous view.
+  bool current=replay;
+  if(!replay && radio.epgContextStable()){
+    bool conflict=false;char* end=nullptr;const auto eid=strtoul(radio.EID,&end,16);
+    const uint64_t bearer=core->findStation(radioSid(),uint16_t(eid),uint8_t(radio.ensembleEcc),-1,conflict);
+    current=!conflict && bearer && bearer==core->selected();
+  }
+  if(current && (core->hasSI() || state==Availability::ReadyLive))return IndicatorState::Ready;
+  if(state==Availability::PiDateStale || state==Availability::TimeUnknown)return IndicatorState::Unavailable;
+  return waiting?IndicatorState::Loading:IndicatorState::Unavailable;
+}
+
 bool liveEnabled() { return core && !replay; }
 static const unsigned byteCaps=MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT;
 // EXEC selects the classic ESP32 IRAM heap, avoiding consumption of DRAM.
@@ -109,9 +173,11 @@ bool ensure(bool reportFailure) {
   return core!=nullptr;
 }
 static void resetLiveCore(epg_diag::Reset reason) {
+  resetIndicatorClock();
   if(core) { epg_diag::registry().reset(reason);core->reset(); core->setLive(true); core->setClockTrusted(false); core->select(0,0,0); EpgInvalidate(); }
 }
 void liveReset() {
+  resetIndicatorClock();
   epg_acq::trace().reset();
   clearInjection();clockLost=false;liveClock=ResolvedClock{};
   if(replay) { replay=demo=false; pendingSid=0; receiver.reset(); EpgClose(false); }
@@ -124,7 +190,11 @@ void liveContext(uint32_t sid,uint16_t eid,uint8_t ecc,uint32_t utc) {
   bool conflict=false;
   // SCIdS is not separately exposed; reject multiple matching bearers.
   const uint64_t match=core->findStation(sid,eid,ecc,-1,conflict);
-  core->select(match,utc,liveClock.offsetKnown?liveClock.offset:0); core->identityConflict=conflict;
+  // An unavailable clock changes trust, never the selected date/offset.
+  // Service identity can change independently; its own cached day is retained.
+  if(utc && liveClock.offsetKnown)core->select(match,utc,liveClock.offset);
+  else if(match!=core->selected())core->select(match,0,core->offset());
+  core->identityConflict=conflict;
 
 }
 void liveEndpoint(uint32_t sid,uint32_t cid) {
@@ -145,7 +215,7 @@ void livePadEndpoint(uint32_t sid,uint32_t cid) {
   setPadEndpoint(sid,cid,!sid?epg_diag::Reset::PadToPacket:padSid?epg_diag::Reset::PadEndpoint:endpointSid?epg_diag::Reset::PacketToPad:epg_diag::Reset::PadAcquire);
 }
 void livePadRevoked(){setPadEndpoint(0,0,epg_diag::Reset::UaRevoked);}
-void liveServiceChanged(){epg_acq::trace().reset();setPadEndpoint(0,0,epg_diag::Reset::Service);}
+void liveServiceChanged(){resetIndicatorClock();epg_acq::trace().reset();setPadEndpoint(0,0,epg_diag::Reset::Service);}
 static void liveGroup(epg_diag::Path path,const uint8_t* data,size_t n,bool owns) {
   auto& diagnostic=epg_diag::registry();auto& counters=diagnostic.at(path);
   diagnostic.group(path,data,n,owns,millis());
@@ -170,6 +240,7 @@ void livePadData(uint32_t sid,uint32_t cid,const uint8_t* data,size_t n) {
   livePadEndpoint(sid,cid);livePadPayload(data,n);
 }
 void stopReplay() {
+  resetIndicatorClock();
   clearInjection();
   replay=demo=false; pendingSid=0; receiver.reset(); liveClock=ResolvedClock{};
   endpointSid=endpointCid=padSid=padCid=0;
@@ -179,6 +250,7 @@ void stopReplay() {
 }
 static uint32_t radioSid() { return radio.ServiceStart && radio.ServiceIndex<radio.numberofservices ? radio.service[radio.ServiceIndex].ServiceID:0; }
 static void startReplay() {
+  resetIndicatorClock();
   clearInjection();
   endpointSid=endpointCid=padSid=padCid=0;
   epg_diag::registry().reset(epg_diag::Reset::ReplayStart);
@@ -191,17 +263,22 @@ static void transportOutput() {
   transportPrintedAt=millis();auto& d=epg_diag::registry();
   if(transportResetSequence!=d.totalResets || transportEpoch!=d.epoch){diagSerial.println("EPG TRANSPORT CANCELLED context changed");transportPage=255;return;}
   const unsigned page=transportPage++;
-  if(page<3){radio.logEpgTransportPage(uint8_t(page));return;}
-  if(page==3){diagSerial.printf("EPG OWNER mode=%s owner=%s channelIndex=%u epoch=%u resets=%u last=%s stateChanges=%u state=%s headerErrors=%u\n",replay?"TEST":"LIVE",replay?"TEST":padSid?"PAD":endpointSid?"PACKET":"NONE",unsigned(dabfreq),unsigned(d.epoch),unsigned(d.totalResets),epg_diag::resetName(d.lastReset),unsigned(d.stateChanges),availabilityName(availability()),unsigned(d.headerErrors));return;}
-  if(page>=4 && page<10){
-    const unsigned index=(page-4)/3,part=(page-4)%3;const auto& c=d.paths[index];const char* name=index?"PAD":"PACKET";
+  if(page<5){radio.logEpgTransportPage(uint8_t(page));return;}
+  if(page==5){diagSerial.printf("EPG OWNER mode=%s owner=%s channelIndex=%u epoch=%u resets=%u last=%s stateChanges=%u state=%s headerErrors=%u\n",replay?"TEST":"LIVE",replay?"TEST":padSid?"PAD":endpointSid?"PACKET":"NONE",unsigned(dabfreq),unsigned(d.epoch),unsigned(d.totalResets),epg_diag::resetName(d.lastReset),unsigned(d.stateChanges),availabilityName(availability()),unsigned(d.headerErrors));return;}
+  if(page>=6 && page<12){
+    const unsigned index=(page-6)/3,part=(page-6)%3;const auto& c=d.paths[index];const char* name=index?"PAD":"PACKET";
     if(part==0)diagSerial.printf("EPG TRANSPORT path=%s endpoint=%08X/%08X headers=%u/%u/%u/%u candidate=%u admitted=%u blocked=%u legacy=%u last=%08X/%08X src=%u ua=%04X dscty=%u state=%u bytes=%u gen=%u waitMs=%u idleMs=%u reason=%s\n",name,unsigned(c.sid),unsigned(c.cid),unsigned(c.headers[0]),unsigned(c.headers[1]),unsigned(c.headers[2]),unsigned(c.headers[3]),unsigned(c.candidates),unsigned(c.admitted),unsigned(c.blocked),unsigned(c.legacy),unsigned(c.lastSid),unsigned(c.lastCid),c.source,c.ua,c.dscty,c.state,c.bytes,unsigned(c.generation),c.sid && !c.dirs?unsigned(millis()-c.endpointMs):0,c.validGroups?unsigned(millis()-c.lastGroupMs):0,!c.sid?"not-owned":c.dirs?(c.objects?"directory-known":"empty-directory"):uint32_t(millis()-c.endpointMs)>=300000U?"directory-timeout":c.validGroups?"incomplete-directory":"waiting-data");
     else if(part==1)diagSerial.printf("EPG MOTPATH path=%s groups=%u valid=%u crcBad=%u invalid=%u type4=%u type6=%u dirs=%u unique=%u repeats=%u empty=%u tid=%04X dirBytes=%u objects=%u SI=%u PI=%u PNG=%u programmes=%u historyLimited=%u\n",name,unsigned(c.groups),unsigned(c.validGroups),unsigned(c.crcBad),unsigned(c.invalid),unsigned(c.objectGroups),unsigned(c.dirGroups),unsigned(c.dirs),unsigned(c.unique),unsigned(c.repeats),unsigned(c.empty),c.tid,unsigned(c.dirBytes),unsigned(c.objects),unsigned(c.si),unsigned(c.pi),unsigned(c.png),unsigned(c.programmes),c.historyLimited);
     else {diagSerial.printf("EPG REJECT path=%s",name);for(unsigned i=0;i<unsigned(epg_diag::Reject::Count);++i)diagSerial.printf(" %s=%u",epg_diag::rejectName(i),unsigned(c.rejected[i]));diagSerial.println("");}
     return;
   }
-  if(page==10){diagSerial.printf("EPG RESETS total=%u",unsigned(d.totalResets));for(unsigned i=0;i<unsigned(epg_diag::Reset::Count);++i)diagSerial.printf(" %s=%u",epg_diag::resetName(i),unsigned(d.resets[i]));diagSerial.println("");return;}
-  if(page==11){diagSerial.printf("EPG HEALTH free8=%u largest8=%u free32=%u largest32=%u min=%u UARTdrop=%u audio=%u SLS=%u core=%u arena=%u cached=%u limited=%u timeout=%u busy=%u invalid=%u crcBad=%u\n",unsigned(heap_caps_get_free_size(byteCaps)),unsigned(heap_caps_get_largest_free_block(byteCaps)),unsigned(heap_caps_get_free_size(wordCaps)),unsigned(heap_caps_get_largest_free_block(wordCaps)),ESP.getMinFreeHeap(),diagSerial.droppedBytes(),radio.ServiceStart,radio.SlideShowAvailable,core!=nullptr,unsigned(Core::memoryBytes()),core?unsigned(core->count()):0,core?core->limited:0,core?unsigned(core->stats.timeout):0,core?unsigned(core->stats.busy):0,core?unsigned(core->stats.invalid):0,core?unsigned(core->stats.crcBad):0);return;}
+  if(page==12){diagSerial.printf("EPG RESETS total=%u",unsigned(d.totalResets));for(unsigned i=0;i<unsigned(epg_diag::Reset::Count);++i)diagSerial.printf(" %s=%u",epg_diag::resetName(i),unsigned(d.resets[i]));diagSerial.println("");return;}
+  if(page==13){diagSerial.printf("EPG HEALTH free8=%u largest8=%u free32=%u largest32=%u min=%u UARTdrop=%u audio=%u SLS=%u core=%u arena=%u cached=%u limited=%u timeout=%u busy=%u invalid=%u crcBad=%u stackMinBytes=%u\n",unsigned(heap_caps_get_free_size(byteCaps)),unsigned(heap_caps_get_largest_free_block(byteCaps)),unsigned(heap_caps_get_free_size(wordCaps)),unsigned(heap_caps_get_largest_free_block(wordCaps)),ESP.getMinFreeHeap(),diagSerial.droppedBytes(),radio.ServiceStart,radio.SlideShowAvailable,core!=nullptr,unsigned(Core::memoryBytes()),core?unsigned(core->count()):0,core?core->limited:0,core?unsigned(core->stats.timeout):0,core?unsigned(core->stats.busy):0,core?unsigned(core->stats.invalid):0,core?unsigned(core->stats.crcBad):0,unsigned(uxTaskGetStackHighWaterMark(nullptr)));return;}
+  if(page==14 || page==15){
+    const unsigned slot=page-14;if(!core){diagSerial.printf("EPG RX slot=%u unavailable\n",slot);return;}
+    const auto& r=core->reception(slot);const auto& a=core->assembly(slot);
+    diagSerial.printf("EPG RX path=%s epoch=%u slot=%u tid=%04X state=%s mask=%08X rx=%u duplicates=%u started=%u received=%u decoded=%u skipped=%u timeout=%u evictions=%u maxGap=%u age=%u progressAge=%u reason=%u highWater=%u\n",replay?"TEST":padSid?"PAD":"PACKET",unsigned(d.epoch),slot,r.tid,core->decoding(slot)?"decoding":r.complete?"ready":a.active?"receiving":"idle",unsigned(a.mask),unsigned(r.rx),unsigned(r.duplicates),unsigned(r.started),unsigned(r.received),unsigned(r.decoded),unsigned(r.skipped),unsigned(r.timeouts),unsigned(r.evictions),unsigned(r.maxGap),r.tid?unsigned(millis()-r.first):0,r.tid?unsigned(millis()-r.progress):0,r.reason,core->slotHighWater);return;
+  }
   diagSerial.println("EPG TRANSPORT END");transportPage=255;
 }
 static void acquisitionOutput() {
@@ -225,7 +302,7 @@ void poll() {
   if(diagnostic.lastState!=state){diagnostic.lastState=state;epg_diag::increment(diagnostic.stateChanges);}
   static bool autoAttempted=false;
   if(!core && !autoAttempted && !radio.isFm() && (radio.spiPresent() || padSid) && radio.ServiceStart) { autoAttempted=true; ensure(); }
-  if(!core) return;
+  if(!core) {updateIndicatorClock();return;}
   const uint32_t nowMs=millis();
   if(replay && (snapshotFm!=radio.isFm() || snapshotFreq!=dabfreq || (snapshotSid && radioSid() && snapshotSid!=radioSid()))) {
     diagSerial.println("EPG INFO replay cancelled by radio service/mux change"); stopReplay();
@@ -251,13 +328,14 @@ void poll() {
     char* end=nullptr; const unsigned eid=strtoul(radio.EID,&end,16);
     const auto& clock=radio.broadcastClock();
     if(!radio.signallock) {clockLost=true;lostClockGeneration=clock.generation;}
-    if(clockLost && clock.generation!=lostClockGeneration) clockLost=false;
+    if(clockLost && clock.valid && clock.offsetKnown && clock.generation!=lostClockGeneration) clockLost=false;
     liveClock=resolveTime(clock,nowMs,radio.signallock && !clockLost);
     core->setLive(true);core->setClockTrusted(liveClock.utcValid && liveClock.offsetKnown);
     liveContext(radioSid(),uint16_t(eid),uint8_t(radio.ensembleEcc),liveClock.utcValid?liveClock.utc:0);
     if(!core->busy() && core->stats.pi && core->count() && core->hasPI() && !core->ambiguous())epg_acq::trace().mark(padSid?1:0,6,nowMs);
     if(core->hasSI() && core->logoSize())epg_acq::trace().mark(padSid?1:0,8,nowMs);
   }
+  updateIndicatorClock();
 }
 static bool hexValue(const char* text,uint64_t& value) {
   if(!*text || strlen(text)>16) return false;
@@ -277,6 +355,8 @@ static void status() {
   diagSerial.printf("EPG STATE state=%s transportFresh=%u scheduleDateValid=%u serviceHasPI=%u serviceHasSI=%u clockValid=%u sourceStart=%u sourceEnd=%u archive=%u\n",availabilityName(availability()),core->transportFresh(),core->scheduleDateValid(),core->hasPI(),core->hasSI(),core->clockTrusted(),unsigned(first==UINT32_MAX?0:first),unsigned(last),core->archivePreview());
   const auto& sample=radio.broadcastClock();
   diagSerial.printf("EPG CLOCK encoding=%u valid=%u offsetKnown=%u offset=%d utc=%u local=%u generation=%u age=%u\n",unsigned(sample.encoding),liveClock.utcValid,liveClock.offsetKnown,int(liveClock.offset),unsigned(liveClock.utc),unsigned(liveClock.local),unsigned(sample.generation),unsigned(millis()-sample.sampledAtMonotonicMs));
+  const auto& refresh=radio.clockRefresh();
+  diagSerial.printf("EPG CLOCK_REFRESH acceptedGeneration=%u candidateState=%s lastAcceptedAgeMs=%u candidateAgeMs=%u offset=%d clockTrusted=%u refreshAttempt=%u ok=%u reject=%u timeout=%u reason=%s\n",unsigned(sample.generation),clockStateName(refresh.state),unsigned(millis()-sample.sampledAtMonotonicMs),refresh.active()?unsigned(millis()-refresh.started):0,int(sample.offsetMinutes),replay?core->clockTrusted():liveClock.utcValid && liveClock.offsetKnown,unsigned(refresh.attempt),unsigned(refresh.ok),unsigned(refresh.reject),unsigned(refresh.timeout),!replay && sample.valid && uint32_t(millis()-sample.sampledAtMonotonicMs)>=300000U?"stale":clockRejectName(refresh.reason));
   if(injectDsrv) diagSerial.printf("EPG INJECT path=%s ua=%u accepted=%u legacy=%u rejected=%u blocked=%u\n",injectPad?"PAD":"MSC",injectUa,unsigned(injectAccepted),unsigned(injectLegacy),unsigned(injectRejected),unsigned(injectBlocked));
 }
 bool command(char* input) {

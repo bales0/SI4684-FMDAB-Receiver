@@ -1816,17 +1816,18 @@ void ShowProtectionlevel(void) {
 static void ShowEpgIcon(void) {
   static bool visibleOld = false;
   static epg::IndicatorState stateOld = epg::IndicatorState::Absent;
-  const bool visible = !radio.isFm();
   const epg::IndicatorState state = epg::indicatorState();
+  const bool visible = state != epg::IndicatorState::Absent;
   if (!displayreset && visible == visibleOld && state == stateOld) return;
 
   // Use the same loaded FONT16 as the codec. E/P/G glyphs fit all their
   // antialiasing rows in this 14-pixel crop, above the PR row at y=65.
   RestoreMainBackgroundRegion(58, 50, 58, 14);
   if (visible) {
-    // Grey/cyan match slideshow artwork; green means this selection is cached.
-    const uint16_t color = state == epg::IndicatorState::Ready ? 0x07E0U :
-                           state == epg::IndicatorState::Present ? 0x06DFU : 0x3A4AU;
+    // EPG only: red waits, cyan denotes usable current-service SI/PI, grey
+    // denotes unavailable data. Slideshow and codec colours are independent.
+    const uint16_t color = state == epg::IndicatorState::Ready ? 0x06DFU :
+                           state == epg::IndicatorState::Loading ? 0xF800U : 0x3A4AU;
     FullLineSprite.pushImage(-58, -50, 320, 240, Background);
     FullLineSprite.setTextDatum(TC_DATUM);
     FullLineSprite.setTextColor(color, BackgroundColor2, false);
@@ -2388,19 +2389,23 @@ void ShowClock(void) {
 }
 
 void ShowSlideShowIcon(void) {
-  if (radio.isFm()) {
-    if (SlideShowAvailableOld || displayreset) tft.pushImage (10, 187, 30, 22, slideshowoff);
-    SlideShowAvailableOld = false;
-    return;
+  static uint8_t previous=255;
+  static uint32_t source=0,waitingAt=0,received=0;
+  static bool presentOld=false,expired=false;
+  const bool present=radio.slideshowSignalled();
+  const uint32_t now=millis(),bytes=radio.slideshowReceivedBytes();
+  if(present && (!presentOld || source!=radio.slideshowGeneration() || bytes!=received)) {
+    waitingAt=now;expired=false;
+  } else if(present && uint32_t(now-waitingAt)>=120000U)expired=true;
+  source=radio.slideshowGeneration();received=bytes;presentOld=present;
+  const uint8_t state=!present?0:radio.SlideShowAvailable?2:expired?3:1;
+  if(state!=previous || displayreset || SlideShowAvailableOld!=radio.SlideShowAvailable) {
+    if(!state) {
+      for(int16_t row=0;row<22;++row)tft.pushImage(10,187+row,30,1,Background+(187+row)*320+10);
+    } else DrawSlideshowStatusIcon(10,187,state==2?0x06DFU:state==1?0xF800U:0x3A4AU,false);
+    previous=state;
   }
-  if (SlideShowAvailableOld != radio.SlideShowAvailable || displayreset) {
-    if (radio.SlideShowAvailable) {
-      tft.pushImage (10, 187, 30, 22, slideshowon);
-    } else {
-      tft.pushImage (10, 187, 30, 22, slideshowoff);
-    }
-    SlideShowAvailableOld = radio.SlideShowAvailable;
-  }
+  SlideShowAvailableOld=radio.SlideShowAvailable;
 }
 
 void ShowTuneMode(void) {

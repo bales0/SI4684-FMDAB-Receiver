@@ -1,68 +1,89 @@
-"""Execute the actual DAB clock cases and queued command scheduling with mock SPI."""
+"""C01-C11/C14-C15 against actual serialized completion/error/scheduler paths."""
 from pathlib import Path
 import subprocess,sys
+from dab_clock_harness import harness
 ROOT=Path(__file__).resolve().parents[1];out=ROOT/'.pio/dab_clock';out.mkdir(exist_ok=True)
-radio=(ROOT/'src/si4684.cpp').read_text(encoding='utf-8')
-cases=radio[radio.index('    case DabCommand::Time:'):radio.index('    case DabCommand::ServiceType:',radio.index('    case DabCommand::Time:'))]
-queue=radio[radio.index('  if(dabClockConfirmPending && signallock)'):radio.index('  if (dabAudioRefreshPending && dabActiveServiceValid)',radio.index('  if(dabClockConfirmPending && signallock)'))]
 cpp=r'''
-#include "epg_core.h"
-#include "dab_scheduler_policy.h"
-#include "vendor/si468x/Si468x.h"
-#include <cassert>
+#include <cstdint>
 #include <cstdio>
-#include <cstring>
-#define DIAG_PRINTF(...) ((void)0)
 static uint32_t tick=100;
 uint32_t millis(){return tick;}
-uint8_t SPIbuffer[32]={};
-struct Radio {
- enum class DabCommand {None,Time,TimeUtc,TimeLocalConfirm};
- unsigned Year=0,Months=0,Days=0,Hours=0,Minutes=0,Seconds=0,diagDabCommandErrorCount=0;
- uint32_t dabTimeGeneration=0,dabLocalClockEpoch=0,dabLocalClockMs=0,dabLastLowPriorityCommandMs=0;
- bool dabUtcRefreshPending=false,dabClockConfirmPending=false,dabTimeRefreshPending=true,signallock=true,diagnosticDebug=false;
- epg::BroadcastClockSample dabEpgClock;
- DabCommand sent=DabCommand::None;uint8_t sentType=255;
- bool parseOk(si468x::Result result){return result==si468x::Result::Ok;}
- bool startDabCommand(DabCommand cmd,uint8_t command,const uint8_t* args,unsigned n,unsigned response){
-  assert(command==0xbc && n==1 && response==11);sent=cmd;sentType=*args;return true;
- }
- void schedule(){const uint32_t now=millis();const uint8_t zero=0;
-'''+queue+r'''
- }
- void reply(unsigned year,unsigned month,unsigned day,unsigned hour,unsigned minute,unsigned second){
-  assert(sent!=DabCommand::None);const auto completed=sent;sent=DabCommand::None;
-  std::memset(SPIbuffer,0,sizeof(SPIbuffer));SPIbuffer[1]=128;
-  SPIbuffer[5]=uint8_t(year);SPIbuffer[6]=uint8_t(year>>8);SPIbuffer[7]=uint8_t(month);SPIbuffer[8]=uint8_t(day);SPIbuffer[9]=uint8_t(hour);SPIbuffer[10]=uint8_t(minute);SPIbuffer[11]=uint8_t(second);
-  switch(completed){
-'''+cases+r'''
-  default:assert(false);
-  }
- }
-};
+'''+harness()+r'''
+static void cycle(ClockRadio& r,uint32_t utc,int offset=60) {
+ r.dabTimeRefreshPending=true;r.schedule();assert(r.sentType==0);r.replyEpoch(utc+offset*60);
+ tick+=100;r.schedule();assert(r.sentType==1);r.replyEpoch(utc);
+ tick+=100;r.schedule();assert(r.sentType==0);r.replyEpoch(utc+offset*60);
+}
+static uint32_t now(const ClockRadio& r){return epg::resolveTime(r.dabEpgClock,tick,r.signallock).utc;}
 int main(){
- Radio r;
- r.schedule();assert(r.sentType==0);r.reply(2026,10,25,2,59,59);assert(r.Hours==2 && !r.dabEpgClock.offsetKnown);
- tick+=100;r.schedule();assert(r.sentType==1);r.reply(2026,10,25,0,59,59);assert(r.Hours==2 && !r.dabEpgClock.valid);
- tick+=1000;r.schedule();assert(r.sentType==0);r.reply(2026,10,25,2,0,0);
- auto clock=epg::resolveTime(r.dabEpgClock,tick,true);
- assert(clock.utcValid && clock.offsetKnown && clock.offset==60 && clock.utc==epg::epoch(2026,10,25,1,0,0));
- assert(clock.local==epg::epoch(2026,10,25,2,0,0) && r.Hours==2 && r.Minutes==0);
- r.dabTimeRefreshPending=true;tick+=100;r.schedule();r.reply(2026,3,29,1,59,59);
- tick+=100;r.schedule();r.reply(2026,3,29,0,59,59);
- tick+=1000;r.schedule();r.reply(2026,3,29,3,0,0);
- clock=epg::resolveTime(r.dabEpgClock,tick,true);
- assert(clock.utc==epg::epoch(2026,3,29,1) && clock.local==epg::epoch(2026,3,29,3) && clock.offset==120);
- assert(!epg::resolveTime(r.dabEpgClock,tick,false).utcValid);
- r.dabTimeRefreshPending=true;r.schedule();r.reply(2026,10,25,8,0,0);
- tick+=100;r.schedule();r.reply(2026,10,25,7,0,0);
- tick+=2100;r.schedule();r.reply(2026,10,25,8,0,2);
- assert(!r.dabEpgClock.valid && !r.dabEpgClock.offsetKnown);
- r.dabTimeRefreshPending=true;r.schedule();r.reply(2026,10,25,8,0,0);
- tick+=100;r.schedule();r.reply(2026,10,25,24,0,0);
- assert(!r.dabEpgClock.valid && !r.dabClockConfirmPending);
- r.signallock=false;r.dabTimeRefreshPending=true;r.schedule();assert(r.sent==Radio::DabCommand::None);
- std::puts("Actual serialized LOCAL/UTC/LOCAL reply parser and queue: DST boundary, local display preservation, stale pair and invalid calendar rejection: PASS");
+ const uint32_t base=epg::epoch(2026,10,25,6);
+ ClockRadio r;r.schedule();assert(r.sentType==0);r.replyEpoch(base+3600);
+ assert(!r.dabEpgClock.valid && r.dabClockRefresh.state==epg::ClockCandidateState::AwaitUtc);
+ tick+=100;r.schedule();r.replyEpoch(base);assert(!r.dabEpgClock.valid);
+ tick+=100;r.schedule();r.replyEpoch(base+3600);
+ assert(r.dabEpgClock.valid && r.dabEpgClock.generation==1 && now(r)==base);
+ std::puts("C01/C04 PASS: first complete cycle only; atomic publication");
+ for(int i=0;i<11;++i) {
+  tick+=60000;const auto before=r.dabEpgClock;const auto gen=before.generation;
+  r.dabTimeRefreshPending=true;r.schedule();r.replyEpoch(now(r)+3600);
+  assert(r.dabEpgClock.generation==gen && r.dabEpgClock.sampledAtMonotonicMs==before.sampledAtMonotonicMs);
+  tick+=100;r.schedule();const auto utc=now(r);r.replyEpoch(utc);
+  assert(r.dabEpgClock.generation==gen && epg::resolveTime(r.dabEpgClock,tick,true).utcValid);
+  tick+=100;r.schedule();r.replyEpoch(now(r)+3600);assert(r.dabEpgClock.generation==gen+1);
+ }
+ std::puts("C02/C03/C15 PASS: 11 minutes of pending refreshes preserve confirmed snapshot");
+ for(auto failure:{0,1,2,3,4,5,6}) {
+  if(r.dabClockRefresh.retryPending)tick=r.dabClockRefresh.retryAt;
+  auto before=r.dabEpgClock;r.dabTimeRefreshPending=true;r.schedule();
+  if(failure==0)r.reply(2026,2,30,12,0,0);
+  else if(failure==1)r.reply(2026,10,25,24,0,0);
+  else {
+   r.replyEpoch(now(r)+3600);tick+=100;r.schedule();
+   if(failure==2)r.finish(si468x::Result::Timeout);
+   else if(failure==3)r.reply(2026,10,25,12,60,0);
+   else {
+    r.replyEpoch(now(r));tick+=failure==4?2101:100;r.schedule();
+    if(failure==5)r.replyEpoch(now(r)+900); // not a half-hour offset
+    else if(failure==6)r.finish(si468x::Result::DeviceError);
+    else r.replyEpoch(now(r)+3600);
+   }
+  }
+  assert(r.dabEpgClock.generation==before.generation && r.dabEpgClock.calendarEpoch==before.calendarEpoch);
+  assert(r.dabClockRefresh.retryPending && !r.dabUtcRefreshPending && !r.dabClockConfirmPending);
+  r.schedule();assert(r.sent==ClockRadio::DabCommand::None);
+ }
+ std::puts("C05/C06 PASS: invalid calendar/time, UTC/confirm error, pairing window and offset; bounded retry");
+ tick=r.dabEpgClock.sampledAtMonotonicMs+300000;assert(!epg::resolveTime(r.dabEpgClock,tick,true).utcValid);
+ std::puts("C07 PASS: holdover expires exactly at 300 seconds");
+ for(bool autumn:{true,false}) {
+  ClockRadio dst;uint32_t utc=autumn?epg::epoch(2026,10,25,0,59,59):epg::epoch(2026,3,29,0,59,59);
+  dst.schedule();dst.replyEpoch(utc+(autumn?120:60)*60);tick+=100;dst.schedule();dst.replyEpoch(utc);
+  tick+=1000;dst.schedule();dst.replyEpoch(utc+1+(autumn?60:120)*60);
+  assert(dst.dabEpgClock.valid && dst.dabEpgClock.offsetMinutes==(autumn?60:120));
+  assert(now(dst)==utc+1 && dst.Hours==(autumn?2U:3U));
+ }
+ std::puts("C08 PASS: actual DST spring/autumn LOCAL-UTC-LOCAL across boundary");
+ ClockRadio reacq;cycle(reacq,base);auto gen=reacq.dabEpgClock.generation;
+ reacq.signallock=false;reacq.maintainDabClock();reacq.signallock=true;reacq.schedule();reacq.replyEpoch(base+3600);
+ assert(reacq.dabEpgClock.generation==gen);reacq.dabGeneration++;reacq.schedule();
+ assert(!reacq.dabEpgClock.valid);reacq.dabGeneration++;reacq.replyEpoch(base); // old in-flight generation ignored
+ reacq.maintainDabClock();assert(!reacq.dabEpgClock.valid);
+ cycle(reacq,base);assert(reacq.dabEpgClock.generation==gen+1);
+ std::puts("C10 PASS: RF lock loss, generation changes, superseded reply, new confirmed cycle");
+ ClockRadio jumps;cycle(jumps,base);gen=jumps.dabEpgClock.generation;
+ cycle(jumps,base+3600);assert(jumps.dabEpgClock.generation==gen && jumps.dabClockRefresh.reason==epg::ClockReject::Jump);
+ tick=jumps.dabClockRefresh.retryAt;cycle(jumps,base+3605);assert(jumps.dabEpgClock.generation==gen+1);
+ // A one-off year jump is rejected too; ordinary time then recovers immediately.
+ auto accepted=now(jumps);cycle(jumps,accepted+366U*86400);assert(jumps.dabEpgClock.generation==gen+1);
+ tick=jumps.dabClockRefresh.retryAt;cycle(jumps,now(jumps));assert(jumps.dabEpgClock.generation==gen+2);
+ std::puts("C11 PASS: one-off hour/year jump rejected; independent repeated correction accepted");
+ tick=0xffffff00U;ClockRadio wrap;cycle(wrap,base);assert(wrap.dabEpgClock.valid);
+ tick+=2000;assert(epg::resolveTime(wrap.dabEpgClock,tick,true).utcValid);
+ tick=0xffffff00U;ClockRadio pair;pair.schedule();pair.replyEpoch(base+3600);tick+=100;pair.schedule();pair.replyEpoch(base);
+ tick+=1000;pair.schedule();pair.replyEpoch(base+3601);assert(now(pair)==base+1);
+ std::puts("C14 PASS: millis wrap during accepted holdover and UTC/LOCAL pairing");
+ ClockRadio pending;pending.schedule();tick+=10001;pending.maintainDabClock();assert(pending.dabClockRefresh.reason==epg::ClockReject::Timeout);
+ std::puts("Clock candidate size and public sample remain bounded; actual driver paths PASS");
 }
 '''
 source=out/'clock.cpp';source.write_text(cpp,encoding='utf-8');exe=out/'clock.exe'

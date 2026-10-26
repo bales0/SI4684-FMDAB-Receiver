@@ -114,6 +114,9 @@ static bool radioAppTestCtsViaIrq = false;
 static bool radioDabRuntimeActive = false;
 static bool dabStcPending = false;
 static bool dabDsrvPending = false;
+static dab_health::Dsrv dabDsrvEvents;
+static dab_health::Watchdog dabProgress;
+static dab_health::Stall dabStallReason=dab_health::Stall::None;
 static bool dabDeviceEventPending = false;
 
 static I2sAudioMode radioI2sAudioMode = I2S_AUDIO_48K;
@@ -430,10 +433,9 @@ static void statusChanged(void*, const si468x::Status& status) {
       dabStcPending = true;
       ++diagDabStcCount;
     }
-    if (status.dsrvInt() && !dabDsrvPending) {
-      dabDsrvPending = true;
-      ++diagDabDsrvCount;
-    }
+    const uint32_t sequence=dabDsrvEvents.sequence;
+    dabDsrvEvents.status(status.dsrvInt());
+    if(sequence!=dabDsrvEvents.sequence){dabDsrvPending=true;++diagDabDsrvCount;}
     if (status.deviceEventInt() && !dabDeviceEventPending) {
       dabDeviceEventPending = true;
       ++diagDabDeviceEventCount;
@@ -711,6 +713,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   dabCommand = DabCommand::None;
   dabCommandRequestId = 0;
   dabGeneration = dab_scheduler::nextGeneration(dabGeneration);
+  dabProgress=dab_health::Watchdog{};
   dabCommandGeneration = dabGeneration;
   dabTuneRequestId = 0;
   dabWaitingTuneRequestId = 0;
@@ -730,7 +733,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   dabSignalRefreshPending = false;
   dabServiceListRefreshPending = false;
   dabEnsembleRefreshPending = false;
-  dabTimeRefreshPending = false; dabUtcRefreshPending = dabClockConfirmPending = false; dabEpgClock.valid=false;
+  dabTimeRefreshPending = false; dabUtcRefreshPending = dabClockConfirmPending = false; dabClockRefresh.invalidate(millis(),dabEpgClock);
   dabAudioRefreshPending = false;
   dabAudioInfoValid = false;
   dabAudioInfoRetryCount = 0;
@@ -746,11 +749,11 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   dabActiveDataServiceValid = false;
   dabDsrvBurstCount = 0;
   dabConsecutiveCtsTimeouts = 0;
-  dabTransportStalled = false;
+  dabTransportStalled = false;dabStallReason=dab_health::Stall::None;
   lastStatus0 = 0;
   radioDabRuntimeActive = false;
   dabStcPending = false;
-  dabDsrvPending = false;
+  dabDsrvPending = false;dabDsrvEvents.reset();
   dabDeviceEventPending = false;
 
   // GPIO12 has an explicit boot-time role. INTB bypasses all detection and
@@ -1394,6 +1397,7 @@ void DAB::onHardwareResetComplete(void) {
   dabSpiProbe = dab_probe::Probe{};
   const si468x::Result aborted = chip.abortCommand();
   dabGeneration = dab_scheduler::nextGeneration(dabGeneration);
+  dabProgress=dab_health::Watchdog{};
   dabCommandGeneration = dabGeneration;
   dabCommand = DabCommand::None;
   dabSwitch.reset();
@@ -1412,10 +1416,10 @@ void DAB::onHardwareResetComplete(void) {
   dabTuneBusyRetries = 0;
   dabTuneRetryNotBeforeMs = 0;
   dabConsecutiveCtsTimeouts = 0;
-  dabTransportStalled = false;
+  dabTransportStalled = false;dabStallReason=dab_health::Stall::None;
   invalidateDabAudioInfo();
   dabStcPending = false;
-  dabDsrvPending = false;
+  dabDsrvPending = false;dabDsrvEvents.reset();
   dabDeviceEventPending = false;
   radioDabRuntimeActive = false;
   commandAwaitingCts = false;
@@ -1454,6 +1458,15 @@ void DAB::invalidateDabAudioInfo(uint32_t notBeforeMs) {
   protectionlevel = 0;
 }
 
+void DAB::requestDabRecovery(dab_health::Stall reason) {
+  if(dabTransportStalled)return;
+  dabTransportStalled=true;dabStallReason=reason;++diagDabRecoveryRequestCount;
+  const uint32_t now=millis();
+  DIAG_PRINTF("[DAB/WATCHDOG] reason=%s failures=%u lastCtsAgeMs=%u known=%u inFlightAgeMs=%u op=%u hostGapUs=%u recovery=%u\n",
+    dab_health::name(reason),unsigned(dabProgress.failures),unsigned(now-dabProgress.lastSuccess),dabProgress.successKnown,
+    dabProgress.inFlight?unsigned(now-dabProgress.inFlightSince):0,unsigned(dabProgress.operation),unsigned(chip.lastServiceGapUs()),unsigned(diagDabRecoveryRequestCount));
+}
+
 dab_scheduler::CtsTimeoutClass DAB::recordDabCtsResult(
     bool timedOut) {
   const dab_scheduler::CtsTimeoutClass classification =
@@ -1471,8 +1484,7 @@ dab_scheduler::CtsTimeoutClass DAB::recordDabCtsResult(
   if (dab_scheduler::ctsRecoveryRequired(
           dabConsecutiveCtsTimeouts, RADIO_DAB_STALL_TIMEOUT_COUNT) &&
       !dabTransportStalled) {
-    dabTransportStalled = true;
-    ++diagDabRecoveryRequestCount;
+    requestDabRecovery(dab_health::Stall::CtsGenuine);
     DIAG_PRINTF("[DAB/STALL] %u consecutive genuine CTS timeouts; recovery requested\n",
                 static_cast<unsigned>(dabConsecutiveCtsTimeouts));
   }
@@ -1706,7 +1718,9 @@ void DAB::getServiceData(void) {
           SPIbuffer + 1, static_cast<uint16_t>(byte_count + 24U));
       finishCommandDiagnostics(readResult);
       if (readResult == si468x::Result::Ok) {
-        byte_count = SPIbuffer[19] + (SPIbuffer[20] << 8);
+        const uint32_t replyByteCount=SPIbuffer[19]+(static_cast<uint32_t>(SPIbuffer[20])<<8);
+        if(replyByteCount!=byte_count){++diagDabCommandErrorCount;return;}
+
 
         // Read DAB Dynamic Label (DLS). Si468x exposes the two DLS prefix bytes
         // at PAYLOAD[0..1] and the character field from PAYLOAD+2. BYTE_COUNT
@@ -1824,6 +1838,9 @@ void DAB::getServiceData(void) {
           const uint8_t segmentNumber = SPIbuffer[28];
           const bool lastSegment = (SPIbuffer[27] & 0x80U) != 0U;
           const uint16_t dataLen = static_cast<uint16_t>(byte_count - 11U);
+          const uint16_t groupCrc=epg::crc16(SPIbuffer+25,byte_count-2U);
+          if(groupCrc!=uint16_t((uint16_t(SPIbuffer[23+byte_count])<<8)|SPIbuffer[24+byte_count])){epg_diag::increment(slsCrcBad);return;}
+
 
           if (!dabSwitch.slsContextValid) {
             discardStaleMot();
@@ -1858,7 +1875,9 @@ void DAB::getServiceData(void) {
               const uint8_t bitIndex = segmentNumber % 8U;
               const uint8_t bitMask = static_cast<uint8_t>(1U << bitIndex);
 
-              if ((SlideShowSegmentBitmap[byteIndex] & bitMask) == 0U) {
+              if ((SlideShowSegmentBitmap[byteIndex] & bitMask) != 0U) {
+                acceptSlideshowDuplicate(segmentNumber,lastSegment,SPIbuffer+34,dataLen,true);
+              } else {
                 const bool lastConflict =
                     lastSegment && SlideShowLastSegmentValid &&
                     segmentNumber != SlideShowLastSegment;
@@ -1974,6 +1993,23 @@ void DAB::acknowledgeSlideshow(void) {
 // Insert one new segment into the single buffer while keeping already received
 // data packed in SegmentNumber order. Later arrival of a lower segment shifts
 // only the collected tail and therefore needs no second image-sized buffer.
+bool DAB::acceptSlideshowDuplicate(uint8_t segment, bool last, const uint8_t* data, uint16_t length, bool crcValid) {
+  if(!SlideShowInit || !SlideShowTransportIDValid || !dabSwitch.slsContextValid ||
+     slideshowPublishedPending || SlideShowUpdate || !slideshowSegBuf)return false;
+  size_t offset=0;for(unsigned i=0;i<segment;++i)offset+=slideshowSegLen[i];
+  const bool knownLast=SlideShowLastSegmentValid && segment==SlideShowLastSegment;
+  const bool valid=crcValid && data && length && length<=SLS_MAX_SEG_SIZE &&
+    (SlideShowSegmentBitmap[segment/8]&(1U<<(segment%8))) &&
+    slideshowSegLen[segment]==length && offset<=SlideShowByteCounter &&
+    length<=SlideShowByteCounter-offset && offset+length<=SLS_BUFFER_BYTES &&
+    (!SlideShowLength || (SlideShowByteCounter<=SlideShowLength && offset+length<=SlideShowLength)) &&
+    (!SlideShowLastSegmentValid || segment<=SlideShowLastSegment) && last==knownLast &&
+    memcmp(slideshowSegBuf+offset,data,length)==0;
+  if(valid){epg_diag::increment(slsDuplicateValid);SlideShowLastActivity=millis();}
+  else epg_diag::increment(slsDuplicateConflict);
+  return valid;
+}
+
 bool DAB::storeSlideshowSegment(uint8_t segmentNumber,
                                 const uint8_t* data,
                                 uint16_t dataLength) {
@@ -2209,6 +2245,7 @@ void DAB::setFreq(uint8_t freq) {
   lastStatus0 = 0;
 
   dabGeneration = dab_scheduler::nextGeneration(dabGeneration);
+  dabProgress=dab_health::Watchdog{};
   if (dab_switch::transitionActive(dabSwitch.state))
     ++diagDabAbandonedSwitchCount;
   dabSwitch.requestSwitch();
@@ -2226,12 +2263,12 @@ void DAB::setFreq(uint8_t freq) {
   dabSignalRefreshPending = false;
   dabServiceListRefreshPending = false;
   dabEnsembleRefreshPending = false;
-  dabTimeRefreshPending = false; dabUtcRefreshPending = dabClockConfirmPending = false; dabEpgClock.valid=false;
+  dabTimeRefreshPending = false; dabUtcRefreshPending = dabClockConfirmPending = false; dabClockRefresh.invalidate(millis(),dabEpgClock);
   dabAudioRefreshPending = false;
   dabCurrentSubchannelRefreshPending = false;
   dabCurrentServiceRefreshPending = false;
   dabServiceTypeScanIndex = 0;
-  dabDsrvPending = false;
+  dabDsrvPending = false;dabDsrvEvents.reset();
   dabDeviceEventPending = false;
   if (!dabActiveDataServiceValid) dataServiceCheck = 0;
   tunePending = true;
@@ -3000,7 +3037,7 @@ void DAB::setService(uint8_t _index) {
 bool DAB::startDabCommand(DabCommand operation, uint8_t command,
                           const uint8_t* args, uint16_t argLength,
                           uint16_t replyLength, uint32_t timeoutUs) {
-  if (chip.busy() || dabCommand != DabCommand::None) return false;
+  if (dabTransportStalled || chip.busy() || dabCommand != DabCommand::None) return false;
   if (replyLength > sizeof(SPIbuffer) - 1U) {
     ++diagDabCommandErrorCount;
     return false;
@@ -3010,6 +3047,7 @@ bool DAB::startDabCommand(DabCommand operation, uint8_t command,
       static_cast<si468x::Command>(command), args, argLength,
       replyLength > 0 ? SPIbuffer + 1 : nullptr, replyLength, timeoutUs);
   if (result == si468x::Result::Pending) {
+    dabProgress.started(millis(),uint16_t(operation));
     dabCommand = operation;
     dabCommandGeneration = dabGeneration;
     if (operation == DabCommand::StopDataService ||
@@ -3025,16 +3063,20 @@ bool DAB::startDabCommand(DabCommand operation, uint8_t command,
   DIAG_PRINTF("[DAB/ASYNC] command 0x%02X start failed result=%d\n",
                 command, static_cast<int>(result));
   const uint32_t now = millis();
+  dabProgress.operation=uint16_t(operation);
+  const auto stalled=dabProgress.terminal(now,result==si468x::Result::Ok || result==si468x::Result::DeviceError,result!=si468x::Result::Timeout);
+  if(stalled!=dab_health::Stall::None)requestDabRecovery(stalled);
   const dab_scheduler::CtsTimeoutClass ctsClass =
       recordDabCtsResult(result == si468x::Result::Timeout);
+  if(dabTransportStalled)return false;
+
 
   if (operation == DabCommand::StopDataService) {
     if (!dabSwitch.backoff(dab_switch::Resume::StopData,
                            dabSwitch.stopRetries,
                            dab_switch::MAX_STOP_RETRIES, now)) {
       if (ctsClass == dab_scheduler::CtsTimeoutClass::Genuine) {
-        dabTransportStalled = true;
-        ++diagDabRecoveryRequestCount;
+        requestDabRecovery(dab_health::Stall::CtsGenuine);
       } else {
         setDabSwitchState(dab_switch::State::Failed);
       }
@@ -3044,8 +3086,7 @@ bool DAB::startDabCommand(DabCommand operation, uint8_t command,
                            dabSwitch.stopRetries,
                            dab_switch::MAX_STOP_RETRIES, now)) {
       if (ctsClass == dab_scheduler::CtsTimeoutClass::Genuine) {
-        dabTransportStalled = true;
-        ++diagDabRecoveryRequestCount;
+        requestDabRecovery(dab_health::Stall::CtsGenuine);
       } else {
         setDabSwitchState(dab_switch::State::Failed);
       }
@@ -3078,10 +3119,16 @@ void DAB::finishDabCommand(void) {
   dabCommand = DabCommand::None;
   finishCommandDiagnostics(result);
 
-  // Device errors prove that the tuner answered. A timeout after a long host
-  // service gap is diagnostic host starvation, not evidence that CTS is lost.
+  // A device error proves an answer. Host-gap classification is diagnostic;
+  // terminal failures independently guard communication progress.
+  if(completedGeneration==dabGeneration){
+    const auto stalled=dabProgress.terminal(millis(),result==si468x::Result::Ok || result==si468x::Result::DeviceError,result!=si468x::Result::Timeout);
+    if(stalled!=dab_health::Stall::None)requestDabRecovery(stalled);
+  }
   const dab_scheduler::CtsTimeoutClass ctsClass =
       recordDabCtsResult(result == si468x::Result::Timeout);
+  if(dabTransportStalled)return;
+
 
   // Reconcile physical probe ownership even if a retune superseded its START.
   // It is independent of the audio/SLS switch command and never updates their
@@ -3149,13 +3196,21 @@ void DAB::finishDabCommand(void) {
     // Status bits sampled while completing the old command belong to the old
     // multiplex as well. A fresh tune will repopulate all three event flags.
     dabStcPending = false;
-    dabDsrvPending = false;
+    dabDsrvPending = false;dabDsrvEvents.reset();
     dabDeviceEventPending = false;
     return;
   }
 
+  if (result != si468x::Result::Ok && (completed==DabCommand::Time || completed==DabCommand::TimeUtc || completed==DabCommand::TimeLocalConfirm)) {
+    ++diagDabCommandErrorCount;
+    dabClockRefresh.fail(result==si468x::Result::Timeout?epg::ClockReject::Timeout:epg::ClockReject::Parse,millis());
+    dabUtcRefreshPending=dabClockConfirmPending=false;
+    return; // compact on-demand diagnostics; no hot retry/error-output loop
+  }
+
   if (result != si468x::Result::Ok) {
     ++diagDabCommandErrorCount;
+    if(completed==DabCommand::DsrvHeader){dabDsrvEvents.finish(millis(),0,0,false);dabDsrvPending=dabDsrvEvents.pending;}
     const uint8_t deviceReason = chip.lastDeviceError();
     if (result == si468x::Result::DeviceError && deviceReason == 0x03U)
       ++diagDabNotAvailableCount;
@@ -3275,8 +3330,7 @@ void DAB::finishDabCommand(void) {
                     static_cast<unsigned>(dabSwitch.notBeforeMs));
       } else if (currentSwitchCommand &&
                  ctsClass == dab_scheduler::CtsTimeoutClass::Genuine) {
-        dabTransportStalled = true;
-        ++diagDabRecoveryRequestCount;
+        requestDabRecovery(dab_health::Stall::CtsGenuine);
         DIAG_PRINTLN("[DAB/SWITCH] data STOP CTS loss; recovery requested");
       } else if (currentSwitchCommand) {
         setDabSwitchState(dab_switch::State::Failed);
@@ -3303,8 +3357,7 @@ void DAB::finishDabCommand(void) {
                     static_cast<unsigned>(dabSwitch.notBeforeMs));
       } else if (currentSwitchCommand &&
                  ctsClass == dab_scheduler::CtsTimeoutClass::Genuine) {
-        dabTransportStalled = true;
-        ++diagDabRecoveryRequestCount;
+        requestDabRecovery(dab_health::Stall::CtsGenuine);
         DIAG_PRINTLN("[DAB/SWITCH] audio STOP CTS loss; recovery requested");
       } else if (currentSwitchCommand) {
         setDabSwitchState(dab_switch::State::Failed);
@@ -3487,7 +3540,7 @@ void DAB::finishDabCommand(void) {
       if (!parseOk(parseResult)) {
         ++diagDabCommandErrorCount;
         epg_diag::increment(epg_diag::registry().headerErrors);
-        dabDsrvPending = false;
+        dabDsrvEvents.finish(millis(),0,0,false);dabDsrvPending=dabDsrvEvents.pending;
         break;
       }
       if (header.interruptSource & 0x02U) ++diagDabDsrvOverflowCount;
@@ -3619,7 +3672,7 @@ void DAB::finishDabCommand(void) {
           ++diagDabStaleMotCount;
         }
       }
-      dabDsrvPending = header.buffersRemaining > 0;
+      dabDsrvPending = dabDsrvEvents.finish(millis(),header.buffersRemaining,header.byteCount,!header.physicalError());
       break;
     }
 
@@ -3697,54 +3750,33 @@ void DAB::finishDabCommand(void) {
     }
 
     case DabCommand::Time:
+    case DabCommand::TimeUtc:
     case DabCommand::TimeLocalConfirm: {
       si468x::DabTimeInfo time;
-      const si468x::Result parseResult = si468x::Si468x::parseDabTime(
-          SPIbuffer + 1, 11, time);
-      if (!parseOk(parseResult)) {
-        ++diagDabCommandErrorCount;
-        break;
-      }
-      Year = time.year;
-      Months = time.month;
-      Days = time.day;
-      Hours = time.hour;
-      Minutes = time.minute;
-      Seconds = time.second;
-      dabTimeGeneration = dab_scheduler::nextGeneration(dabTimeGeneration);
-      dabLocalClockEpoch=epg::epoch(time.year,time.month,time.day,time.hour,time.minute,time.second);
-      dabLocalClockMs=millis();
-      if(completed==DabCommand::TimeLocalConfirm) {
-        int16_t offset=0;
-        const bool paired=epg::pairedOffsetAfterUtc(dabEpgClock.calendarEpoch,dabEpgClock.sampledAtMonotonicMs,dabLocalClockEpoch,dabLocalClockMs,offset);
-        dabEpgClock.offsetMinutes=offset;dabEpgClock.offsetKnown=paired;
-        dabEpgClock.valid=paired;dabEpgClock.generation=dabTimeGeneration;
-        if(diagnosticDebug) DIAG_PRINTF("[DAB/CLOCK] confirm local=%u utc=%u paired=%u offset=%d generation=%u\n",unsigned(dabLocalClockEpoch),unsigned(dabEpgClock.calendarEpoch),paired,int(offset),unsigned(dabTimeGeneration));
-      } else {
-        dabEpgClock=epg::BroadcastClockSample{};
-        dabEpgClock.year=time.year;dabEpgClock.month=time.month;dabEpgClock.day=time.day;
-        dabEpgClock.hour=time.hour;dabEpgClock.minute=time.minute;dabEpgClock.second=time.second;
-        dabEpgClock.encoding=epg::ClockEncoding::Local;dabEpgClock.calendarEpoch=dabLocalClockEpoch;
-        dabEpgClock.sampledAtMonotonicMs=dabLocalClockMs;dabEpgClock.generation=dabTimeGeneration;
-        dabEpgClock.valid=dabLocalClockEpoch!=0;dabUtcRefreshPending=dabEpgClock.valid;
-      }
-      if(diagnosticDebug) DIAG_PRINTF("[DAB/CLOCK] type=0 raw=%02X%02X%02X%02X%02X%02X%02X generation=%u local=%u\n",SPIbuffer[5],SPIbuffer[6],SPIbuffer[7],SPIbuffer[8],SPIbuffer[9],SPIbuffer[10],SPIbuffer[11],unsigned(dabTimeGeneration),unsigned(dabLocalClockEpoch));
-      break;
-    }
-
-    case DabCommand::TimeUtc: {
-      si468x::DabTimeInfo time;
       const auto parsed=si468x::Si468x::parseDabTime(SPIbuffer+1,11,time);
-      if(!parseOk(parsed)) {++diagDabCommandErrorCount;break;}
-      dabEpgClock=epg::BroadcastClockSample{};
-      dabEpgClock.year=time.year;dabEpgClock.month=time.month;dabEpgClock.day=time.day;
-      dabEpgClock.hour=time.hour;dabEpgClock.minute=time.minute;dabEpgClock.second=time.second;
-      dabEpgClock.encoding=epg::ClockEncoding::UTC;
-      dabEpgClock.calendarEpoch=epg::epoch(time.year,time.month,time.day,time.hour,time.minute,time.second);
-      dabEpgClock.sampledAtMonotonicMs=millis();dabEpgClock.generation=dabTimeGeneration;
-      // Trust only after a subsequent LOCAL reply confirms a current offset.
-      dabClockConfirmPending=dabEpgClock.calendarEpoch!=0;
-      if(diagnosticDebug) DIAG_PRINTF("[DAB/CLOCK] type=1 raw=%02X%02X%02X%02X%02X%02X%02X generation=%u utc=%u\n",SPIbuffer[5],SPIbuffer[6],SPIbuffer[7],SPIbuffer[8],SPIbuffer[9],SPIbuffer[10],SPIbuffer[11],unsigned(dabTimeGeneration),unsigned(dabEpgClock.calendarEpoch));
+      epg::BroadcastClockSample sample;
+      if(parseOk(parsed)) {
+        sample.year=time.year;sample.month=time.month;sample.day=time.day;
+        sample.hour=time.hour;sample.minute=time.minute;sample.second=time.second;
+        sample.calendarEpoch=epg::epoch(time.year,time.month,time.day,time.hour,time.minute,time.second);
+      }
+      if(!parseOk(parsed) || !sample.calendarEpoch) {
+        ++diagDabCommandErrorCount;dabClockRefresh.fail(epg::ClockReject::Parse,millis());
+        dabUtcRefreshPending=dabClockConfirmPending=false;break;
+      }
+      if(completed==DabCommand::TimeUtc) {
+        dabClockConfirmPending=dabClockRefresh.acceptUtc(sample,completedGeneration,millis());
+      } else {
+        // Public screen fields remain LOCAL, independent of the EPG transaction.
+        Year=time.year;Months=time.month;Days=time.day;
+        Hours=time.hour;Minutes=time.minute;Seconds=time.second;
+        dabTimeGeneration=dab_scheduler::nextGeneration(dabTimeGeneration);
+        const bool confirm=completed==DabCommand::TimeLocalConfirm;
+        const bool accepted=dabClockRefresh.acceptLocal(sample,completedGeneration,millis(),confirm,dabEpgClock);
+        if(!confirm)dabUtcRefreshPending=accepted;
+      }
+      if(diagnosticDebug && completed==DabCommand::TimeLocalConfirm)
+        DIAG_PRINTF("[DAB/CLOCK] acceptedGeneration=%u candidate=%s reason=%s offset=%d\n",unsigned(dabEpgClock.generation),epg::clockStateName(dabClockRefresh.state),epg::clockRejectName(dabClockRefresh.reason),int(dabEpgClock.offsetMinutes));
       break;
     }
 
@@ -4080,7 +4112,14 @@ void DAB::processDabSwitchState(uint32_t now) {
   }
 }
 
+void DAB::maintainDabClock(void) {
+  const bool fresh=dabClockRefresh.observe(dabGeneration,!isFm() && signallock && !dabTuneRequestPending,millis(),dabEpgClock);
+  if(!dabClockRefresh.active())dabUtcRefreshPending=dabClockConfirmPending=false;
+  if(fresh)dabTimeRefreshPending=true;
+}
+
 void DAB::scheduleNextDabCommand(void) {
+  maintainDabClock();
   if (chip.busy() || dabCommand != DabCommand::None || dabTransportStalled)
     return;
 
@@ -4183,7 +4222,7 @@ void DAB::scheduleNextDabCommand(void) {
        uaQueryPending || dabSpiProbe.state == dab_probe::State::StartRequested);
   const dab_scheduler::BackgroundWork work =
       dab_scheduler::chooseBackgroundWork(
-          dabDsrvPending, dabDsrvBurstCount, dabSignalRefreshPending,
+          dabDsrvPending && dabDsrvEvents.ready(now), dabDsrvBurstCount, dabSignalRefreshPending,
           lowPriorityPending);
 
   if (work == dab_scheduler::BackgroundWork::Dsrv) {
@@ -4194,7 +4233,7 @@ void DAB::scheduleNextDabCommand(void) {
                         static_cast<uint8_t>(si468x::Command::GET_DIGITAL_SERVICE_DATA),
                         args, sizeof(args), 24)) {
       ++dabDsrvBurstCount;
-      dabDsrvPending = false;
+      dabDsrvEvents.start(now);dabDsrvPending=false;
     }
     return;
   }
@@ -4271,11 +4310,12 @@ void DAB::scheduleNextDabCommand(void) {
     }
     return;
   }
-  if (dabTimeRefreshPending && signallock) {
+  if ((dabTimeRefreshPending || dabClockRefresh.retryPending) && signallock && dabClockRefresh.ready(now)) {
     if (startDabCommand(DabCommand::Time,
                         static_cast<uint8_t>(si468x::Command::DAB_GET_TIME),
                         &zero, 1, 11)) {
       dabTimeRefreshPending = false;
+      dabClockRefresh.begin(dabGeneration,now);
       dabLastLowPriorityCommandMs = now;
     }
     return;
@@ -4446,6 +4486,11 @@ dab_spi::Identity DAB::xpadSpiIdentity(void) const {
   return dabUaScan.functionalComplete(dabCommand==DabCommand::ComponentInfo)?
       dab_spi::Identity::NotSpi:dab_spi::Identity::Unqueried;
 }
+bool DAB::slideshowSignalled(void) const {
+  return !isFm() && ServiceStart && dabActiveServiceValid && !dabServiceRequestPending && !dabTuneRequestPending &&
+      (SlideShowAvailable || SlideShowInit || dabActiveDataServiceValid ||
+       (slsSignalPresent && slsSignalSid==dabActiveServiceId && slsSignalCid==dabActiveComponentId));
+}
 void DAB::logEpgTransportPage(uint8_t page) {
   if(page==0) {
     const auto identity=xpadSpiIdentity();
@@ -4453,8 +4498,12 @@ void DAB::logEpgTransportPage(uint8_t page) {
     diagSerial.printf("EPG AUDIO sid=%08X cid=%08X ua=%s identity=%u gen=%u published=%u inventory=%u complete=%u failed=%u usable=%u\n",unsigned(dabActiveServiceId),unsigned(dabActiveComponentId),ua,unsigned(identity),unsigned(dabUaScan.generation),unsigned(dabSpiDiscoveryGeneration),dabUaInventoryValid,dabUaScan.functionalComplete(dabCommand==DabCommand::ComponentInfo),unsigned(dabUaScan.failed),xpadSpiPresent());
   } else if(page==1) {
     diagSerial.printf("EPG PACKET selected=%u sid=%08X cid=%08X status=%s confirmed=%u unverified=%u tracked=%08X/%08X probe=%u\n",dabSpiDiscovery.available(),unsigned(dabSpiDiscovery.serviceId),unsigned(dabSpiDiscovery.componentId),dab_spi::statusName(dabSpiDiscovery.status),unsigned(dabSpiDiscovery.confirmed),unsigned(dabSpiDiscovery.packetMotUnverified),unsigned(dabSpiProbe.spi.sid),unsigned(dabSpiProbe.spi.cid),unsigned(dabSpiProbe.state));
-  } else {
+  } else if(page==2) {
     diagSerial.printf("EPG RADIO mode=%s requestedIndex=%u khz=%u eid=%s ecc=%02X lock=%u tune=%u switching=%u CTS=%u overflow=%u errors=%u XPAD=%04X set=%d get=%d match=%u\n",isFm()?"FM":"DAB",unsigned(dabRequestedFrequency),unsigned(getFreq(dabRequestedFrequency)),EID,unsigned(ensembleEcc),signallock,dabTuneRequestPending,dabServiceRequestPending,unsigned(diagDabCtsTimeoutCount),unsigned(diagDabDsrvOverflowCount),unsigned(diagDabCommandErrorCount),unsigned(dabXpad.value),int(dabXpad.setResult),int(dabXpad.getResult),dabXpad.matches());
+  } else if(page==3) {
+    diagSerial.printf("EPG IO reason=%s stalled=%u failures=%u lastCtsAgeMs=%u known=%u inFlight=%u inFlightAgeMs=%u op=%u recovery=%u IRQ=%u clearStart=%u remaining=%u newer=%u suspect=%u drainMaxMs=%u errors=%u\n",dab_health::name(dabStallReason),dabTransportStalled,unsigned(dabProgress.failures),unsigned(millis()-dabProgress.lastSuccess),dabProgress.successKnown,dabProgress.inFlight,dabProgress.inFlight?unsigned(millis()-dabProgress.inFlightSince):0,unsigned(dabProgress.operation),unsigned(diagDabRecoveryRequestCount),unsigned(dabDsrvEvents.irqSets),unsigned(dabDsrvEvents.cleared),unsigned(dabDsrvEvents.remaining),unsigned(dabDsrvEvents.newer),unsigned(dabDsrvEvents.suspect),unsigned(dabDsrvEvents.maxDrainMs),unsigned(dabDsrvEvents.errors));
+  } else {
+    diagSerial.printf("EPG SLS tid=%04X active=%u bytes=%u body=%u SLS_DUP_VALID=%u SLS_DUP_CONFLICT=%u crcBad=%u SLS_LAST_ACTIVITY_AGE=%u SLS_FIRST_SEGMENT_AGE=%u\n",SlideShowTransportID,SlideShowInit,unsigned(SlideShowByteCounter),unsigned(SlideShowLength),unsigned(slsDuplicateValid),unsigned(slsDuplicateConflict),unsigned(slsCrcBad),SlideShowInit?unsigned(millis()-SlideShowLastActivity):0,SlideShowInit && SlideShowByteCounter?unsigned(millis()-slideshowFirstSegmentMs):0);
   }
 }
 bool DAB::xpadSpiPresent(void) const {
@@ -4467,7 +4516,7 @@ void DAB::resetDabSpiDiscovery(bool preservePresence, bool logInventory) {
   const uint16_t previousConfirmed = dabSpiDiscovery.confirmed;
   for (auto& identity : dabSpiIdentities) identity = dab_spi::Identity::Unqueried;
   dabUaRefresh.cancel();
-  if (!preservePresence) dabSpiPresent = false;
+  if (!preservePresence) {dabSpiPresent = false;slsSignalPresent=false;slsSignalSid=slsSignalCid=0;}
   dabUaScan.begin(dabUaComponentCount, dabServiceListReady && dabUaInventoryValid);
   dabUaScanIndex = 0;
   dabUaLogPending = false;
@@ -4523,6 +4572,21 @@ void DAB::refreshDabSpiDiscovery(void) {
   if(dabUaInventoryValid && result.available())epg_acq::trace().endpoint(0,result.serviceId,result.componentId,millis());
   if(xpadSpiPresent())epg_acq::trace().endpoint(1,dabActiveServiceId,dabActiveComponentId,millis());
   if (dabUaInventoryValid) dabSpiPresent = result.confirmedPresent();
+  if(dabUaInventoryValid) {
+    bool present=false,unknown=false;
+    for(uint8_t i=0;i<dabUaServiceCount;++i) {
+      const UaService& e=dabUaServices[i];if(e.sid!=dabActiveServiceId)continue;
+      for(uint16_t j=e.first;j<e.first+e.count;++j) {
+        const auto identity=dabSpiIdentities[j];
+        if(identity==dab_spi::Identity::Unqueried || identity==dab_spi::Identity::Failed)unknown=true;
+        if(dab_spi::isSlideshow(identity) && (dabUaComponents[j]==dabActiveComponentId || dab_inventory::Component{dabUaComponents[j]}.packetMot()))present=true;
+      }
+    }
+    if(present || !unknown) {
+      slsSignalPresent=present;slsSignalSid=dabActiveServiceId;slsSignalCid=dabActiveComponentId;
+    }
+  }
+
   // Only a completed validated inventory can withdraw the selected PAD owner.
   // During routine UA refresh a temporarily unqueried answer merely pauses PAD.
   if(dabUaInventoryValid) {
@@ -4710,6 +4774,7 @@ void DAB::logDabUserApplications(uint32_t now) {
 // Periodic cooperative driver pump. No DAB command waits for CTS or STC here;
 // every call advances at most one in-flight command and starts at most one more.
 void DAB::Update(bool allowNewWork) {
+  maintainDabClock();
   if (isFm()) {
     if (radioControlMode == RADIO_CTRL_INTB && radioIntbActive()) {
       // Non-blocking tune/seek commands are completed here rather than through
@@ -4729,10 +4794,12 @@ void DAB::Update(bool allowNewWork) {
     return;
   }
 
+  if(dabTransportStalled && !chip.busy() && dabCommand==DabCommand::None)return;
+
   // Slideshow collection and rendering use RAM only; no filesystem path is
   // involved in the runtime collector.
   const uint32_t now = millis();
-  if (SlideShowInit && SlideShowLastActivity > 0 && now - SlideShowLastActivity > 30000) {
+  if (SlideShowInit && uint32_t(now-SlideShowLastActivity)>30000U) {
     if (SlideShowDebug) DIAG_PRINTLN("[SLS] Collection timeout, resetting");
     // The buffer contains an incomplete object and therefore remains
     // unavailable. A picture already decoded to TFT GRAM is not erased here.

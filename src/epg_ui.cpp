@@ -7,6 +7,22 @@
 namespace {
 bool visible=false, suspended=false, dirty=true, fallback=false;
 unsigned page=0, selected=0, scroll=0, maxScroll=0;
+bool overviewBrowsing=false, renderedOverviewBrowsing=false;
+uint64_t overviewBearer=0;
+uint32_t overviewDay=0,overviewStart=0,overviewId=0;
+void syncOverview(epg::Core* c){
+  if(!c)return;
+  if(overviewBearer!=c->selected() || overviewDay!=c->localDay())overviewBrowsing=false;
+  overviewBearer=c->selected();overviewDay=c->localDay();
+  if(overviewBrowsing){
+    if(selected>=c->count() || c->at(selected).start!=overviewStart || c->at(selected).id!=overviewId){
+      unsigned i=0;while(i<c->count() && (c->at(i).start!=overviewStart || c->at(i).id!=overviewId))++i;
+      if(i==c->count())overviewBrowsing=false;else selected=i;
+    }
+    if(int(selected)==c->current())overviewBrowsing=false;
+  }
+  if(!overviewBrowsing){const int current=c->current(),next=c->next();selected=current>=0?unsigned(current):next>=0?unsigned(next):0;}
+}
 uint32_t revision=0, renderedMinute=0;
 epg::Availability renderedState=epg::Availability::NoSpi;
 unsigned renderedPage=3, renderedSelected=0, renderedFirst=0, renderedLanguage=8;
@@ -125,7 +141,7 @@ bool EpgVisible() { return visible; }
 void EpgInvalidate() { dirty=true; }
 void EpgOpen() {
   if(menu || tuning || seek || (radio.isFm() && !epg::replayActive())) return;
-  visible=true; dirty=true; page=selected=scroll=0;
+  visible=true; dirty=true; page=selected=scroll=0;overviewBrowsing=false;overviewBearer=0;overviewDay=0;
   ChannelListView=DabGlobalListView=SlideShowView=ShowServiceInformation=false;
   slsWaitingView=slsWaitingOverlayVisible=setvolume=false;
   memorystore=false; rotary=rotary2=0;
@@ -139,18 +155,29 @@ void EpgBack() {
   if(!visible) return;
   if(!page) { EpgClose(); return; }
   --page; scroll=0; dirty=true;
-  if(!page && epg::runtime()) epg::runtime()->browseDay(-epg::runtime()->dayOffset());
+  if(!page && epg::runtime()){overviewBrowsing=false;epg::runtime()->browseDay(-epg::runtime()->dayOffset());}
 }
 void EpgClick() {
   if(!visible) return;
   if(page==2) { page=1; scroll=0; }
-  else { ++page; if(page==1 && epg::runtime()) { const int current=epg::runtime()->current(); selected=current>=0?unsigned(current):0; } }
+  else {if(!page)syncOverview(epg::runtime());++page;}
   dirty=true;
 }
 void EpgMove(int step,bool second) {
   if(!visible) return;
   epg::Core* c=epg::runtime();
   if(!c) return;
+  if(page==0){
+    if(second || !step || !c->count())return;
+    syncOverview(c);int64_t target=int64_t(selected)+step;
+    if(!overviewBrowsing){const int current=c->current(),next=c->next();
+      if(step>0 && next>=0)target=int64_t(next)+step-1;
+      else if(current<0 && next<0)target=step>0?0:int64_t(c->count())-1;
+    }
+    if(target<0 || target>=int64_t(c->count()))return;
+    selected=unsigned(target);overviewBrowsing=int(selected)!=c->current();
+    overviewStart=c->at(selected).start;overviewId=c->at(selected).id;dirty=true;return;
+  }
   if(second && page==1) { c->browseDay(step); selected=scroll=0; }
   else if((second && page==2) || (!second && page==1)) {
     const int next=int(selected)+step; if(next>=0 && next<int(c->count())) selected=unsigned(next);
@@ -161,6 +188,7 @@ void EpgMove(int step,bool second) {
 void EpgDraw(bool force) {
   if(!visible || menu) return;
   epg::Core* c=epg::runtime();
+  if(page==0)syncOverview(c);
   const auto state=epg::availability();
   const bool stateChanged=state!=renderedState;
   if(stateChanged) dirty=true;
@@ -170,7 +198,10 @@ void EpgDraw(bool force) {
   static uint32_t renderedAt=0;
   if(!force && uint32_t(millis()-renderedAt)<150U) return;
   renderedAt=millis();
-  const bool full=force || page!=1 || renderedPage!=page || renderedLanguage!=language;
+  const bool overviewMove=page==0 && renderedPage==0 && c && !force && !stateChanged &&
+    renderedLanguage==language && revision==c->revision && renderedMinute==c->now()/60 &&
+    renderedDay==c->dayOffset() && (selected!=renderedSelected || overviewBrowsing!=renderedOverviewBrowsing);
+  const bool full=force || (page!=1 && !overviewMove) || renderedPage!=page || renderedLanguage!=language;
   const bool dataChanged=stateChanged || !c || revision!=c->revision || renderedDay!=c->dayOffset();
   const bool footerChanged=full || dataChanged || (c && renderedMinute!=c->now()/60);
   const unsigned oldSelected=renderedSelected, oldFirst=renderedFirst;
@@ -186,7 +217,7 @@ void EpgDraw(bool force) {
     tftPrintFixed(0,title,160,4,PrimaryColor,PrimaryColorSmooth,size);
   }
   renderedPage=page; renderedLanguage=language;
-  renderedSelected=selected; renderedFirst=selected/9*9;
+  renderedSelected=selected; renderedFirst=selected/9*9;renderedOverviewBrowsing=overviewBrowsing;
   if(c) renderedDay=c->dayOffset();
   const epg::Service* station=c?c->station():nullptr;
   const char* name=station && !station->conflict?station->name:epg::replayActive()?text(EPG_WAIT_SI):_serviceName;
@@ -241,22 +272,29 @@ void EpgDraw(bool force) {
       maxScroll=total>rows?total-rows:0;
     } else waiting(text(stateText(state)));
   } else {
-    line(name,118,38,190,PrimaryColor);
-    char clock[8]; clockText(c->now(),c->offset(),clock,sizeof(clock)); line(c->now() && c->clockTrusted()?clock:text(EPG_CLOCK_UNCERTAIN),118,63,190,SecondaryColor);
-    if(c->logo() && !c->ambiguous()) DrawEpgLogo(c->logo(),c->logoSize(),12,34,100,70);
-    bool overlap=false; const int current=c->current(&overlap), next=c->next();
-    line(text(state!=epg::Availability::ReadyLive?stateText(state):overlap?EPG_OVERLAP:EPG_NOW),12,110,296,ActiveColor);
+    if(full){
+      line(name,118,38,190,PrimaryColor);
+      char clock[8]; clockText(c->now(),c->offset(),clock,sizeof(clock)); line(c->now() && c->clockTrusted()?clock:text(EPG_CLOCK_UNCERTAIN),118,63,190,SecondaryColor);
+      if(c->logo() && !c->ambiguous()) DrawEpgLogo(c->logo(),c->logoSize(),12,34,100,70);
+    }else restore(8,106,304,112,bg);
+    bool overlap=false;const int liveCurrent=c->current(&overlap),liveNext=c->next();
+    const int current=overviewBrowsing && selected<c->count()?int(selected):liveCurrent;
+    const int next=overviewBrowsing?(selected+1<c->count()?int(selected+1):-1):liveNext;
+    const EpgText label=overviewBrowsing?(current==liveNext?EPG_NEXT:EPG_PROGRAM):state!=epg::Availability::ReadyLive?stateText(state):overlap?EPG_OVERLAP:EPG_NOW;
+    line(text(label),12,110,296,ActiveColor);
     if(current>=0) {
       wrapped(c->title(current),0,2,130,PrimaryColor);
       interval(*c,current,info,sizeof(info)); line(info,12,171,200,SecondaryColor);
-      const auto& p=c->at(current); const unsigned percent=unsigned((uint64_t(c->now()-p.start)*100)/p.duration);
-      tft.drawRect(222,174,85,7,SecondaryColor); tft.fillRect(223,175,int(percent*83/100),5,ActiveColor);
+      if(!overviewBrowsing && state==epg::Availability::ReadyLive){
+        const auto& p=c->at(current);const unsigned percent=unsigned((uint64_t(c->now()-p.start)*100)/p.duration);
+        tft.drawRect(222,174,85,7,SecondaryColor);tft.fillRect(223,175,int(percent*83/100),5,ActiveColor);
+      }
     } else if(state==epg::Availability::SiOnly || state==epg::Availability::DirectoryEmpty || state==epg::Availability::PiDateStale || state==epg::Availability::TimeUnknown) {
       wrapped(text(stateText(state)),0,3,132,PrimaryColor);
     } else if(!c->count()) waiting(text(stateText(state)));
     else line(text(c->fresh()?EPG_UNAVAILABLE:EPG_STALE),12,134,296,PrimaryColor);
-    if(!epg::replayActive() && state==epg::Availability::ReadyLive && (current>=0 || next>=0))epg_acq::trace().mark(epg_acq::trace().owner,7,millis());
-    if(next>=0) { char time[8]; clockText(c->at(next).start,c->at(next).lto,time,sizeof(time)); snprintf(info,sizeof(info),"%s %s  %s",text(EPG_NEXT),time,c->title(next)); line(info,12,198,296,ActiveColor); }
+    if(!overviewBrowsing && !epg::replayActive() && state==epg::Availability::ReadyLive && (current>=0 || next>=0))epg_acq::trace().mark(epg_acq::trace().owner,7,millis());
+    if(next>=0) {char time[8];clockText(c->at(next).start,c->at(next).lto,time,sizeof(time));snprintf(info,sizeof(info),"%s %s  %s",text(overviewBrowsing?EPG_PROGRAM:EPG_NEXT),time,c->title(next));line(info,12,198,296,ActiveColor);}
   }
   if(fallback) line("~",306,222,8,SecondaryColor);
 }

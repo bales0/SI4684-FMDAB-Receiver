@@ -48,6 +48,7 @@ prefix=r'''
 static std::string textLog;
 struct TextDraw { std::string value; int y; };
 static std::vector<TextDraw> drawnText;
+static unsigned progressBars=0;
 static unsigned backgrounds=0, rows=0, scans=0, mainRedraws=0, volumePaints=0, legacyCycles=0, panels=0;
 static uint32_t testMillis=100;
 uint32_t millis(){return testMillis;}
@@ -72,7 +73,7 @@ struct MockTft {
  void drawFastVLine(int x,int y,int h,int color){verticals.push_back({x,y,h,color});}
  void drawRoundRect(int,int,int,int,int,int){}
  void drawLine(int,int,int,int,int){}
- void drawRect(int x,int y,int w,int h,int){assert(x>=0 && y>=0 && x+w<=320 && y+h<=240);}
+ void drawRect(int x,int y,int w,int h,int){assert(x>=0 && y>=0 && x+w<=320 && y+h<=240);if(x==222 && y==174 && w==85 && h==7)++progressBars;}
  void fillRect(int x,int y,int w,int h,int){assert(x>=0 && y>=0 && x+w<=320 && y+h<=240);}
 } tft,FullLineSprite;
 void tftPrintFixed(int,const char* text,int x,int y,int,int,unsigned){assert(x>=0 && x<320 && y>=0 && y<240);textLog+=text;textLog+='|';if(*text)drawnText.push_back({text,y});}
@@ -155,6 +156,17 @@ int main(int argc,char** argv){
  EpgOpen();assert(epg_acq::trace().paths[0].known&(1U<<7));
  epg_acq::trace().enable(false);epg::testReplay=true;
  assert(EpgVisible() && textLog.find("EPG NOW / NEXT")!=std::string::npos);
+ // ROT1 preview changes only displayed rows, never the source clock or NOW.
+ const uint32_t originalNow=c->now();const int originalCurrent=c->current(),originalNext=c->next();
+ unsigned beforeBackground=backgrounds,beforeProgress=progressBars;
+ EpgMove(1,false);testMillis+=200;drawnText.clear();EpgDraw();
+ assert(overviewBrowsing && selected==unsigned(originalNext) && c->now()==originalNow && c->current()==originalCurrent);
+ assert(backgrounds==beforeBackground && progressBars==beforeProgress);
+ assert(textLog.find(epgText[language][EPG_NEXT])!=std::string::npos);
+ EpgMove(1,false);testMillis+=200;EpgDraw();assert(selected==unsigned(originalNext+1) && backgrounds==beforeBackground && progressBars==beforeProgress);
+ EpgMove(-1,false);EpgMove(-1,false);testMillis+=200;EpgDraw();assert(!overviewBrowsing && selected==unsigned(originalCurrent) && progressBars>beforeProgress);
+ EpgMove(1,false);const unsigned preview=selected;EpgClick();assert(page==1 && selected==preview);EpgBack();testMillis+=200;EpgDraw();assert(!overviewBrowsing && selected==unsigned(originalCurrent));
+ EpgMove(10000,false);assert(!overviewBrowsing);EpgMove(1,true);assert(!overviewBrowsing && c->now()==originalNow);
  unsigned previous=backgrounds;EpgDraw();assert(backgrounds==previous);
  assert(EpgBackground(true)==configurationbackground && EpgBackground(false)==configurationbackground);
  EpgClick();testMillis+=200;EpgDraw();assert(rows==9 && textLog.find("EPG PROGRAM")!=std::string::npos);

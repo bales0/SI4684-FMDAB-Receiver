@@ -15,7 +15,8 @@ static std::string message(unsigned seq,unsigned offset,unsigned total,const uin
   assert(value.size()<127); return value;
 }
 int main() {
-  assert(epg::Core::memoryBytes()<=51*1024);
+  // Two preallocated 12 KiB receive blocks, with the total arena still bounded.
+  assert(epg::Core::memoryBytes()<=64*1024);
   static_assert(sizeof(epg::UartReceiver)<4200,"bounded UART receiver");
   auto core=std::unique_ptr<epg::Core>(new epg::Core);
   epg::UartReceiver rx;

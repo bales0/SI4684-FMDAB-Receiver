@@ -29,9 +29,13 @@ methods = "\n".join(function(signature) for signature in (
     "void DAB::logDabUserApplications(uint32_t now)",
     "bool DAB::resolveDabDataService(void)",
 ))
+methods += function("bool DAB::slideshowSignalled(void) const")
+methods += function("dab_spi::Identity DAB::xpadSpiIdentity(void) const") + function("bool DAB::xpadSpiPresent(void) const")
+
 fields = header[header.index("    struct UaService {"):header.index("    uint32_t dabSignalNextDueMs")]
 service = header[header.index("typedef struct _Services"):header.index("} DABService;") + len("} DABService;")]
 prefix = r'''
+#include "epg_acquisition.h"
 #include "dab_spi_discovery.h"
 #include "dab_diagnostics.h"
 #include "dab_spi_probe.h"
@@ -45,6 +49,7 @@ prefix = r'''
 #include <string>
 #include <vector>
 #include <cstdarg>
+namespace epg {void livePadEndpoint(uint32_t,uint32_t){}void livePadRevoked(){}}
 using byte = uint8_t;
 uint8_t SPIbuffer[4096];
 uint8_t dabServiceCharsetValue[32];
@@ -70,6 +75,9 @@ class DAB {
   DABService service[32] = {};
   uint8_t numberofservices = 0, ServiceIndex = 0;
   uint32_t serviceID = 0, componentID = 0, CurrentServiceID = 0;
+  bool SlideShowAvailable=false,SlideShowInit=false;bool slideshowSignalled()const;
+  bool ServiceStart=true,dabTuneRequestPending=false;bool isFm()const{return false;}
+  dab_spi::Identity xpadSpiIdentity()const;bool xpadSpiPresent()const;
   bool dabServiceListReady = false, dabServiceRequestPending = false;
   bool dabActiveServiceValid = true, dabActiveDataServiceValid = false;
   uint32_t dabRequestedComponentId = 0, dabActiveComponentId = 0x01FE0008;
@@ -169,6 +177,10 @@ int main() {
   sls.dabUaLogPending=true;
   sls.refreshDabSpiDiscovery();
   assert(sls.resolveDabDataService() && sls.evaluationRequests==1);
+  assert(sls.slideshowSignalled());sls.resetDabSpiDiscovery(true,false);assert(sls.slideshowSignalled());
+  sls.dabServiceRequestPending=true;assert(!sls.slideshowSignalled());sls.dabServiceRequestPending=false;
+  sls.dabActiveServiceId=0x9999;assert(!sls.slideshowSignalled());sls.dabActiveServiceId=0x2100;
+  sls.resetDabSpiDiscovery(false,false);assert(!sls.slideshowSignalled());
   assert(sls.dabDataComponentId==0x00F0E321 && !sls.dabSpiPresent);
   sls.refreshDabSpiDiscovery(); assert(sls.evaluationRequests==1);
   diagnosticDebug=false; diagSerial.space=512; lines.clear();

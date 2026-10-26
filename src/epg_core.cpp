@@ -109,7 +109,7 @@ int Assembly::add(uint16_t id, uint16_t seg, bool final, Bytes p, uint16_t n,
   if(seg>=32 || !n || n>cap) { ++stats.invalid; return -1; }
   Assembly next=*this;
   const bool replaced=next.active && next.tid!=id;
-  if(replaced) next.reset();
+  if(replaced) { ++stats.conflict; return -1; }
   if(!next.active) { next.active=true; next.tid=id; }
   const uint32_t flag=uint32_t(1)<<seg;
   if((next.last!=0xffff && (seg>next.last || (final && seg!=next.last))) ||
@@ -127,7 +127,7 @@ int Assembly::add(uint16_t id, uint16_t seg, bool final, Bytes p, uint16_t n,
   if(offset+n>cap || (final && next.stride && n>next.stride)) { ++stats.invalid; return -1; }
   if(next.mask&flag) {
     if(next.lengths[seg]!=n || !(buffer+offset).equals(p,n)) { ++stats.conflict; return -1; }
-    ++stats.duplicate; return 0;
+    ++stats.duplicate; touched=now; return 0;
   }
   // No writes or context mutations until every bound and conflict check passed.
   if(relocate) buffer.move(size_t(next.last)*next.stride,cap-next.lengths[next.last],next.lengths[next.last]);
@@ -140,13 +140,12 @@ int Assembly::add(uint16_t id, uint16_t seg, bool final, Bytes p, uint16_t n,
 Core::Core() : Core(::malloc, ::free) {}
 Core::Core(Allocate allocate, Release release, bool wordOnly) : release_(release) {
   if(!allocate || !release_) return;
-  body_=Buffer(allocate(kObjectBytes),wordOnly);
-  if(body_) directory_=Buffer(allocate(kDirectoryBytes),wordOnly);
+  bodies_[0]=Buffer(allocate(kObjectBytes),wordOnly);
+  if(bodies_[0]) bodies_[1]=Buffer(allocate(kObjectBytes),wordOnly);
+  if(bodies_[1]) directory_=Buffer(allocate(kDirectoryBytes),wordOnly);
   if(directory_) logo_=Buffer(allocate(kObjectBytes),wordOnly);
   if(logo_) text_=Buffer(allocate(kTextBytes),wordOnly);
-  if(body_) body_.zero(kObjectBytes);
-  if(directory_) directory_.zero(kDirectoryBytes);
-  if(logo_) logo_.zero(kObjectBytes);
+  body_=bodies_[0];
   if(text_) text_.zero(kTextBytes);
 }
 Core::~Core() {
@@ -154,8 +153,19 @@ Core::~Core() {
   if(text_) release_(text_.allocation());
   if(logo_) release_(logo_.allocation());
   if(directory_) release_(directory_.allocation());
-  if(body_) release_(body_.allocation());
+  for(auto& body:bodies_)if(body)release_(body.allocation());
 }
+void Core::resetBodies(){
+  bodyAssembly_.reset();secondAssembly_.reset();phase_=0;slotPressure_=false;
+  for(auto& r:reception_)r.complete=false;
+}
+void Core::releaseBody(bool decoded){
+  if(decoded)++reception_[decodeSlot_].decoded;
+  else ++stats.invalid;
+  (decodeSlot_?secondAssembly_:bodyAssembly_).reset();
+  reception_[decodeSlot_].complete=false;phase_=0;
+}
+
 void Core::rebuildView() {
   viewCount_=0;
   for(size_t i=0;i<count_;++i) if(cache_[i].context==context_) view_[viewCount_++]=uint8_t(i);
@@ -241,7 +251,7 @@ void Core::activateContext() {
   contexts_[target].used=++useSequence_; limited=contexts_[target].limited;
   rebuildView(); ++revision;
   // A partially decoded object belongs to the previous selection.
-  bodyAssembly_.reset(); phase_=0;
+  resetBodies();
 }
 void Core::clearCache() {
   count_=viewCount_=0; textUsed_=1; text_.set(0,0); logoBytes_=0; logoBearer_=0; limited=false;
@@ -251,7 +261,7 @@ void Core::clearCache() {
 void Core::reset() {
   identityConflict=false; transportSeen_=false; transportTouched_=0; archiveDay_=clockDay_=0; acquisitionTid_=acquisitionSkip_=0; acquisitionAt_=0;
   stats=Stats{}; entryCount_=serviceCount_=0; directoryHash_=0; browseOffset_=0; focus_=0;
-  dirAssembly_.reset(); bodyAssembly_.reset(); phase_=0; clearCache();
+  dirAssembly_.reset();resetBodies();for(auto& r:reception_)r=Reception{};slotHighWater=0;clearCache();
 }
 uint32_t Core::selectionDay(uint64_t bearer,uint32_t utc,int16_t off) const {
   int64_t civil=int64_t(utc)+int32_t(off)*60;
@@ -308,8 +318,13 @@ const Service* Core::station() const { for(size_t i=0;i<serviceCount_;++i) if(se
 bool Core::ambiguous() const { const Service* s=station(); return identityConflict || (s && s->conflict); }
 void Core::expire(uint32_t now) {
   monotonicMs_=now;
-  Assembly* contexts[]={&bodyAssembly_,&dirAssembly_};
-  for(auto a:contexts) if(a->active && uint32_t(now-a->touched)>assemblyTimeoutMs_) { a->reset(); ++stats.timeout; }
+  if(dirAssembly_.active && uint32_t(now-dirAssembly_.touched)>assemblyTimeoutMs_){dirAssembly_.reset();++stats.timeout;}
+  for(unsigned slot=0;slot<2;++slot){auto& a=slot?secondAssembly_:bodyAssembly_;auto& r=reception_[slot];
+    if(!a.active || r.complete || (phase_ && decodeSlot_==slot))continue;
+    const bool idle=uint32_t(now-a.touched)>assemblyTimeoutMs_;
+    const bool stalled=slotPressure_ && uint32_t(now-r.progress)>assemblyTimeoutMs_;
+    if(idle || stalled){a.reset();++stats.timeout;++r.timeouts;if(stalled){++r.evictions;r.reason=2;}else r.reason=1;}
+  }
 }
 bool Core::header(Bytes p, size_t n, Entry& e, size_t& used) const {
   if(n<7) return false;
@@ -347,7 +362,7 @@ bool Core::directory(Bytes p, size_t n) {
   if(pos!=n) return false;
   const uint32_t hash=crc32(p,n);
   if(hash==directoryHash_) return true;
-  directoryHash_=hash; entryCount_=count; serviceCount_=0; bodyAssembly_.reset(); clearCache();
+  directoryHash_=hash; entryCount_=count; serviceCount_=0; resetBodies(); clearCache();
   pos=13+extension;
   for(size_t i=0;i<count;++i) { Entry e; size_t used=0; e.tid=be16(p+pos); header(p+pos+2,n-pos-2,e,used); entries_[i]=e; pos+=2+used; }
   for(size_t i=0;i<count;++i) if(entries_[i].start && !entries_[i].stop)
@@ -448,90 +463,104 @@ const char* availabilityName(Availability state) {
   static const char* const names[]={"NO_SPI","SPI_PRESENT_WAIT_DIR","DIRECTORY_EMPTY","PENDING_IDENTITY","SI_ONLY","PI_DECLARED_LOADING","PI_DATE_STALE","READY_LIVE","IDENTITY_CONFLICT","TIME_UNKNOWN"};
   return names[unsigned(state)];
 }
+bool Core::relevantPI(const Entry& e) const {
+  return selected_ && e.type==7 && e.subtype==1 && e.bearer==selected_ && !ambiguous() &&
+    (!e.start || (int64_t(e.start)+int32_t(e.startLto)*60<int64_t(day_+1)*86400 && (!e.stop || int64_t(e.stop)+int32_t(e.stopLto)*60>int64_t(day_)*86400)));
+}
 uint16_t Core::wanted() {
   if(focus_) return focus_;
-  if(bodyAssembly_.active && uint32_t(monotonicMs_-bodyAssembly_.touched)<=5000U) return bodyAssembly_.tid;
+
   // PI first, but a missing object cannot starve SI/logo on every rotation.
-  // One bounded assembly; after five seconds without completion rotate priority.
+  // This rotates preference only; both RX slots keep their carousel lifetime.
   unsigned best=80;int bestScore=100;
   const Service* s=station();
   for(size_t j=0;j<entryCount_;++j) {
     const size_t i=(j+acquisitionSkip_)%entryCount_;const Entry& e=entries_[i];
     if(e.type&128 || e.size>kObjectBytes || (e.seen && e.epoch==cacheEpoch_)) continue;
     int score=100;
-    if(selected_ && e.type==7 && e.subtype==1 && e.bearer==selected_ && !ambiguous()) {
-      const bool matches=!e.start || (int64_t(e.start)+int32_t(e.startLto)*60<int64_t(day_+1)*86400 && (!e.stop || int64_t(e.stop)+int32_t(e.stopLto)*60>int64_t(day_)*86400));
-      if(matches) score=0;
-    }
+    if(relevantPI(e))score=0;
     if(e.type==7 && e.subtype==0) score=1;
     if(e.type==2 && e.subtype==3 && s && !s->conflict && s->png && !logoSize() && !strcmp(e.name,s->logo)) score=2;
     if(e.tid==acquisitionTid_ && uint32_t(monotonicMs_-acquisitionAt_)>5000U) score=99;
     if(score<bestScore) {best=unsigned(i);bestScore=score;}
   }
   const uint16_t tid=best<entryCount_ && bestScore<99?entries_[best].tid:0;
-  if(!tid && acquisitionTid_) { acquisitionTid_=0; acquisitionAt_=monotonicMs_; acquisitionSkip_=uint16_t((acquisitionSkip_+1)% (entryCount_?entryCount_:1)); bodyAssembly_.reset(); return wanted(); }
+  if(!tid && acquisitionTid_) { acquisitionTid_=0; acquisitionAt_=monotonicMs_; acquisitionSkip_=uint16_t((acquisitionSkip_+1)% (entryCount_?entryCount_:1)); return wanted(); }
   if(tid!=acquisitionTid_) {acquisitionTid_=tid;acquisitionAt_=monotonicMs_;}
   return tid;
 }
 Feed Core::feed(Bytes p, size_t n, uint32_t now) {
-  if(busy()) { ++stats.busy; return Feed::Busy; }
-  monotonicMs_=now;
-  ++stats.frames;
-  GroupEnvelope envelope;const auto checked=inspectGroup(p,n,envelope);
-  if(checked!=GroupCheck::Valid) {
-    if(checked==GroupCheck::Crc)++stats.crcBad;else ++stats.invalid;
-    return Feed::Rejected;
-  }
-  const uint8_t type=envelope.type;const unsigned stream=type==6?1:0;
+  monotonicMs_=now;++stats.frames;
+  GroupEnvelope h;const auto checked=inspectGroup(p,n,h);
+  if(checked!=GroupCheck::Valid){if(checked==GroupCheck::Crc)++stats.crcBad;else ++stats.invalid;return Feed::Rejected;}
+  const uint8_t type=h.type;const unsigned stream=type==6?1:0;
   const uint8_t continuity=p[1]>>4,previous=stats.lastContinuity[stream];
   if(previous!=255 && continuity!=previous && continuity!=((previous+1)&15))++stats.continuityJumps;
-  stats.lastContinuity[stream]=continuity;stats.lastRepetition[stream]=p[1]&15;stats.lastMotRepetition=envelope.repetition;
-  const uint16_t tid=envelope.tid,segment=envelope.segment;
-  const size_t pos=envelope.offset,length=envelope.length;
+  stats.lastContinuity[stream]=continuity;stats.lastRepetition[stream]=p[1]&15;stats.lastMotRepetition=h.repetition;
   transportSeen_=true;transportTouched_=now;
-  Assembly& a=type==6?dirAssembly_:bodyAssembly_;
-  Buffer buffer=type==6?directory_:body_; const size_t cap=type==6?kDirectoryBytes:kObjectBytes;
-  size_t index=0;
-  if(type==4) {
-    while(index<entryCount_ && entries_[index].tid!=tid) ++index;
-    if(index==entryCount_) { ++stats.unmapped; return Feed::Accepted; }
-    if(entries_[index].type&128) { ++stats.unsupported; return Feed::Accepted; }
-    if(entries_[index].size>cap) { ++stats.oversize; return Feed::Accepted; }
-    if(entries_[index].type==7 && entries_[index].subtype==1 && entries_[index].bearer==selected_ &&
-       entries_[index].epoch==cacheEpoch_ && contexts_[context_].haveData) {
-      if(!fresh()) ++revision;
-      contexts_[context_].touched=now;
-    }
-    if(tid!=wanted()) {
-      const Entry& e=entries_[index];const Service* s=station();
-      const bool si=e.type==7 && e.subtype==0;
-      const bool logo=e.type==2 && e.subtype==3 && s && !s->conflict && s->png && !strcmp(s->logo,e.name) && !logoSize();
-      // Consume available metadata while the preferred PI has not begun.
-      if(focus_ || bodyAssembly_.active || (!si && !logo)) return Feed::Accepted;
-    }
-    if(entries_[index].seen && entries_[index].epoch==cacheEpoch_) { ++stats.duplicate; return Feed::Accepted; }
+  if(type==6){
+    if(busy()){++stats.busy;return Feed::Busy;}
+    if(dirAssembly_.active && dirAssembly_.tid!=h.tid){dirAssembly_.reset();++stats.incomplete;}
+    const int result=dirAssembly_.add(h.tid,h.segment&32767,(h.segment&32768)!=0,p+h.offset,uint16_t(h.length),directory_,kDirectoryBytes,now,stats);
+    if(result<0)return Feed::Rejected;
+    if(!result)return Feed::Accepted;
+    const bool ok=directory(directory_,dirAssembly_.size());dirAssembly_.reset();
+    if(!ok){++stats.invalid;return Feed::Rejected;}return Feed::Accepted;
   }
-  const int result=a.add(tid,segment&32767,(segment&32768)!=0,p+pos,uint16_t(length),buffer,cap,now,stats);
-  if(result<0) return Feed::Rejected;
-  if(!result) return Feed::Accepted;
-  const size_t size=a.size();
-  if(type==6) { if(!directory(buffer,size)) { ++stats.invalid; a.reset(); return Feed::Rejected; } a.reset(); return Feed::Accepted; }
-  if(size!=entries_[index].size) { ++stats.invalid; a.reset(); return Feed::Rejected; }
-  objectIndex_=uint16_t(index); objectLength_=size; a.reset();
+  size_t index=0;while(index<entryCount_ && entries_[index].tid!=h.tid)++index;
+  if(index==entryCount_){++stats.unmapped;return Feed::Accepted;}
   Entry& e=entries_[index];
-  if(e.type==2 && e.subtype==3) {
-    if(!pngValid(body_,size)) { ++stats.invalid; return Feed::Rejected; }
-    if(!e.seen) { ++stats.png; ++stats.objects; if(observer.object) observer.object(observer.user,e.tid,4,body_,size); }
-    e.seen=true; e.epoch=cacheEpoch_;
-    const Service* s=station();
-    if(s && !s->conflict && s->png && !strcmp(s->logo,e.name)) { logo_.write(0,body_,size); logoBytes_=size; logoBearer_=selected_; ++revision; }
+  if(e.type&128){++stats.unsupported;return Feed::Accepted;}
+  if(e.size>kObjectBytes){++stats.oversize;return Feed::Accepted;}
+  if(e.seen && e.epoch==cacheEpoch_){
+    ++stats.duplicate;
+    if(e.type==7 && e.subtype==1 && e.bearer==selected_ && contexts_[context_].haveData){if(!fresh())++revision;contexts_[context_].touched=now;}
     return Feed::Accepted;
   }
-  if(e.type!=7 || e.subtype>1 || body_[0]!=(e.subtype==0?3:2)) { ++stats.invalid; return Feed::Rejected; }
-  for(auto& token:tokens_) token=Token{};
-  phase_=1; position_=0; depth_=0; rootService_=body_[0]==3;
+  const Service* service=station();
+  const bool pi=relevantPI(e);
+  const bool si=e.type==7 && e.subtype==0;
+  const bool png=e.type==2 && e.subtype==3 && service && !service->conflict && service->png && !logoSize() && !strcmp(service->logo,e.name);
+  if((focus_ && focus_!=h.tid) || (!focus_ && !pi && !si && !png))return Feed::Accepted;
+  int slot=-1;
+  for(unsigned i=0;i<2;++i)if(assembly(i).active && assembly(i).tid==h.tid)slot=int(i);
+  if(slot>=0 && phase_ && decodeSlot_==unsigned(slot)){++stats.busy;return Feed::Busy;}
+  if(slot<0){
+    // Reserve room for selected PI while permitting one independent metadata RX.
+    unsigned occupied=0;bool piActive=false;
+    for(unsigned i=0;i<2;++i)if(assembly(i).active){++occupied;const auto& x=entries_[reception_[i].index];if(x.type==7 && x.subtype==1)piActive=true;}
+    bool piPending=false;
+    for(size_t i=0;i<entryCount_;++i)if(relevantPI(entries_[i]) && !(entries_[i].seen && entries_[i].epoch==cacheEpoch_))piPending=true;
+    if(!(occupied==1 && !pi && !piActive && piPending && !focus_))
+      for(unsigned i=0;i<2;++i)if(!assembly(i).active){slot=int(i);break;}
+    if(slot<0){slotPressure_=true;for(auto& r:reception_)++r.skipped;return Feed::Accepted;}
+    auto& r=reception_[slot];if(r.tid!=h.tid)r=Reception{};r.tid=h.tid;r.index=uint16_t(index);r.first=r.progress=now;r.maxGap=0;r.reason=0;++r.started;
+    if(occupied+1>slotHighWater)slotHighWater=uint8_t(occupied+1);
+  }
+  auto& a=slot?secondAssembly_:bodyAssembly_;auto& r=reception_[slot];++r.rx;
+  const auto mask=a.mask;const uint32_t prior=a.touched;
+  const int result=a.add(h.tid,h.segment&32767,(h.segment&32768)!=0,p+h.offset,uint16_t(h.length),bodies_[slot],kObjectBytes,now,stats);
+  if(result<0)return Feed::Rejected;
+  if(prior && uint32_t(now-prior)>r.maxGap)r.maxGap=now-prior;
+  if(a.mask==mask)++r.duplicates;else r.progress=now;
+  if(result==1){if(a.size()!=e.size){a.reset();++stats.invalid;return Feed::Rejected;}r.complete=true;++r.received;if(!phase_)startBody(unsigned(slot));}
   return Feed::Accepted;
 }
+void Core::startBody(unsigned slot){
+  decodeSlot_=uint8_t(slot);auto& r=reception_[slot];body_=bodies_[slot];objectIndex_=r.index;
+  objectLength_=assembly(slot).size();Entry& e=entries_[objectIndex_];
+  if(e.type==2 && e.subtype==3){
+    if(!pngValid(body_,objectLength_)){releaseBody(false);return;}
+    if(!e.seen){++stats.png;++stats.objects;if(observer.object)observer.object(observer.user,e.tid,4,body_,objectLength_);}
+    e.seen=true;e.epoch=cacheEpoch_;const Service* service=station();
+    if(service && !service->conflict && service->png && !strcmp(service->logo,e.name)){logo_.write(0,body_,objectLength_);logoBytes_=objectLength_;logoBearer_=selected_;++revision;}
+    releaseBody(true);return;
+  }
+  if(e.type!=7 || e.subtype>1 || body_[0]!=(e.subtype==0?3:2)){releaseBody(false);return;}
+  for(auto& token:tokens_)token=Token{};
+  phase_=1;position_=0;depth_=0;rootService_=body_[0]==3;
+}
+
 bool Core::text(Bytes p,size_t n,char* out,size_t capacity) {
   size_t used=out?strlen(out):0; bool truncated=false;
   for(size_t i=0;i<n;) {
@@ -673,14 +702,17 @@ void Core::completeObject() {
     if(!fresh()) ++revision;
     contexts_[context_].haveData=true; contexts_[context_].touched=monotonicMs_;
   }
+  releaseBody(true);
 }
 void Core::pump(unsigned budget) {
+  if(!budget)return;
+  if(!phase_)for(unsigned i=0;i<2;++i)if(reception_[i].complete){startBody(i);break;}
   while(phase_ && budget--) {
     if(depth_ && position_==stack_[depth_-1].end) {
       if(phase_==2) close(stack_[depth_-1].tag);
       --depth_;
       if(!depth_) {
-        if(position_!=objectLength_) { ++stats.invalid; phase_=0; return; }
+        if(position_!=objectLength_) { releaseBody(false); return; }
         if(phase_==2) { completeObject(); return; }
         phase_=2; position_=0; scope_=defaultScope_=0; programmeDepth_=0;
         for(auto& token:tokens_) token=Token{};
@@ -689,25 +721,25 @@ void Core::pump(unsigned budget) {
     }
     uint8_t tag=0; size_t start=0,end=0;
     const size_t limit=depth_?stack_[depth_-1].end:objectLength_;
-    if(!tlv(body_,limit,position_,tag,start,end) || (!depth_ && end!=objectLength_)) { ++stats.invalid; phase_=0; return; }
+    if(!tlv(body_,limit,position_,tag,start,end) || (!depth_ && end!=objectLength_)) { releaseBody(false); return; }
     const uint8_t parent=depth_?stack_[depth_-1].tag:0;
     position_=end;
     if(tag==4) {
       size_t pos=start; uint32_t tokenMask=0;
       while(pos<end) {
-        if(pos+2>end) { ++stats.invalid; phase_=0; return; }
+        if(pos+2>end) { releaseBody(false); return; }
         const uint8_t key=body_[pos++], length=body_[pos++];
-        if(!key || key>=20 || key==9 || key==10 || key==13 || !length || length>end-pos || (tokenMask&(uint32_t(1)<<key))) { ++stats.invalid; phase_=0; return; }
+        if(!key || key>=20 || key==9 || key==10 || key==13 || !length || length>end-pos || (tokenMask&(uint32_t(1)<<key))) { releaseBody(false); return; }
         tokenMask|=uint32_t(1)<<key;
-        for(unsigned j=0;j<length;++j) if(body_[pos+j]<32 && body_[pos+j]!=9 && body_[pos+j]!=10 && body_[pos+j]!=13) { ++stats.invalid; phase_=0; return; }
-        if(!text(body_+pos,length,nullptr,0)) { ++stats.invalid; phase_=0; return; }
+        for(unsigned j=0;j<length;++j) if(body_[pos+j]<32 && body_[pos+j]!=9 && body_[pos+j]!=10 && body_[pos+j]!=13) { releaseBody(false); return; }
+        if(!text(body_+pos,length,nullptr,0)) { releaseBody(false); return; }
         tokens_[key].offset=uint16_t(pos); tokens_[key].length=length;
         pos+=length;
       }
     } else if(tag>=128) {
       if(phase_==2 && depth_) attribute(tag,body_+start,end-start);
     } else if(tag==1) {
-      if(phase_==1 && !text(body_+start,end-start,nullptr,0)) { ++stats.invalid; phase_=0; return; }
+      if(phase_==1 && !text(body_+start,end-start,nullptr,0)) { releaseBody(false); return; }
       if(phase_==2) {
         Programme& p=programme_[programmeDepth_==2?1:0];
         char* dest=nullptr; size_t cap=0;
@@ -717,12 +749,12 @@ void Core::pump(unsigned budget) {
         else if(parent==0x11) { dest=p.medium; cap=sizeof(p.medium); }
         else if(parent==0x12) { dest=p.name; cap=sizeof(p.name); }
         else if(parent==0x1a || parent==0x1b) { dest=p.description; cap=sizeof(p.description); }
-        if(dest && !text(body_+start,end-start,dest,cap)) { ++stats.invalid; phase_=0; return; }
+        if(dest && !text(body_+start,end-start,dest,cap)) { releaseBody(false); return; }
       }
     } else if(tag==5) {
       if(phase_==2) { defaultScope_=0; bearerValue(body_+start,end-start,defaultScope_); scope_=defaultScope_; }
     } else if(container(tag)) {
-      if(depth_==24) { ++stats.invalid; phase_=0; return; }
+      if(depth_==24) { releaseBody(false); return; }
       stack_[depth_++]={end,tag}; position_=start;
       if(phase_==2) {
         if(tag==0x21) scope_=defaultScope_;
