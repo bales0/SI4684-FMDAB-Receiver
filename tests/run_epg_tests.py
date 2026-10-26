@@ -34,6 +34,10 @@ run('compile scheduler',[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-p
 run('scheduler',[str(out/'scheduler.exe')])
 run('DAB packet runtime',[sys.executable,'tests/test_dab_packet_runtime.py',a.compiler])
 run('DAB receive health',[sys.executable,'tests/test_dab_receive_health.py',a.compiler])
+run('compile DSRV loss diagnostics',[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_dab_loss_diag.cpp','-o',str(out/'loss_diag.exe')])
+run('DSRV loss diagnostics',[str(out/'loss_diag.exe')])
+run('compile DSRV preserved reply',[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_dab_dsrv_header.cpp','-o',str(out/'dsrv_header.exe')])
+run('DSRV preserved reply',[str(out/'dsrv_header.exe')])
 run('X-PAD config/diagnostics',[sys.executable,'tests/test_dab_xpad_integration.py',a.compiler])
 for name in ['live','multitid','priority','runtime','ui','transport','coexistence','synthetic_paths','synthetic_uart','storage','png_adam7']+([] if a.skip_pc else ['pc']):
  run(name,[sys.executable,'tests/test_epg_'+name+'.py',a.compiler])

@@ -1,10 +1,47 @@
 #include "../src/vendor/si468x/Si468x.h"
 #include "../src/dab_spi_probe.h"
+#include "../src/dab_receive_health.h"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
 
+
+struct PreservedWire {
+ uint8_t reply[51]={};uint32_t now=0;unsigned commands=0,reads=0,callbacks=0;
+ bool queued=true,failRead=false;dab_health::Dsrv pending;
+ static bool write(void* ctx,uint8_t cmd,const uint8_t* args,uint16_t n){
+  auto& w=*static_cast<PreservedWire*>(ctx);assert(cmd==0x84 && n==1 && *args==1);++w.commands;
+  memset(w.reply,0,sizeof w.reply);w.reply[0]=0x80;
+  if(w.queued){w.reply[18]=27;w.reply[7]=60;w.reply[24]=0x36;w.reply[25]=0;w.queued=false;}
+  return true;
+ }
+ static bool read(void* ctx,uint8_t* p,uint16_t n){auto& w=*static_cast<PreservedWire*>(ctx);++w.reads;if(w.failRead)return false;assert(n<=sizeof w.reply);memcpy(p,w.reply,n);return true;}
+ static uint32_t time(void* ctx){return static_cast<PreservedWire*>(ctx)->now;}
+ static void status(void* ctx,const si468x::Status& s){auto& w=*static_cast<PreservedWire*>(ctx);++w.callbacks;w.pending.status(s.dsrvInt());}
+};
+static void preservedReplyTest(){
+ using namespace si468x;PreservedWire w;HostInterface host;host.context=&w;host.writeCommand=PreservedWire::write;host.readReply=PreservedWire::read;host.timeUs=PreservedWire::time;
+ Si468x chip(host);chip.setStatusCallback(PreservedWire::status,&w);
+ uint8_t header[24],full[51],ack=1;w.pending.status(true);w.pending.start(0);
+ assert(chip.startCommand(Command::GET_DIGITAL_SERVICE_DATA,&ack,1,header,24,100000)==Result::Pending);
+ assert(chip.startCommand(Command::GET_DIGITAL_SERVICE_DATA,&ack,1,header,24,100000)==Result::Busy);
+ assert(chip.service()==Result::Ok);assert(chip.readCurrentReply(full,51)==Result::Ok && w.commands==1);
+ uint8_t copy[51];memcpy(copy,full,51);assert(chip.readCurrentReply(full,51)==Result::Ok && !memcmp(full,copy,51) && w.commands==1);
+ w.pending.finish(1,0,27,true);assert(!w.pending.pending); // no new event -> no second GET
+ assert(w.callbacks>=3); // header/full read both call status callback
+ // A new event can deliver exactly the same content in a different transaction.
+ w.queued=true;w.pending.status(true);w.pending.start(2);
+ assert(chip.startCommand(Command::GET_DIGITAL_SERVICE_DATA,&ack,1,header,24,100000)==Result::Pending && chip.service()==Result::Ok);
+ assert(chip.readCurrentReply(full,51)==Result::Ok && !memcmp(full,copy,51) && w.commands==2);
+ w.failRead=true;assert(chip.readCurrentReply(full,51)==Result::TransportError);
+ w.failRead=false;w.pending.status(true);w.pending.start(3);
+ assert(chip.startCommand(Command::GET_DIGITAL_SERVICE_DATA,&ack,1,header,24,100000)==Result::Pending && chip.service()==Result::Ok);
+ DsrvHeader h;assert(Si468x::parseDsrvHeader(header,24,h)==Result::Ok && h.byteCount==0);
+ w.pending.finish(4,0,0,true);assert(!w.pending.pending && w.commands==3);
+ std::puts("Actual vendor preserved reply: header/full callbacks, repeat reads vs new GET, Busy, read transport error, empty drain ACK: PASS");
+}
 int main() {
+ preservedReplyTest();
   // Synthetic parser fixtures, not evidence of firmware UATYPE support.
   const uint16_t rawValues[] = {0, 2, 7, 0xABCD};
   const dab_probe::Endpoint audio(0x2FD9, 0x01FE002A, true);

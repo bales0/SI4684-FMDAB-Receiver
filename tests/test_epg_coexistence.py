@@ -54,6 +54,7 @@ struct DAB {
  void logEpgTransportPage(uint8_t);
  uint8_t dabRequestedFrequency=24;dab_diag::XpadReadback dabXpad;unsigned diagDabCtsTimeoutCount=0;
  uint32_t getFreq(uint8_t){return 216928;}
+ uint32_t dabGeneration=1;si468x::Result readDsrvPayload(uint16_t);
  void getServiceData(){++legacy;}
 };
 DAB radio;
@@ -247,7 +248,7 @@ int main(int argc,char** argv){
 }
 '''
 
-source=out/'coexistence.cpp';source.write_text(prefix+runtime+'\n'+method('void DAB::logEpgTransportPage(uint8_t page)')+'\n'+method('dab_spi::Identity DAB::xpadSpiIdentity(void) const')+'\n'+method('bool DAB::xpadSpiPresent(void) const')+'\n'+method('void DAB::refreshDabSpiDiscovery(void)')+'\nvoid DAB::dsrv(){switch(DabCommand::DsrvHeader){\n'+case+'default:break;}}\n'+fixture+main,encoding='utf-8')
+source=out/'coexistence.cpp';source.write_text(prefix+runtime+'\n'+method('si468x::Result DAB::readDsrvPayload(uint16_t length)')+'\n'+method('void DAB::logEpgTransportPage(uint8_t page)')+'\n'+method('dab_spi::Identity DAB::xpadSpiIdentity(void) const')+'\n'+method('bool DAB::xpadSpiPresent(void) const')+'\n'+method('void DAB::refreshDabSpiDiscovery(void)')+'\nvoid DAB::dsrv(){switch(DabCommand::DsrvHeader){\n'+case+'default:break;}}\n'+fixture+main,encoding='utf-8')
 exe=out/'coexistence.exe'
 subprocess.run([sys.argv[1] if len(sys.argv)>1 else 'C:/msys64/ucrt64/bin/g++.exe','-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(ROOT/'src'),str(source),str(ROOT/'src/epg_core.cpp'),str(ROOT/'src/epg_uart.cpp'),'-o',str(exe)],check=True)
 result=subprocess.run([str(exe),str(ROOT/'tests/fixtures/epg/synthetic_programme_groups_v2.bin'),str(ROOT/'tests/fixtures/epg/mux11a_empty_group.bin'),str(ROOT/'tests/fixtures/epg/synthetic_logo_1_groups_v2.bin')],capture_output=True,text=True)

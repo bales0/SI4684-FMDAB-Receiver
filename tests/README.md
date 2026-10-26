@@ -544,3 +544,27 @@ in `run_epg_tests.py`. The UART arena bound is now 64 KiB for the approved extra
 12 KiB RX block; capability-pool reserve and six-allocation rollback checks
 remain enforced. The input fixture files and their hashes are unchanged.
 For physical acceptance, use [the English RF guide](../docs/SI4684_RX_RF_TEST_EN.md).
+
+## DSRV/SLS loss instrumentation (26 October 2026)
+
+The runner includes `test_dab_loss_diag.cpp` (saturating interval/total counters,
+CTS decomposition, histogram, all 256 missing bits, LAST uncertainty, rollover,
+transaction vs payload identity and bounded quiet output), and
+`test_dab_dsrv_header.cpp` (actual vendor header/full-read callbacks, preserved
+reply, Busy, transport failure and empty ACK).
+
+`test_dab_receive_health.py` compiles actual getServiceData/collector methods:
+30/34 segments, 452/464-byte LAST, one/multiple absent segments, missing LAST,
+CRC vs absent, duplicates/conflicts, NEW_HEADER/NEW_SEG0, timeout/reset and full
+read faults. `test_epg_transport.py` compiles the actual A–D setter and packet
+START/STOP submission branches, tests pending START/STOP cleanup and return A,
+shared ownership refusal, C reading without parser, and retained PAD/audio state.
+`test_epg_coexistence.py` retains the complete DSRV dispatch/real Core ownership
+checks with valid repeated empty 16-byte Directory and IRQ during full read.
+`test_scheduler.cpp` covers the unchanged four-command burst policy.
+
+`analyze_dab_loss_logs.py ZIP` reconstructs old log intervals/closed objects;
+external RF logs are optional and are not used as host-test fixtures. The new
+hardware A/B test and all field meanings are in
+[the diagnostic report](../docs/SI4684_DSRV_SLS_DIAGNOSTICS_2026-10-26.md).
+Host success cannot establish real RF delivery or audible continuity.

@@ -154,3 +154,18 @@ and adequate measured heap/stack. Record each unavailable or unperformed case
 as NOT TESTED. Disable DEBUG after collecting the observations.
 
 For exact UART field meanings, see [Serial_protocol.md](../Serial_protocol.md).
+
+## MUX 11A DSRV/SLS A/B diagnostics (26 October 2026)
+
+Use the same build/location/antenna and a fresh ESP32 boot per variant.
+After stable 11A PR Trójka packet reception, send `DSRV MODE A`, B, C or D
+(one variant per run); `DSRV STATUS` confirms the actual packet owner state.
+B must reach probe=0 after packet-only STOP; return A must reach probe=4 after
+START. C must keep full reads while parseSkipped rises. D keeps aggregates with
+normal DEBUG off. Collect at least 20 closed SLS TIDs per variant and repeat on
+11B as control. Record audio observations, boot reasons, RF quality, rate/queue
+and per-TID loss masks. Exclude mixed epochs and dropped diagnostic evidence.
+
+The exact commands, field definitions, interpretation limits and complete
+procedure are in [the DSRV/SLS report](SI4684_DSRV_SLS_DIAGNOSTICS_2026-10-26.md).
+This procedure does not authorize firmware flashing or NVS changes.

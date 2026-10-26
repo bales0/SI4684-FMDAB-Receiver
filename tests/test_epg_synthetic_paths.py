@@ -10,6 +10,7 @@ radio=(ROOT/'src/si4684.cpp').read_text(encoding='utf-8')
 # Reuse the existing radio mock shell, but use real DSRV parsing and EPG decode.
 tree=ast.parse((ROOT/'tests/test_epg_transport.py').read_text(encoding='utf-8'))
 prefix=next(ast.literal_eval(node.value) for node in tree.body if isinstance(node,ast.Assign) and any(isinstance(x,ast.Name) and x.id=='prefix' for x in node.targets))
+prefix=prefix.replace('enum class DabCommand{SpiProbeStart,SpiProbeStop};','enum class DabCommand{None,ComponentInfo,SpiProbeStart,SpiProbeStop};')
 prefix=prefix.replace('#include "dab_spi_probe.h"','#include "epg_core.h"\n#include "vendor/si468x/Si468x.h"\n#include <string>\n#include <fstream>\n#include "dab_spi_probe.h"')
 prefix=prefix.replace('namespace si468x { enum class Result{Ok,Timeout}; struct DsrvHeader{unsigned byteCount=0,dataSource=0;}; }','')
 prefix='\n'.join(line for line in prefix.splitlines() if not line.startswith(('static bool epgContinuous=', 'static void discard(')))
@@ -59,11 +60,12 @@ prefix=prefix.replace('bool xpadSpiPresent() const{return xpadConfirmed;}',r'''
  dab_spi::Identity dabSpiIdentities[1]={dab_spi::Identity::NotSpi};
  uint16_t dabUaComponentCount=1;
  uint8_t dabUaServiceCount=1;
- enum class DabCommand {None,ComponentInfo};DabCommand dabCommand=DabCommand::None;
+ DabCommand dabCommand=DabCommand::None;
  dab_spi::Scan dabUaScan;
  dab_spi::Identity xpadSpiIdentity(void) const;
  bool xpadSpiPresent(void) const;
 ''')
+prefix=prefix.replace(' DabCommand dabCommand=DabCommand::None;','').replace('enum class DabCommand{None,ComponentInfo,SpiProbeStart,SpiProbeStop};','enum class DabCommand{None,ComponentInfo,SpiProbeStart,SpiProbeStop};DabCommand dabCommand=DabCommand::None;')
 a=radio.index('      if (header.byteCount > 0U)',radio.index('case DabCommand::DsrvHeader:'))
 b=radio.index('      dabDsrvPending =',a)
 payload=radio[a:b]
@@ -106,7 +108,7 @@ static dab_probe::Route inject(DAB& radio,const Data& data,unsigned source,uint3
  const dab_probe::Endpoint audio(radio.dabActiveServiceId,radio.dabActiveComponentId),sls;
  const auto target=dab_probe::route(sid,cid,uint8_t(source),audio,sls,radio.dabSpiProbe.spi);
  const bool legacy=dab_probe::feedLegacyDecoder(target,radio.dabSpiProbe.spi.valid,true);
- ++clockMs;radio.handle(header,target,legacy);return target;
+ ++clockMs;std::memcpy(SPIbuffer+1,chip.wire.data(),24);radio.handle(header,target,legacy);return target;
 }
 static void reset(){epg::syntheticCore.reset();epg::syntheticCore.select(base+1,today+3660,0);epg::payloadCalls=0;epg::lastFeed=epg::Feed::Accepted;}
 int main(int argc,char** argv){
@@ -180,7 +182,10 @@ int main(int argc,char** argv){
  std::puts("SLS/DLS/foreign PAD isolation: PASS (legacy hand-off only, not legacy content decoding)");
 }
 '''
-cpp=out/'paths.cpp';cpp.write_text(prefix+pad_query+'\nvoid DAB::handle(const si468x::DsrvHeader& header,dab_probe::Route target,bool feedLegacy){\n'+payload+'}\n'+fixture+suffix,encoding='utf-8')
+cpp=out/'paths.cpp';a=radio.index('si468x::Result DAB::readDsrvPayload(uint16_t length) {');b=radio.index('{',a)+1;depth=1
+while depth:depth+=(radio[b]=='{')-(radio[b]=='}');b+=1
+read_method=radio[a:b]
+cpp.write_text(prefix+read_method+'\n'+pad_query+'\nvoid DAB::handle(const si468x::DsrvHeader& header,dab_probe::Route target,bool feedLegacy){\n'+payload+'}\n'+fixture+suffix,encoding='utf-8')
 compiler=sys.argv[1] if len(sys.argv)>1 else 'C:/msys64/ucrt64/bin/g++.exe'
 exe=out/'paths.exe'
 subprocess.run([compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(ROOT/'src'),str(cpp),str(ROOT/'src/epg_core.cpp'),'-o',str(exe)],check=True)

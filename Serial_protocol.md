@@ -40,7 +40,8 @@ Updated for the locally tested firmware on 24 October 2026.
 | `[` | diagnostic text outside the control protocol |
 | `EPG ` | EPG command replies, ACK/NACK, status and object diagnostics |
 
-Lines beginning with `[` may appear when diagnostics are enabled. A structured
+Lines beginning with `[` may appear when diagnostics are enabled; the boot
+reset-reason line is emitted even with diagnostics disabled. A structured
 protocol monitor must ignore them.
 
 ## Opening and closing a connection
@@ -196,6 +197,61 @@ or:
 ```
 
 Disabling normal diagnostics also disables verbose slideshow diagnostics.
+
+### Restart and RF diagnostics (26 October 2026)
+
+Every boot emits `[BOOT] reset reason=N (NAME)` even with DEBUG disabled.
+Names distinguish POWERON, EXTERNAL, SOFTWARE, PANIC, INTERRUPT_WATCHDOG,
+TASK_WATCHDOG, OTHER_WATCHDOG, DEEP_SLEEP_WAKE, BROWNOUT and SDIO; unrecognized
+reasons use UNKNOWN. This is the ESP32 reset reason. A tuner cold recovery is
+reported separately by the existing `[DAB/WATCHDOG]` / `[DAB/STALL]` diagnostics.
+The reset category alone does not identify the exact faulty code or component.
+
+With `DEBUG` ON, a best-effort `[DAB/RF]` or `[FM/RF]` line appears every 5 s
+when at least 512 bytes of diagnostic queue space are available. `upMs` is
+uptime in milliseconds (wraps after about 49.7 days). Values come from cached
+status replies; logging performs no additional tuner transaction.
+
+- `RSSIx10` is RSSI in tenths of dBuV (divide by 10); CNR/SNR are in dB.
+- DAB `FIC` is quality in percent; `lock` is valid AND acquired. `sample` is
+  the RF sample generation: an unchanged value means no new parsed RF reply.
+- DAB `requestedKhz` is the requested channel, `tune` indicates pending tuning.
+  Cached metrics during tuning must not be attributed to the new channel.
+- DAB `SLS` is slideshow signalling, `completedTID` the last completed MOT transport ID (zero if unknown),
+  `bytes=received/expected` the collector progress and `ready` image availability.
+  An unknown expected size is zero; completedTID does not identify the partial object.
+- DAB `heap`/`minHeap` are current/minimum free heap bytes. Compare progress
+  stalls with lock/FIC/CNR, existing CTS/overflow counters and `[SERIAL] dropped`.
+- FM `khz`, `valid`, `SNR` and `multipath` describe the cached FM status;
+  multipath is the filtered percentage used by the UI.
+
+Enable `DEBUG` before collecting the failure log and keep the monitor open
+across a restart to capture the boot reason and any ESP32 panic/backtrace.
+`DEBUG SLSV` is not required for these summaries.
+
+### `DSRV MODE A|B|C|D` and `DSRV STATUS`
+
+Temporary RAM-only loss-diagnostics experiment, available without ENABLE.
+A is normal packet parsing with DEBUG on; B requests STOP of the separately
+owned packet SPI service while keeping audio/PAD/SLS; C drains packet replies
+but omits packet EPG Core parsing; D is normal reception with ordinary DEBUG
+and verbose off, retaining bounded aggregates. No setting is written to NVS.
+
+`[DSRV/MODE] requested=B result=ACCEPTED probe=5` acknowledges a request, not
+completed hardware STOP. Use `DSRV STATUS` to verify mode B/probe 0 (Idle), then
+mode A/probe 4 (Observing) after return. Shared/missing packet ownership, FM,
+replay or cleanup failure can return UNSUPPORTED. In-flight START/STOP uses the
+existing owner cleanup sequence. A/C/D restore automatic production acquisition.
+
+`[DSRV/RATE]`, `[DSRV/CMD]`, `[DSRV/QUEUE]` and `[DSRV/PATH]` report frozen
+30 s interval and cumulative evidence, paced at most once per 100 ms with UART
+headroom. `[SLS/LOSS]` and `[SLS/PATH]` describe completed/abandoned collectors,
+including a full missing-segment bitmap. Missing LAST means a lower bound, not
+an invented total. Counters saturate; lost diagnostic records are counted.
+`mixed=1` marks a rate interval crossing mode changes. Use a fresh boot for each
+variant and at least 20 closed TIDs; new hardware measurements remain required.
+
+See [field definitions, evidence and complete A/B hardware procedure](docs/SI4684_DSRV_SLS_DIAGNOSTICS_2026-10-26.md).
 
 ### `DEBUG SLSV` or `DEBUG VERBOSE`
 

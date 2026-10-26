@@ -1,4 +1,5 @@
 #include "src/epg_runtime.h"
+#include "src/dab_loss_diag_output.h"
 #include "src/epg_ui.h"
 // SI4684 DAB/FM Receiver - main Arduino sketch.
 //
@@ -1273,6 +1274,23 @@ static bool buttonEdge(uint8_t pin, bool& armed) {
   return true;
 }
 
+// Keep the numeric ESP-IDF reason for tooling and a readable name for UART logs.
+static const char* ResetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXTERNAL";
+    case ESP_RST_SW: return "SOFTWARE";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INTERRUPT_WATCHDOG";
+    case ESP_RST_TASK_WDT: return "TASK_WATCHDOG";
+    case ESP_RST_WDT: return "OTHER_WATCHDOG";
+    case ESP_RST_DEEPSLEEP: return "DEEP_SLEEP_WAKE";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "UNKNOWN";
+  }
+}
+
 // One-shot initialisation called by the Arduino framework after boot.
 // Order matters: Serial → GPIO drive → NVS → audio → display → radio →
 // menu state → encoders.
@@ -1302,7 +1320,10 @@ void setup(void) {
   DIAG_PRINTLN("==================================================");
   DIAG_PRINTLN("SI4684 FM/DAB DIAGNOSTIC BOOT");
   DIAG_PRINTLN("==================================================");
-  DIAG_PRINTF("[BOOT] reset reason=%d\n", static_cast<int>(esp_reset_reason()));
+  // Always visible, including with DEBUG disabled after an unexpected reset.
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  diagSerial.printf("[BOOT] reset reason=%d (%s)\n",
+                    static_cast<int>(resetReason), ResetReasonName(resetReason));
   DIAG_PRINTF("[BOOT] free heap=%u min free heap=%u\n",
                 ESP.getFreeHeap(), ESP.getMinFreeHeap());
   DIAG_PRINTLN("[BOOT] setup() entered");
@@ -1768,6 +1789,17 @@ void loop(void) {
   ProcessDabFullScan();
   Communication();
   epg::poll();
+  // Stack high-water scanning and heap queries belong to the 30 s summary,
+  // never to every radio pump. The reporter itself only enqueues paced lines.
+  static uint32_t diagHealthAt=0,diagHeap=0,diagMinHeap=0,diagStack=0;
+  const uint32_t diagNow=millis();
+  if((diagnosticDebug || dab_loss::evidence().experiment) && uint32_t(diagNow-diagHealthAt)>=30000U){
+    diagHealthAt=diagNow;diagHeap=ESP.getFreeHeap();diagMinHeap=ESP.getMinFreeHeap();
+    diagStack=uxTaskGetStackHighWaterMark(nullptr);
+  }
+  dab_loss::service(diagSerial,diagNow,diagnosticDebug,unsigned(radio.spiProbeState()),
+      diagSerial.droppedBytes(),diagHeap,diagMinHeap,diagStack,
+      radio.getRSSI(),radio.cnr,radio.fic,radio.signallock);
   diagSerial.service(64U);
   if (displayreset) ShowTuneModeCurrent();
   displayreset = false;
@@ -1779,6 +1811,30 @@ void loop(void) {
   if (memoryIntegrityNow - memoryIntegrityTimer >= 60000UL) {
     memoryIntegrityTimer = memoryIntegrityNow;
     LogMemoryIntegrity("runtime");
+  }
+
+  // Cached metrics only: logging must not issue SPI commands or delay DSRV.
+  // Fixed pacing and queue headroom keep diagnostics from flooding the UART.
+  static uint32_t rfDiagnosticsTimer = 0;
+  if (diagnosticDebug && memoryIntegrityNow - rfDiagnosticsTimer >= 5000UL &&
+      diagSerial.availableForWrite() >= 512) {
+    rfDiagnosticsTimer = memoryIntegrityNow;
+    if (radioMode == RADIO_MODE_DAB) {
+      DIAG_PRINTF("[DAB/RF] upMs=%u requestedKhz=%u tune=%u sample=%u lock=%u RSSIx10=%d CNR=%u FIC=%u SLS=%u completedTID=%u bytes=%u/%u ready=%u heap=%u minHeap=%u\n",
+                  unsigned(memoryIntegrityNow), unsigned(radio.getFreq(dabfreq)),
+                  radio.isTunePending(), unsigned(radio.signalSampleGeneration()),
+                  radio.signallock, int(radio.getRSSI()), unsigned(radio.cnr),
+                  unsigned(radio.fic), radio.slideshowSignalled(),
+                  unsigned(radio.slideshowTransportId()),
+                  unsigned(radio.slideshowReceivedBytes()),
+                  unsigned(radio.slideshowExpectedBytes()), radio.SlideShowAvailable,
+                  unsigned(ESP.getFreeHeap()), unsigned(ESP.getMinFreeHeap()));
+    } else {
+      DIAG_PRINTF("[FM/RF] upMs=%u khz=%u tune=%u valid=%u RSSIx10=%d SNR=%d multipath=%u\n",
+                  unsigned(memoryIntegrityNow), unsigned(radio.getFreq(0)),
+                  radio.isTunePending(), radio.fmValid, int(radio.getRSSI()),
+                  int(radio.fmSnr), unsigned(radio.fmMultipath));
+    }
   }
 
   static uint32_t serialDiagnosticsTimer = 0;

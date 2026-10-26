@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "dab_loss_diag.h"
 namespace dab_health {
 inline void count(uint32_t& value){if(value!=UINT32_MAX)++value;}
 enum class Stall : uint8_t { None, CtsGenuine, CtsNoProgress, Transport };

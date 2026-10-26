@@ -29,7 +29,8 @@ void quiet(const char*,...){}
 #define DIAG_PRINTLN(...) quiet(__VA_ARGS__)
 static dab_health::Watchdog dabProgress;
 static dab_health::Stall dabStallReason=dab_health::Stall::None;
-static bool payloadReached=false;
+static bool payloadReached=false,diagnosticDebug=false;
+static uint32_t diagDabStaleMotCount=0;
 static uint32_t diagDabCommandErrorCount=0,diagDabRecoveryRequestCount=0,diagDabHostStarvationCount=0,diagDabHostStarvationMaxGapUs=0,diagDabCtsTimeoutCount=0,diagDabGenuineCtsTimeoutCount=0;
 struct Chip{si468x::Result result=si468x::Result::Timeout;unsigned gap=8500,headerCount=0;si468x::Result readCurrentReply(uint8_t* p,uint16_t){p[18]=uint8_t(headerCount);p[19]=uint8_t(headerCount>>8);return result;}si468x::Result lastResult(){return result;}unsigned lastServiceGapUs(){return gap;}}chip;
 void finishCommandDiagnostics(si468x::Result){}
@@ -37,10 +38,12 @@ void SlideshowReceptionState(bool){}
 struct Monitor{unsigned availableForWrite(){return 4096;}}diagSerial;
 uint8_t SPIbuffer[4096];
 struct DAB {
+ const char* slsCloseReason="OTHER";si468x::Result readDsrvPayload(uint16_t);
+ uint8_t dabDynamicLabelCharset=0,dabDynamicLabelLength=0;char ServiceData[128]={};
  bool dabTransportStalled=false;uint8_t dabConsecutiveCtsTimeouts=0;
  enum class DabCommand{None,StopService};DabCommand dabCommand=DabCommand::None;
  uint32_t dabCommandGeneration=1,dabGeneration=1;
- void requestDabRecovery(dab_health::Stall);void finishDabCommand();void readGuard();
+ void requestDabRecovery(dab_health::Stall);void finishDabCommand();void readGuard();void getServiceData();
  dab_scheduler::CtsTimeoutClass recordDabCtsResult(bool);
  bool transportStalled(){return dabTransportStalled;}
  static const size_t SLS_BUFFER_BYTES=51200;static const unsigned SLS_MAX_SEG_SIZE=2048,SLS_MAX_SEGMENTS=256;
@@ -61,6 +64,8 @@ threshold=re.search(r'static constexpr uint8_t RADIO_DAB_STALL_TIMEOUT_COUNT = .
 methods=threshold+'\n'+''.join(method(signature) for signature in [
  'bool DAB::acceptSlideshowDuplicate(uint8_t segment, bool last, const uint8_t* data, uint16_t length, bool crcValid)',
  'bool DAB::storeSlideshowSegment(uint8_t segmentNumber,\n                                const uint8_t* data,\n                                uint16_t dataLength)',
+ 'si468x::Result DAB::readDsrvPayload(uint16_t length)',
+ 'void DAB::getServiceData(void)',
  'void DAB::clearSegmentBuffer(void)','void DAB::resetSlideshowCollector(void)',
  'void DAB::lockSlideshowTransport(uint16_t transportId)','void DAB::beginSlideshowReception(void)',
  'void DAB::acknowledgeSlideshow(void)','bool DAB::allSegmentsReceived(void)','void DAB::assembleSlideshow(void)',
@@ -82,8 +87,8 @@ uint32_t LastRadioStallRecoveryMs=0;static const uint32_t RADIO_STALL_RECOVERY_M
 unsigned coldRecoveries=0;void doRecovery(){++coldRecoveries;}
 void recoveryTick(){'''+sketch[start:b]+'}\n'
 main=r'''
-static void send(DAB& d,const std::vector<uint8_t>& image,unsigned segment,uint16_t tid=7,bool conflict=false,bool badCrc=false,bool flipLast=false){
- unsigned start=segment*80,n=unsigned(image.size())-start;if(n>80)n=80;
+static void send(DAB& d,const std::vector<uint8_t>& image,unsigned segment,uint16_t tid=7,bool conflict=false,bool badCrc=false,bool flipLast=false,unsigned stride=80){
+ unsigned start=segment*stride,n=unsigned(image.size())-start;if(n>stride)n=stride;
  memset(SPIbuffer,0,sizeof(SPIbuffer));SPIbuffer[25]=0x74;
  bool last=start+n==image.size();if(flipLast)last=!last;
  SPIbuffer[27]=last?0x80:0;SPIbuffer[28]=uint8_t(segment);SPIbuffer[29]=0x12;SPIbuffer[30]=uint8_t(tid>>8);SPIbuffer[31]=uint8_t(tid);
@@ -91,7 +96,51 @@ static void send(DAB& d,const std::vector<uint8_t>& image,unsigned segment,uint1
  const auto crc=epg::crc16(SPIbuffer+25,n+9);SPIbuffer[34+n]=uint8_t(crc>>8);SPIbuffer[35+n]=uint8_t(crc)^badCrc;
  d.body(n+11);
 }
+
+static void header(DAB& d,uint16_t tid,uint32_t length){
+ memset(SPIbuffer,0,sizeof(SPIbuffer));SPIbuffer[8]=0x40;SPIbuffer[19]=22;
+ SPIbuffer[27]=0x80;SPIbuffer[29]=0x12;SPIbuffer[30]=uint8_t(tid>>8);SPIbuffer[31]=uint8_t(tid);
+ SPIbuffer[34]=uint8_t(length>>20);SPIbuffer[35]=uint8_t(length>>12);SPIbuffer[36]=uint8_t(length>>4);SPIbuffer[37]=uint8_t(length<<4);
+ auto crc=epg::crc16(SPIbuffer+25,20);SPIbuffer[45]=uint8_t(crc>>8);SPIbuffer[46]=uint8_t(crc);
+ chip.headerCount=22;d.getServiceData();
+}
+static void lossScenarios(){
+ using namespace dab_loss;
+ for(unsigned count:{30U,34U})for(unsigned mode=0;mode<4;++mode){
+  evidence()=Evidence{};DAB d;clockMs=100;chip.result=si468x::Result::Ok;
+  const unsigned size=(count-1)*512+(count==30?452:464);
+  std::vector<uint8_t> data(size,0x32);data[0]=255;data[1]=216;data[2]=255;data[size-2]=255;data[size-1]=217;
+  evidence().drainStart(clockMs,false);header(d,100,size);
+  // Interleaved packet events do not mutate the PAD collector.
+  for(unsigned i=0;i<count;++i){
+   evidence().header(0,3,27,1,false,true);evidence().event(PacketEmptyDir);
+   if((mode==1 && i==16) || (mode==2 && (i==1 || i==16 || i==count-1)))continue;
+   ++clockMs;send(d,data,i,100,false,mode==3 && i==16,false,512);
+  }
+  if(mode==0){assert(d.SlideShowAvailable && d.slideshowPublishedPending);assert(evidence().lossCount==1);assert(!strcmp(evidence().losses[0].reason,"COMPLETE"));assert(evidence().losses[0].missing==0 && evidence().losses[0].received==count);send(d,data,0,100,false,false,false,512);assert(evidence().lossCount==1);}
+  else{
+   assert(!d.SlideShowAvailable);++clockMs;header(d,101,size);
+   assert(evidence().lossCount==1);const auto& l=evidence().losses[0];assert(!strcmp(l.reason,"NEW_HEADER"));
+   assert(l.expectedBytes==size && l.missing==(mode==2?2:1) && l.firstMissing==(mode==2?1:16));
+   assert(l.last==(mode!=2));assert(l.mask[2]&1); // bit 16
+   assert(l.crcBad==(mode==3?1:0)); // corrupted vs never delivered
+   assert(evidence().total.event[Candidate]==(mode==2?count-3:mode==1?count-1:count));
+  }
+ }
+ // New seg0 also reports an unfinished old object, independent of header.
+ evidence()=Evidence{};DAB d;std::vector<uint8_t> data(15300,0);data[0]=255;data[1]=216;data[2]=255;
+ header(d,7,15300);send(d,data,0,7,false,false,false,512);send(d,data,2,7,false,false,false,512);
+ send(d,data,0,8,false,false,false,512);assert(evidence().lossCount==1 && !strcmp(evidence().losses[0].reason,"NEW_SEG0") && evidence().losses[0].missing==1);
+ // Failed full reads are classified once even when CTS never reached the parser.
+ for(auto result:{si468x::Result::Timeout,si468x::Result::TransportError,si468x::Result::DeviceError}){
+  evidence()=Evidence{};diagDabCommandErrorCount=0;chip.result=result;SPIbuffer[19]=22;SPIbuffer[20]=0;d.getServiceData();assert(evidence().total.event[ReadFail]==1 && diagDabCommandErrorCount==1);
+ }
+ chip.result=si468x::Result::Ok;
+ std::puts("Actual SLS parser: 30/34 segments, 452/464-byte LAST, single/multiple holes, missing LAST, CRC vs absent, NEW_HEADER/NEW_SEG0 and full-read failures: PASS");
+}
 int main(int argc,char** argv){
+ lossScenarios();dab_loss::evidence()=dab_loss::Evidence{};diagDabCommandErrorCount=0;
+
  assert(argc==2);std::ifstream f(argv[1],std::ios::binary);std::vector<uint8_t> image((std::istreambuf_iterator<char>(f)),{});assert(image.size()==267);
  DAB d;chip.result=si468x::Result::Ok;SPIbuffer[19]=20;chip.headerCount=65535;d.readGuard();assert(!payloadReached && diagDabCommandErrorCount==1);
  SPIbuffer[19]=20;SPIbuffer[20]=0;chip.headerCount=20;d.readGuard();assert(payloadReached);payloadReached=false;SPIbuffer[19]=0xe8;SPIbuffer[20]=0x0f;d.readGuard();assert(!payloadReached);

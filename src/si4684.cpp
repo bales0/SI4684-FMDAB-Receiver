@@ -8,6 +8,7 @@
 //   - Slideshow segments and the assembled current image stay in RAM.
 
 #include "si4684.h"
+#include "dab_loss_diag.h"
 #include "constants.h"
 #include "dab_scheduler_policy.h"
 #include "dab_user_application.h"
@@ -435,7 +436,7 @@ static void statusChanged(void*, const si468x::Status& status) {
     }
     const uint32_t sequence=dabDsrvEvents.sequence;
     dabDsrvEvents.status(status.dsrvInt());
-    if(sequence!=dabDsrvEvents.sequence){dabDsrvPending=true;++diagDabDsrvCount;}
+    if(sequence!=dabDsrvEvents.sequence){dabDsrvPending=true;++diagDabDsrvCount;dab_loss::evidence().event(dab_loss::IrqObserved);dab_loss::evidence().pending(millis());}
     if (status.deviceEventInt() && !dabDeviceEventPending) {
       dabDeviceEventPending = true;
       ++diagDabDeviceEventCount;
@@ -454,6 +455,8 @@ static void statusChanged(void*, const si468x::Status& status) {
   }
 
   if (radioRuntimeDiagnosticsActive) {
+    if (radioDabRuntimeActive) dab_loss::evidence().cts(
+        (radioControlMode == RADIO_CTRL_INTB || radioControlMode == RADIO_CTRL_DETECT) && irqTriggered);
     if ((radioControlMode == RADIO_CTRL_INTB ||
          radioControlMode == RADIO_CTRL_DETECT) && irqTriggered)
       ++diagCtsIrqCompletionCount;
@@ -706,6 +709,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   slideshowPublishedPending = false;
   lastCompletedTransportId = 0;
   lastCompletedTransportIdValid = false;
+  slsCloseReason="RESET";
   resetSlideshowCollector();
   dabRssi10 = 0;
   dabSignalTimer = 0;
@@ -753,7 +757,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   lastStatus0 = 0;
   radioDabRuntimeActive = false;
   dabStcPending = false;
-  dabDsrvPending = false;dabDsrvEvents.reset();
+  dabDsrvPending = false;dabDsrvEvents.reset();dab_loss::evidence().pendingKnown=false;
   dabDeviceEventPending = false;
 
   // GPIO12 has an explicit boot-time role. INTB bypasses all detection and
@@ -1396,6 +1400,7 @@ void DAB::onHardwareResetComplete(void) {
   epg::liveReset();
   dabSpiProbe = dab_probe::Probe{};
   const si468x::Result aborted = chip.abortCommand();
+  if(dab_loss::evidence().active)dab_loss::evidence().terminal(unsigned(dabCommand),int(aborted));
   dabGeneration = dab_scheduler::nextGeneration(dabGeneration);
   dabProgress=dab_health::Watchdog{};
   dabCommandGeneration = dabGeneration;
@@ -1419,7 +1424,7 @@ void DAB::onHardwareResetComplete(void) {
   dabTransportStalled = false;dabStallReason=dab_health::Stall::None;
   invalidateDabAudioInfo();
   dabStcPending = false;
-  dabDsrvPending = false;dabDsrvEvents.reset();
+  dabDsrvPending = false;dabDsrvEvents.reset();dab_loss::evidence().pendingKnown=false;
   dabDeviceEventPending = false;
   radioDabRuntimeActive = false;
   commandAwaitingCts = false;
@@ -1675,15 +1680,41 @@ void DAB::parseDabServiceListReply(uint16_t replyLength) {
   }
 }
 
+// Read the preserved DSRV reply once, validating its original identity/length.
 // Pull one chunk of service-data from the chip. Each chunk is either:
 //   - Dynamic Label / Radiotext (group flag 0x02) → copy into ServiceData
 //   - MOT slideshow header     (0x80 0x00 0x12 ...) → record total length, TID
 //   - MOT slideshow segment    (0x00/0x80 ...   ) → memcpy into slideshowSegBuf
 // Called on every Update() while the receiver has signal lock.
+si468x::Result DAB::readDsrvPayload(uint16_t length) {
+  auto& d=dab_loss::evidence();
+  const uint32_t sid=si468x::readLe32(SPIbuffer+9),cid=si468x::readLe32(SPIbuffer+13);
+  const si468x::Result result=chip.readCurrentReply(SPIbuffer+1,length);
+  d.lastReadResult=int(result);dab_loss::inc(d.fullReads);
+  if(result!=si468x::Result::Ok){
+    d.event(dab_loss::ReadFail);
+    d.event(result==si468x::Result::Timeout?dab_loss::ReadTimeout:
+        result==si468x::Result::DeviceError?dab_loss::ReadDevice:
+        result==si468x::Result::TransportError || result==si468x::Result::NoTransport?dab_loss::ReadTransport:dab_loss::ReadOther);
+    return result;
+  }
+  d.event(dab_loss::ReadOk);
+  const unsigned count=unsigned(SPIbuffer[19])+(unsigned(SPIbuffer[20])<<8);
+  if(si468x::readLe32(SPIbuffer+9)!=sid || si468x::readLe32(SPIbuffer+13)!=cid){
+    d.event(dab_loss::HeaderIdentity);return si468x::Result::MalformedReply;
+  }
+  if(count+24U!=length){
+    d.event(dab_loss::LengthMismatch);return si468x::Result::MalformedReply;
+  }
+  d.payload(sid,cid,dabGeneration,SPIbuffer+25,count);
+  return result;
+}
+
 void DAB::getServiceData(void) {
   uint32_t byte_count = 0;
   const auto discardStaleMot = []() {
     ++diagDabStaleMotCount;
+    dab_loss::evidence().event(dab_loss::Stale);
     static uint32_t lastLogMs = 0U;
     const uint32_t now = millis();
     if (diagnosticDebug &&
@@ -1714,9 +1745,9 @@ void DAB::getServiceData(void) {
   byte_count = SPIbuffer[19] + (static_cast<uint32_t>(SPIbuffer[20]) << 8);
   if (byte_count + 24U < sizeof(SPIbuffer)) {
     if (byte_count > 0) {
-      const si468x::Result readResult = chip.readCurrentReply(
-          SPIbuffer + 1, static_cast<uint16_t>(byte_count + 24U));
+      const si468x::Result readResult = readDsrvPayload(static_cast<uint16_t>(byte_count + 24U));
       finishCommandDiagnostics(readResult);
+      if (readResult != si468x::Result::Ok) ++diagDabCommandErrorCount;
       if (readResult == si468x::Result::Ok) {
         const uint32_t replyByteCount=SPIbuffer[19]+(static_cast<uint32_t>(SPIbuffer[20])<<8);
         if(replyByteCount!=byte_count){++diagDabCommandErrorCount;return;}
@@ -1762,6 +1793,8 @@ void DAB::getServiceData(void) {
                    SPIbuffer[29] == 0x12) {
           const uint16_t transportID =
               (static_cast<uint16_t>(SPIbuffer[30]) << 8) | SPIbuffer[31];
+          const bool headerCrcOk=epg::crc16(SPIbuffer+25,byte_count-2U)==uint16_t((uint16_t(SPIbuffer[23+byte_count])<<8)|SPIbuffer[24+byte_count]);
+          dab_loss::evidence().event(headerCrcOk?dab_loss::HeaderValid:dab_loss::HeaderCrcBad);
           const uint32_t newLength =
               (static_cast<uint32_t>(SPIbuffer[34]) << 20) |
               (static_cast<uint32_t>(SPIbuffer[35]) << 12) |
@@ -1771,13 +1804,16 @@ void DAB::getServiceData(void) {
           if (!dabSwitch.slsContextValid) {
             discardStaleMot();
           } else if (newLength == 0U || newLength > SLS_BUFFER_BYTES) {
+            dab_loss::evidence().event(dab_loss::Invalid);
             if (SlideShowDebug)
               DIAG_PRINTF("[SLS] Reject header TID=%u length=%u\n",
                             transportID, newLength);
           } else if (lastCompletedTransportIdValid &&
                      transportID == lastCompletedTransportId) {
+            dab_loss::evidence().event(dab_loss::CompletedRepeat);
             logRepeatedCompletedMot(transportID);
           } else if (slideshowPublishedPending || SlideShowUpdate) {
+            dab_loss::evidence().event(dab_loss::Hold);
             // The only image-sized buffer is still owned by the UI. DSRV is
             // deliberately drained, but no new object may claim the buffer.
             if (SlideShowDebug)
@@ -1789,6 +1825,7 @@ void DAB::getServiceData(void) {
               if (SlideShowDebug)
                 DIAG_PRINTF("[SLS] Partial TID=%u abandoned; new header TID=%u\n",
                               SlideShowTransportID, transportID);
+              slsCloseReason="NEW_HEADER";
               lockSlideshowTransport(transportID);
             } else if (!SlideShowTransportIDValid) {
               lockSlideshowTransport(transportID);
@@ -1801,6 +1838,8 @@ void DAB::getServiceData(void) {
               if (SlideShowDebug)
                 DIAG_PRINTF("[SLS] TID=%u BodySize changed %u -> %u; reset\n",
                               transportID, SlideShowLength, newLength);
+              slsCloseReason="INVALID";
+              dab_loss::evidence().event(dab_loss::Invalid);
               lockSlideshowTransport(transportID);
               metadataChanged = true;
             }
@@ -1823,6 +1862,8 @@ void DAB::getServiceData(void) {
             } else if (SlideShowByteCounter > SlideShowLength) {
               if (SlideShowDebug)
                 DIAG_PRINTLN("[SLS] Buffered bytes exceed BodySize; reset");
+              dab_loss::evidence().event(dab_loss::Invalid);
+              slsCloseReason="INVALID";
               resetSlideshowCollector();
             }
           }
@@ -1838,16 +1879,20 @@ void DAB::getServiceData(void) {
           const uint8_t segmentNumber = SPIbuffer[28];
           const bool lastSegment = (SPIbuffer[27] & 0x80U) != 0U;
           const uint16_t dataLen = static_cast<uint16_t>(byte_count - 11U);
+          dab_loss::evidence().event(dab_loss::Candidate);
           const uint16_t groupCrc=epg::crc16(SPIbuffer+25,byte_count-2U);
-          if(groupCrc!=uint16_t((uint16_t(SPIbuffer[23+byte_count])<<8)|SPIbuffer[24+byte_count])){epg_diag::increment(slsCrcBad);return;}
+          if(groupCrc!=uint16_t((uint16_t(SPIbuffer[23+byte_count])<<8)|SPIbuffer[24+byte_count])){epg_diag::increment(slsCrcBad);dab_loss::evidence().event(dab_loss::CrcBad);return;}
+          dab_loss::evidence().event(dab_loss::CrcOk);
 
 
           if (!dabSwitch.slsContextValid) {
             discardStaleMot();
           } else if (lastCompletedTransportIdValid &&
               transportID == lastCompletedTransportId) {
+            dab_loss::evidence().event(dab_loss::CompletedRepeat);
             if (segmentNumber == 0U) logRepeatedCompletedMot(transportID);
           } else if (slideshowPublishedPending || SlideShowUpdate) {
+            dab_loss::evidence().event(dab_loss::Hold);
             // Preserve the complete image until acknowledgeSlideshow().
             if (SlideShowDebug && segmentNumber == 0U)
               DIAG_PRINTF("[SLS] Hold published image; ignore seg=0 TID=%u\n",
@@ -1858,6 +1903,7 @@ void DAB::getServiceData(void) {
               if (SlideShowDebug)
                 DIAG_PRINTF("[SLS] Partial TID=%u abandoned; new seg=0 TID=%u\n",
                               SlideShowTransportID, transportID);
+              slsCloseReason="NEW_SEG0";
               lockSlideshowTransport(transportID);
             } else if (!SlideShowTransportIDValid) {
               lockSlideshowTransport(transportID);
@@ -1866,6 +1912,7 @@ void DAB::getServiceData(void) {
             }
 
             if (transportID != SlideShowTransportID) {
+              dab_loss::evidence().event(dab_loss::RejectTid);
               if (SlideShowDebug)
                 DIAG_PRINTF("[SLS] Ignore seg=%u TID=%u (collecting TID=%u)\n",
                               segmentNumber, transportID,
@@ -1895,6 +1942,8 @@ void DAB::getServiceData(void) {
                     DIAG_PRINTF("[SLS] Invalid seg=%u len=%u last=%u; reset TID=%u\n",
                                   segmentNumber, dataLen,
                                   lastSegment ? 1U : 0U, transportID);
+                  dab_loss::evidence().event(dab_loss::Invalid);
+                  slsCloseReason="INVALID";
                   resetSlideshowCollector();
                 } else {
                   // Invalidate the previous published view before the first
@@ -1910,8 +1959,11 @@ void DAB::getServiceData(void) {
                     if (SlideShowDebug)
                       DIAG_PRINTF("[SLS] Seg=%u len=%u does not fit packed buffer\n",
                                     segmentNumber, dataLen);
+                    dab_loss::evidence().event(dab_loss::Invalid);
+                    slsCloseReason="INVALID";
                     resetSlideshowCollector();
                   } else {
+                    dab_loss::evidence().event(dab_loss::Stored);
                     SlideShowSegmentBitmap[byteIndex] |= bitMask;
                     SlideShowByteCounter += dataLen;
                     if (segmentNumber > SlideShowHighestSegment)
@@ -1952,6 +2004,8 @@ void DAB::getServiceData(void) {
                         SlideShowByteCounter > SlideShowLength) {
                       if (SlideShowDebug)
                         DIAG_PRINTLN("[SLS] Segment data exceed BodySize; reset");
+                      dab_loss::evidence().event(dab_loss::Invalid);
+                      slsCloseReason="INVALID";
                       resetSlideshowCollector();
                     } else if (allSegmentsReceived() &&
                                ((SlideShowLength != 0U &&
@@ -1968,6 +2022,8 @@ void DAB::getServiceData(void) {
               }
             }
           }
+        } else {
+          dab_loss::evidence().event(dab_loss::Unsupported);
         }
       }
     }
@@ -2005,8 +2061,8 @@ bool DAB::acceptSlideshowDuplicate(uint8_t segment, bool last, const uint8_t* da
     (!SlideShowLength || (SlideShowByteCounter<=SlideShowLength && offset+length<=SlideShowLength)) &&
     (!SlideShowLastSegmentValid || segment<=SlideShowLastSegment) && last==knownLast &&
     memcmp(slideshowSegBuf+offset,data,length)==0;
-  if(valid){epg_diag::increment(slsDuplicateValid);SlideShowLastActivity=millis();}
-  else epg_diag::increment(slsDuplicateConflict);
+  if(valid){epg_diag::increment(slsDuplicateValid);dab_loss::evidence().event(dab_loss::Duplicate);SlideShowLastActivity=millis();}
+  else {epg_diag::increment(slsDuplicateConflict);dab_loss::evidence().event(dab_loss::Conflict);}
   return valid;
 }
 
@@ -2042,6 +2098,10 @@ void DAB::clearSegmentBuffer(void) {
 }
 
 void DAB::resetSlideshowCollector(void) {
+  if(SlideShowTransportIDValid) dab_loss::evidence().close(millis(),SlideShowTransportID,
+      SlideShowSegmentBitmap,SlideShowHighestSegment,SlideShowLastSegmentValid,
+      SlideShowLastSegment,SlideShowByteCounter,SlideShowLength,SlideShowLastActivity,slsCloseReason);
+  slsCloseReason="OTHER";
   clearSegmentBuffer();
   SlideShowTransportIDValid = false;
   SlideShowTransportID = 0;
@@ -2058,6 +2118,7 @@ void DAB::lockSlideshowTransport(uint16_t transportId) {
   resetSlideshowCollector();
   SlideShowTransportID = transportId;
   SlideShowTransportIDValid = true;
+  dab_loss::evidence().begin(millis());
 }
 
 // Check if we have every segment from 0..N where N is either:
@@ -2122,6 +2183,7 @@ void DAB::assembleSlideshow(void) {
       slideshowSegBuf[7] == 0x0A;
 
   if (!validJPEG && !validPNG) {
+    dab_loss::evidence().event(dab_loss::Invalid);
     if (SlideShowDebug) {
       DIAG_PRINTF("[SLS] REJECTED new image: size=%u expected=%u hdr=%02X %02X %02X %02X\n",
                     actualSize, SlideShowLength,
@@ -2150,6 +2212,7 @@ void DAB::assembleSlideshow(void) {
                   (unsigned)SLS_BUFFER_BYTES, actualSize);
   }
 
+  slsCloseReason=(validJPEG || validPNG)?"COMPLETE":"INVALID";
   // Reset only collector metadata. The compacted image bytes remain in this
   // single buffer and are published through slideshowRamSize on success.
   resetSlideshowCollector();
@@ -2237,6 +2300,7 @@ void DAB::setFreq(uint8_t freq) {
   slideshowRamSize = 0;
   slideshowPublishedPending = false;
   lastCompletedTransportIdValid = false;
+  slsCloseReason="TUNE";
   resetSlideshowCollector();
 
   signallock = false;
@@ -2268,7 +2332,7 @@ void DAB::setFreq(uint8_t freq) {
   dabCurrentSubchannelRefreshPending = false;
   dabCurrentServiceRefreshPending = false;
   dabServiceTypeScanIndex = 0;
-  dabDsrvPending = false;dabDsrvEvents.reset();
+  dabDsrvPending = false;dabDsrvEvents.reset();dab_loss::evidence().pendingKnown=false;
   dabDeviceEventPending = false;
   if (!dabActiveDataServiceValid) dataServiceCheck = 0;
   tunePending = true;
@@ -3002,6 +3066,7 @@ void DAB::setService(uint8_t _index) {
   ecc = 0;  // Reset so ServiceInfo() picks up the new service's ECC
   serviceHasOwnEcc = false;
   // Reset segment tracking (RAM-only).
+  slsCloseReason="SWITCH";
   resetSlideshowCollector();
 
   u.combine = service[ServiceIndex].ServiceID;
@@ -3037,8 +3102,13 @@ void DAB::setService(uint8_t _index) {
 bool DAB::startDabCommand(DabCommand operation, uint8_t command,
                           const uint8_t* args, uint16_t argLength,
                           uint16_t replyLength, uint32_t timeoutUs) {
-  if (dabTransportStalled || chip.busy() || dabCommand != DabCommand::None) return false;
+  static_assert(unsigned(DabCommand::StartDataService)==21, "Update diagnostic command names");
+  if (dabTransportStalled || chip.busy() || dabCommand != DabCommand::None) {
+    dab_loss::evidence().action(unsigned(operation), dabTransportStalled?dab_loss::StartFail:dab_loss::Busy);
+    return false;
+  }
   if (replyLength > sizeof(SPIbuffer) - 1U) {
+    dab_loss::evidence().action(unsigned(operation),dab_loss::StartFail);
     ++diagDabCommandErrorCount;
     return false;
   }
@@ -3047,6 +3117,7 @@ bool DAB::startDabCommand(DabCommand operation, uint8_t command,
       static_cast<si468x::Command>(command), args, argLength,
       replyLength > 0 ? SPIbuffer + 1 : nullptr, replyLength, timeoutUs);
   if (result == si468x::Result::Pending) {
+    dab_loss::evidence().started(unsigned(operation));
     dabProgress.started(millis(),uint16_t(operation));
     dabCommand = operation;
     dabCommandGeneration = dabGeneration;
@@ -3060,6 +3131,7 @@ bool DAB::startDabCommand(DabCommand operation, uint8_t command,
   }
   finishCommandDiagnostics(result);
   ++diagDabCommandErrorCount;
+  dab_loss::evidence().action(unsigned(operation),result==si468x::Result::Busy?dab_loss::Busy:dab_loss::StartFail);
   DIAG_PRINTF("[DAB/ASYNC] command 0x%02X start failed result=%d\n",
                 command, static_cast<int>(result));
   const uint32_t now = millis();
@@ -3116,6 +3188,7 @@ void DAB::finishDabCommand(void) {
   const DabCommand completed = dabCommand;
   const si468x::Result result = chip.lastResult();
   const uint32_t completedGeneration = dabCommandGeneration;
+  dab_loss::evidence().terminal(unsigned(completed),int(result));
   dabCommand = DabCommand::None;
   finishCommandDiagnostics(result);
 
@@ -3159,6 +3232,7 @@ void DAB::finishDabCommand(void) {
   }
 
   if (!dab_scheduler::generationMatches(completedGeneration, dabGeneration)) {
+    dab_loss::evidence().event(dab_loss::Stale);
     // A superseded service command may still have changed tuner state before a
     // newer tune request invalidated its metadata generation. Reconcile only
     // the physical audio/data ownership; the new switch request remains the
@@ -3196,7 +3270,7 @@ void DAB::finishDabCommand(void) {
     // Status bits sampled while completing the old command belong to the old
     // multiplex as well. A fresh tune will repopulate all three event flags.
     dabStcPending = false;
-    dabDsrvPending = false;dabDsrvEvents.reset();
+    dabDsrvPending = false;dabDsrvEvents.reset();dab_loss::evidence().pendingKnown=false;
     dabDeviceEventPending = false;
     return;
   }
@@ -3210,7 +3284,7 @@ void DAB::finishDabCommand(void) {
 
   if (result != si468x::Result::Ok) {
     ++diagDabCommandErrorCount;
-    if(completed==DabCommand::DsrvHeader){dabDsrvEvents.finish(millis(),0,0,false);dabDsrvPending=dabDsrvEvents.pending;}
+    if(completed==DabCommand::DsrvHeader){dabDsrvEvents.finish(millis(),0,0,false);dabDsrvPending=dabDsrvEvents.pending;if(dabDsrvPending)dab_loss::evidence().pending(millis());}
     const uint8_t deviceReason = chip.lastDeviceError();
     if (result == si468x::Result::DeviceError && deviceReason == 0x03U)
       ++diagDabNotAvailableCount;
@@ -3540,10 +3614,10 @@ void DAB::finishDabCommand(void) {
       if (!parseOk(parseResult)) {
         ++diagDabCommandErrorCount;
         epg_diag::increment(epg_diag::registry().headerErrors);
-        dabDsrvEvents.finish(millis(),0,0,false);dabDsrvPending=dabDsrvEvents.pending;
+        dabDsrvEvents.finish(millis(),0,0,false);dabDsrvPending=dabDsrvEvents.pending;if(dabDsrvPending)dab_loss::evidence().pending(millis());
         break;
       }
-      if (header.interruptSource & 0x02U) ++diagDabDsrvOverflowCount;
+      if (header.interruptSource & 0x02U) {++diagDabDsrvOverflowCount;dab_loss::evidence().event(dab_loss::Overflow);}
       const dab_probe::Endpoint audio(dabActiveServiceId, dabActiveComponentId,
                                       dabActiveServiceValid);
       const dab_probe::Endpoint sls(dabActiveDataServiceId, dabActiveDataComponentId,
@@ -3551,6 +3625,9 @@ void DAB::finishDabCommand(void) {
       const dab_probe::Route target = dab_probe::route(
           header.serviceId, header.componentId, header.dataSource,
           audio, sls, dabSpiProbe.spi);
+      dab_loss::evidence().header(header.dataSource,unsigned(target),header.byteCount,
+          header.buffersRemaining,header.physicalError(),header.serviceState==0 || header.serviceState==3);
+      if(dab_loss::evidence().verifyInFlight && !header.byteCount)dab_loss::evidence().event(dab_loss::VerifyEmpty);
       epg_diag::registry().header(header.dataSource,header.rawUatypeOrRfu,header.dscType,header.serviceState,header.serviceId,header.componentId,header.byteCount,dabUaScan.generation,millis(),(header.dataSource==0U && target==dab_probe::Route::Spi) || (header.dataSource==1U && header.rawUatypeOrRfu==7U));
       dabSpiProbe.observe(target, header.dataSource, header.serviceStopped(),
                           header.byteCount > 0U);
@@ -3619,6 +3696,7 @@ void DAB::finishDabCommand(void) {
           dabSpiProbeSuppressedRoutes = 0;
         } else dab_probe::increment(dabSpiProbeSuppressedRoutes);
       }
+      if(header.byteCount>sizeof(SPIbuffer)-25U)dab_loss::evidence().event(dab_loss::Oversize);
       if (header.byteCount > 0U) {
         const epg_ingress::PadRoute padRoute = epg_ingress::pad(
             header.dataSource, header.dscType, header.rawUatypeOrRfu,
@@ -3632,8 +3710,7 @@ void DAB::finishDabCommand(void) {
         if (padRoute == epg_ingress::PadRoute::Epg) {
           if (header.byteCount <= sizeof(SPIbuffer)-25U) {
             if (epg::liveEnabled()) {
-              const si468x::Result readResult = chip.readCurrentReply(
-                  SPIbuffer+1,static_cast<uint16_t>(24U+header.byteCount));
+              const si468x::Result readResult = readDsrvPayload(static_cast<uint16_t>(24U+header.byteCount));
               finishCommandDiagnostics(readResult);
               if (readResult==si468x::Result::Ok)
                 epg::livePadData(dabActiveServiceId,dabActiveComponentId,SPIbuffer+25,header.byteCount);
@@ -3657,14 +3734,21 @@ void DAB::finishDabCommand(void) {
           } else if (header.dataSource == 0U && header.byteCount <= sizeof(SPIbuffer) - 25U &&
               epg::liveEnabled() && dabSpiProbe.state == dab_probe::State::Observing &&
               dabActiveServiceValid && !dabServiceRequestPending && !dabTuneRequestPending) {
-            const si468x::Result readResult = chip.readCurrentReply(
-                SPIbuffer + 1, static_cast<uint16_t>(24U + header.byteCount));
+            const si468x::Result readResult = readDsrvPayload(static_cast<uint16_t>(24U + header.byteCount));
             finishCommandDiagnostics(readResult);
-            if (readResult == si468x::Result::Ok)
-              epg::livePayload(SPIbuffer + 25, header.byteCount);
+            if (readResult == si468x::Result::Ok) {
+              epg_diag::Registry observed;
+              observed.group(epg_diag::Path::Packet,SPIbuffer+25,header.byteCount,false,millis());
+              dab_loss::evidence().event(observed.at(epg_diag::Path::Packet).empty?dab_loss::PacketEmptyDir:dab_loss::PacketOther);
+              if(dab_loss::evidence().mode==dab_loss::Mode::NoParse)dab_loss::evidence().event(dab_loss::ParseSkipped);
+              else epg::livePayload(SPIbuffer + 25, header.byteCount);
+            }
             else {++diagDabCommandErrorCount;epg_diag::registry().reject(epg_diag::Path::Packet,epg_diag::Reject::Read);}
           } else epg_diag::registry().reject(epg_diag::Path::Packet,epg::replayActive()?epg_diag::Reject::Replay:header.byteCount>sizeof(SPIbuffer)-25U?epg_diag::Reject::Length:epg_diag::Reject::Inactive);
         } else if (feedLegacy) {
+          if(header.dataSource==1 && (target==dab_probe::Route::Audio || target==dab_probe::Route::Sls) &&
+              (header.serviceState==0 || header.serviceState==3) && !header.physicalError())
+            dab_loss::evidence().event(dab_loss::PadSls);
           epg_diag::increment(epg_diag::registry().at(header.dataSource==0?epg_diag::Path::Packet:epg_diag::Path::Pad).legacy);
           getServiceData();
         } else if (target != dab_probe::Route::Spi) {
@@ -3672,7 +3756,11 @@ void DAB::finishDabCommand(void) {
           ++diagDabStaleMotCount;
         }
       }
+      const uint32_t drainMs=millis()-dabDsrvEvents.startedAt;
+      dab_loss::evidence().maximum(&dab_loss::Bank::drainMaxMs,drainMs);
+      if(drainMs>dab_loss::evidence().objectDrainMax)dab_loss::evidence().objectDrainMax=drainMs;
       dabDsrvPending = dabDsrvEvents.finish(millis(),header.buffersRemaining,header.byteCount,!header.physicalError());
+      if(dabDsrvPending)dab_loss::evidence().pending(millis());
       break;
     }
 
@@ -4112,6 +4200,25 @@ void DAB::processDabSwitchState(uint32_t now) {
   }
 }
 
+bool DAB::setDsrvDiagnosticMode(char mode) {
+  auto& d=dab_loss::evidence();
+  if(mode<'A' || mode>'D') return false;
+  if(isFm() || epg::replayActive() || dabSpiProbe.state==dab_probe::State::CleanupFailed) return false;
+  if(mode=='B' && (!dabSpiProbe.spi.valid || !epgContinuous || !dabSpiProbe.audio.valid ||
+      dabSpiProbe.audio.matches(dabSpiProbe.spi.sid,dabSpiProbe.spi.cid) ||
+      dabSpiProbe.sls.matches(dabSpiProbe.spi.sid,dabSpiProbe.spi.cid))) {
+    // Repeating B is safe, but never claim an unsupported STOP was applied.
+    return d.mode==dab_loss::Mode::NoPacket;
+  }
+  d.mode=mode=='B'?dab_loss::Mode::NoPacket:mode=='C'?dab_loss::Mode::NoParse:mode=='D'?dab_loss::Mode::Quiet:dab_loss::Mode::Normal;
+  d.experiment=true;dab_loss::inc(d.modeEpoch);d.hashKnown=false;
+  epgManualPending=false;
+  epgProductionPaused=mode=='B';
+  if(mode=='B')dabSpiProbe.stop(millis());
+  diagnosticDebug=mode!='D';SlideShowDebug=diagnosticDebug;SlideShowVerbose=false;
+  return true;
+}
+
 void DAB::maintainDabClock(void) {
   const bool fresh=dabClockRefresh.observe(dabGeneration,!isFm() && signallock && !dabTuneRequestPending,millis(),dabEpgClock);
   if(!dabClockRefresh.active())dabUtcRefreshPending=dabClockConfirmPending=false;
@@ -4175,6 +4282,7 @@ void DAB::scheduleNextDabCommand(void) {
         dabTuneRequestPending = false;
         dabCommandRequestId = requestId;
         dabCommand = DabCommand::Tune;
+        dab_loss::evidence().started(unsigned(DabCommand::Tune));
         dabCommandGeneration = dabGeneration;
         setDabSwitchState(dab_switch::State::WaitTune);
       } else {
@@ -4182,6 +4290,7 @@ void DAB::scheduleNextDabCommand(void) {
         ++diagDabCommandErrorCount;
         tunePending = false;
         dabTuneRequestPending = false;
+        dab_loss::evidence().action(unsigned(DabCommand::Tune),result==si468x::Result::Busy?dab_loss::Busy:dab_loss::StartFail);
         DIAG_PRINTF("[DAB/ASYNC] tune start failed result=%d\n",
                       static_cast<int>(result));
       }
@@ -4233,6 +4342,7 @@ void DAB::scheduleNextDabCommand(void) {
                         static_cast<uint8_t>(si468x::Command::GET_DIGITAL_SERVICE_DATA),
                         args, sizeof(args), 24)) {
       ++dabDsrvBurstCount;
+      dab_loss::evidence().drainStart(now,dabDsrvEvents.verification);
       dabDsrvEvents.start(now);dabDsrvPending=false;
     }
     return;
@@ -4413,6 +4523,7 @@ void DAB::scheduleNextDabCommand(void) {
 }
 
 bool DAB::requestSpiProbe(bool production) {
+  if(dab_loss::evidence().mode==dab_loss::Mode::NoPacket) return false;
   if (epg::replayActive() || dabSpiProbe.state == dab_probe::State::CleanupFailed) return false;
   if (epgContinuous && dabSpiProbe.spi.valid) {
     epgManualPending = true;
@@ -4801,6 +4912,7 @@ void DAB::Update(bool allowNewWork) {
   const uint32_t now = millis();
   if (SlideShowInit && uint32_t(now-SlideShowLastActivity)>30000U) {
     if (SlideShowDebug) DIAG_PRINTLN("[SLS] Collection timeout, resetting");
+    slsCloseReason="TIMEOUT";
     // The buffer contains an incomplete object and therefore remains
     // unavailable. A picture already decoded to TFT GRAM is not erased here.
     resetSlideshowCollector();

@@ -248,6 +248,19 @@ void processCommandLine(char* line) {
   char* equals = strchr(input, '=');
   if (!equals) {
     upperInPlace(input);
+    if (strcmp(input,"DSRV STATUS")==0) {
+      diagSerial.printf("[DSRV/MODE] mode=%s epoch=%u probe=%u debug=%u\n",
+          dab_loss::modeName(dab_loss::evidence().mode),unsigned(dab_loss::evidence().modeEpoch),
+          unsigned(radio.spiProbeState()),diagnosticDebug);
+      return;
+    }
+    if (strncmp(input, "DSRV MODE ", 10) == 0 && input[10] && !input[11]) {
+      const bool accepted=radio.setDsrvDiagnosticMode(input[10]);
+      diagSerial.printf("[DSRV/MODE] requested=%c result=%s probe=%u\n",input[10],
+          accepted?"ACCEPTED":"UNSUPPORTED",unsigned(radio.spiProbeState()));
+      if(!accepted)diagSerial.println("[DSRV/MODE] use A-D; requires DAB LIVE, distinct continuous packet ownership and no failed cleanup");
+      return;
+    }
     if (strcmp(input, "DEBUG") == 0) {
       diagnosticDebug = !diagnosticDebug;
       radio.SlideShowDebug = diagnosticDebug;

@@ -34,6 +34,8 @@
 #include "epg_time.h"
 #include "dab_clock_refresh.h"
 
+namespace si468x { enum class Result : int8_t; }
+
 struct DABFrequencyLabel_DAB {
   uint32_t frequency;
   const char* label;
@@ -206,6 +208,8 @@ class DAB {
     // Always pumps an in-flight transport operation. When allowNewWork is
     // false no new metadata, DSRV or status command is scheduled.
     void Update(bool allowNewWork = true);
+    bool setDsrvDiagnosticMode(char mode);
+    uint8_t spiProbeState() const { return uint8_t(dabSpiProbe.state); }
     void vol(uint8_t vol);
     RadioMode mode(void) const { return activeMode; }
     bool isFm(void) const { return activeMode == RADIO_MODE_FM; }
@@ -290,6 +294,8 @@ class DAB {
     };
 
     bool SlideShowInit;
+    const char* slsCloseReason="OTHER";
+    si468x::Result readDsrvPayload(uint16_t length);
     RadioMode activeMode;
     uint8_t activeFmRegion = static_cast<uint8_t>(FmRegion::Europe);
     uint8_t activeFmSeekSensitivity = 1;
