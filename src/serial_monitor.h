@@ -31,6 +31,11 @@ class NonBlockingSerialMonitor : public Stream {
     if (!buffered_) return serial_.write(data, length);
     size_t accepted = 0;
     while (accepted < length && write(data[accepted]) == 1U) ++accepted;
+    if(accepted<length) {
+      // write(byte) counted the first failed byte; account for the discarded tail.
+      const size_t remaining=length-accepted-1;
+      dropped_=remaining>UINT32_MAX-dropped_?UINT32_MAX:dropped_+uint32_t(remaining);
+    }
     return accepted;
   }
 
@@ -62,7 +67,7 @@ class NonBlockingSerialMonitor : public Stream {
   uint32_t droppedBytes() const { return dropped_; }
   size_t queuedBytes() const { return count_; }
 
-  static constexpr size_t kCapacity = 4096U;
+  static constexpr size_t kCapacity = 2048U;
   static constexpr size_t kDefaultServiceBytes = 64U;
 
  private:

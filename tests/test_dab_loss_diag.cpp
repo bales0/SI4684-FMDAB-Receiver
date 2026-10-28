@@ -5,14 +5,14 @@
 #include <string>
 #include <cstring>
 struct Output {
- int room=4096;std::string text;
+ int room=4096;size_t longest=0;std::string text;
  int availableForWrite(){return room;}
- size_t write(const uint8_t* p,size_t n){text.append(reinterpret_cast<const char*>(p),n);return n;}
+ size_t write(const uint8_t* p,size_t n){assert(n<768 && n<=size_t(room));if(n>longest)longest=n;text.append(reinterpret_cast<const char*>(p),n);return n;}
  void printf(const char* fmt,...){char b[1200];va_list a;va_start(a,fmt);int n=vsnprintf(b,sizeof b,fmt,a);va_end(a);assert(n>=0 && n<int(sizeof b));text+=b;}
 };
 int main(){
  using namespace dab_loss;
- static_assert(sizeof(Evidence)<4096,"Diagnostic RAM budget");
+ static_assert(sizeof(Evidence)<(SI4684_DIAG_DETAIL?4096:1600),"Diagnostic RAM budget");
  Evidence e;e.started(3);e.cts(false);e.terminal(3,0);
  e.action(3,Busy);e.action(3,StartFail);
  e.started(5);e.cts(true);e.terminal(5,-6);
@@ -41,7 +41,7 @@ int main(){
  assert(!e.total.event[Identical]);e.started(3);e.payload(1,2,3,payload,3);assert(e.total.event[Identical]==1);
  e.started(3);e.payload(1,2,4,payload,3);assert(e.total.event[Identical]==1);
  auto& d=evidence();d=Evidence{};Output out;d.started(3);d.cts(false);d.terminal(3,0);
- service(out,30000,false,4,0,14000,13000,2000);assert(out.text.empty() && d.stage==0 && d.report.cmd[3][Start]==1);
+ d.reportRequested=true;out.room=0;service(out,30000,false,4,0,14000,13000,2000);assert(out.text.empty() && d.stage==0 && d.report.cmd[3][Start]==1);
  d.started(5);d.cts(true);d.terminal(5,0);
  out.room=0;service(out,30100,true,4,0,14000,13000,2000);assert(out.text.empty());
  out.room=4096;for(unsigned t=30200;t<38000;t+=100)service(out,t,true,4,0,14000,13000,2000);
@@ -51,7 +51,27 @@ int main(){
  d=Evidence{};d.experiment=true;d.mode=Mode::Quiet;memset(mask,255,sizeof mask);mask[2]&=~1;
  d.close(1,15780,mask,33,true,33,16848,17360,0,"NEW_HEADER");
  out.text.clear();service(out,100,false,4,0,14000,13000,2000);
+ service(out,60000,true,4,0,14000,13000,2000);
+ assert(out.text.empty() && !d.lossCount && d.stage==255); // truly Quiet, even a stale experiment flag
+ d.reportRequested=true;service(out,60100,false,4,0,14000,13000,2000);assert(!out.text.empty());
+ for(unsigned t=60200;t<68000;t+=100)service(out,t,false,4,0,14000,13000,2000);
+ assert(!d.reportRequested && d.stage==255);out.text.clear();service(out,90000,false,4,0,14000,13000,2000);assert(out.text.empty());
+ d=Evidence{};d.experiment=true;d.close(1,15780,mask,33,true,33,16848,17360,0,"NEW_HEADER");
+ assert(d.losses[0].credibleInternal);out.text.clear();service(out,100,true,4,0,14000,13000,2000);
  assert(out.text.find("tid=15780 reason=NEW_HEADER total=34 received=33 missing=1 firstMissing=16")!=std::string::npos);
- assert(out.text.find("missingMask=0000010000")!=std::string::npos);
- std::printf("Diagnostic saturation, interval snapshot/CTS reconciliation, queue histogram, bitmap/LAST uncertainty, wrap, identity transactions and paced quiet output: PASS (%u bytes)\n",unsigned(sizeof(Evidence)));
+ assert(out.text.find("missingMask=0000010000")!=std::string::npos && out.text.find("credibleInternal=1")!=std::string::npos);
+ d=Evidence{};mask[0]&=~1;d.close(1,2,mask,33,true,33,10,20,0,"NEW_HEADER");assert(!d.losses[0].credibleInternal);
+ mask[0]|=1;d=Evidence{};d.begin(0);d.contextChanged();d.close(1,3,mask,33,true,33,10,20,0,"TIMEOUT");assert(!d.losses[0].credibleInternal);
+ d=Evidence{};d.close(1,4,mask,33,true,33,10,20,0,"SWITCH");assert(!d.losses[0].credibleInternal);
+ // Format every report with maximal counters and integer widths, not just typical RF values.
+ d=Evidence{};d.experiment=true;
+ for(unsigned c=0;c<commandSlots;++c)for(unsigned a=0;a<Actions;++a)d.window.cmd[commandAt(c)][a]=d.total.cmd[commandAt(c)][a]=UINT32_MAX;
+ for(unsigned i=0;i<EventCount;++i)d.window.event[i]=d.total.event[i]=UINT32_MAX;
+ for(unsigned i=0;i<4;++i)d.window.remaining[i]=d.total.remaining[i]=UINT32_MAX;
+ d.window.queueMax=d.window.waitMaxMs=d.window.drainMaxMs=UINT32_MAX;
+ out.text.clear();service(out,UINT32_MAX-10000,true,255,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,-2147483647,UINT32_MAX,UINT32_MAX,true);
+ for(unsigned t=100;t<10000;t+=100)service(out,t,true,255,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,-2147483647,UINT32_MAX,UINT32_MAX,true);
+ assert(d.total.event[LossLogDrop]==UINT32_MAX && out.longest<768); // saturated, not wrapped
+ std::printf("Maximum emitted record: %u bytes\n",unsigned(out.longest));
+ std::printf("Diagnostic saturation, interval snapshot/CTS reconciliation, queue histogram, bitmap/LAST uncertainty, wrap, identity transactions and bounded full/compact output and actually quiet D: PASS (%u bytes)\n",unsigned(sizeof(Evidence)));
 }

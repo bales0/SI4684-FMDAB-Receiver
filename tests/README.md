@@ -568,3 +568,25 @@ external RF logs are optional and are not used as host-test fixtures. The new
 hardware A/B test and all field meanings are in
 [the diagnostic report](../docs/SI4684_DSRV_SLS_DIAGNOSTICS_2026-10-26.md).
 Host success cannot establish real RF delivery or audible continuity.
+
+
+CTS/RAM/UA regressions (28 October 2026):
+`test_dab_loss_diag.cpp` is compiled in compact and full-detail configurations.
+It checks saturation, actual Quiet semantics, explicit reports, maximal line
+widths and credible SLS internal holes versus context/switch interruption.
+`test_dab_cts_ua.py` compiles actual first-timeout/recovery and mode/UA command
+branches with the actual 2048-byte UART wrapper. It tests backpressure without
+extra chip accesses, STATUS3, generation/wrap and completed scan requirements.
+Coexistence also executes the whole MODE-C packet dispatch and SLS handoff,
+then resumes real PI/SI decoding. All are included in `run_epg_tests.py`.
+
+The read-only `analyze_cts_watchdog_logs.py` accepts the separately supplied
+4a4b2d2 ZIP; it does not infer CTS causality from service gaps. Source logs are
+not required by the host runner, which uses the preserved fixture RAW/ZIP.
+Results and target memory measurements: [Czech audit](../docs/SI4684_CTS_DSRV_XPAD_RAM_AUDIT_2026-10-27_CZ.md).
+External physical acceptance: [Polish guide](../docs/TEST_SI4684_MUX11A_11B_CTS_DSRV_PL.md).
+
+Builds: `pio run -e esp32dev -e esp32dev_spi5 -e esp32dev_diag`.
+The first two differ only in radio SPI speed; the detail build retains all
+per-opcode statistics and requires additional DRAM. Never reduce the Core
+reserve to make an optional experiment pass. This task does not flash hardware.

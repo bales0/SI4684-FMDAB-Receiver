@@ -69,5 +69,15 @@ struct Registry {
   if(n && data[0]==3)increment(c.si);else if(n && data[0]==2){increment(c.pi);c.programmes=programmes;}else increment(c.png);
  }
 };
+inline bool emptyDirectoryGroup(const uint8_t* p,size_t n) {
+ // Ordinary PI/PNG packets need no diagnostic CRC/hash or registry initialization.
+ if(!p || n<24 || (p[0]&15)!=6)return false;
+ epg::GroupEnvelope h;
+ if(epg::inspectGroup(p,n,h)!=epg::GroupCheck::Valid || h.type!=6 || h.segment!=0x8000 || h.length<13)return false;
+ const uint8_t* b=p+h.offset;
+ const uint32_t declared=uint32_t(b[0])<<24|uint32_t(b[1])<<16|uint32_t(b[2])<<8|b[3];
+ const uint16_t ext=uint16_t(b[11])<<8|b[12];
+ return !b[4] && !b[5] && !(b[0]&0xc0) && !(b[9]&0x80) && declared==h.length && size_t(13)+ext==h.length;
+}
 inline Registry& registry(){static Registry counters;return counters;}
 } // namespace epg_diag

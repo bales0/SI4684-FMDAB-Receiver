@@ -248,10 +248,21 @@ void processCommandLine(char* line) {
   char* equals = strchr(input, '=');
   if (!equals) {
     upperInPlace(input);
+    if (strncmp(input,"DSRV UA PAUSE ",14)==0) {
+      char* end=nullptr;const unsigned long seconds=strtoul(input+14,&end,10);
+      const bool syntax=input[14]>='0' && input[14]<='9' && end && !*end;
+      const bool accepted=syntax && seconds>=30 && seconds<=900 && radio.pausePeriodicUa(unsigned(seconds));
+      diagSerial.printf("[DSRV/UA] requested=PAUSE seconds=%lu result=%s\n",seconds,accepted?"ACCEPTED":"UNSUPPORTED");
+      return;
+    }
+    if (strcmp(input,"DSRV UA RESUME")==0) {
+      radio.resumePeriodicUa();diagSerial.println("[DSRV/UA] requested=RESUME result=ACCEPTED");return;
+    }
     if (strcmp(input,"DSRV STATUS")==0) {
       diagSerial.printf("[DSRV/MODE] mode=%s epoch=%u probe=%u debug=%u\n",
           dab_loss::modeName(dab_loss::evidence().mode),unsigned(dab_loss::evidence().modeEpoch),
           unsigned(radio.spiProbeState()),diagnosticDebug);
+      radio.requestDsrvStatus();
       return;
     }
     if (strncmp(input, "DSRV MODE ", 10) == 0 && input[10] && !input[11]) {

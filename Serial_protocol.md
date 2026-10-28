@@ -229,29 +229,117 @@ Enable `DEBUG` before collecting the failure log and keep the monitor open
 across a restart to capture the boot reason and any ESP32 panic/backtrace.
 `DEBUG SLSV` is not required for these summaries.
 
-### `DSRV MODE A|B|C|D` and `DSRV STATUS`
+### `DSRV MODE A|B|C|D`, `DSRV STATUS` and periodic UA pause
 
-Temporary RAM-only loss-diagnostics experiment, available without ENABLE.
-A is normal packet parsing with DEBUG on; B requests STOP of the separately
-owned packet SPI service while keeping audio/PAD/SLS; C drains packet replies
-but omits packet EPG Core parsing; D is normal reception with ordinary DEBUG
-and verbose off, retaining bounded aggregates. No setting is written to NVS.
+RAM-only service commands, case-insensitive, available without ENABLE. Terminate
+with CR, LF or CRLF; an empty second terminator is ignored. A new ESP32 boot
+restores normal reception and removes all experiment settings. No NVS writes.
 
-`[DSRV/MODE] requested=B result=ACCEPTED probe=5` acknowledges a request, not
-completed hardware STOP. Use `DSRV STATUS` to verify mode B/probe 0 (Idle), then
-mode A/probe 4 (Observing) after return. Shared/missing packet ownership, FM,
-replay or cleanup failure can return UNSUPPORTED. In-flight START/STOP uses the
-existing owner cleanup sequence. A/C/D restore automatic production acquisition.
+| Command | Effect |
+|---|---|
+| `DSRV MODE A` | Normal packet reception/Core parsing; DEBUG on, SLS verbose off. |
+| `DSRV MODE B` | Request physical STOP of the separately owned packet SPI service; continue audio/PAD/SLS. DEBUG on. |
+| `DSRV MODE C` | Keep physical packet START/read/ACK; skip only packet `livePayload()`/Core feeding. PAD and its validated EPG path are unchanged. DEBUG on. |
+| `DSRV MODE D` | Normal packet/Core reception, DEBUG/verbose off; no automatic aggregate/loss reports, content hashes or loss-bitmap construction. Small counters and watchdog remain active. |
+| `DSRV STATUS` | Print current mode, UA state, SPI/build/RAM configuration, then request one paced aggregate report. Replay the retained first-CTS snapshot if present. Does not enable DEBUG or leave D. |
+| `DSRV UA PAUSE 30` … `DSRV UA PAUSE 900` | Pause only periodic UA refresh for the given seconds, after a successful complete current-context initial scan. |
+| `DSRV UA RESUME` | Cancel the temporary UA pause. An overdue periodic refresh becomes eligible normally. |
 
-`[DSRV/RATE]`, `[DSRV/CMD]`, `[DSRV/QUEUE]` and `[DSRV/PATH]` report frozen
-30 s interval and cumulative evidence, paced at most once per 100 ms with UART
-headroom. `[SLS/LOSS]` and `[SLS/PATH]` describe completed/abandoned collectors,
-including a full missing-segment bitmap. Missing LAST means a lower bound, not
-an invented total. Counters saturate; lost diagnostic records are counted.
-`mixed=1` marks a rate interval crossing mode changes. Use a fresh boot for each
-variant and at least 20 closed TIDs; new hardware measurements remain required.
+Examples (observations vary):
 
-See [field definitions, evidence and complete A/B hardware procedure](docs/SI4684_DSRV_SLS_DIAGNOSTICS_2026-10-26.md).
+```text
+DSRV MODE B
+[DSRV/MODE] requested=B result=ACCEPTED probe=5
+DSRV STATUS
+[DSRV/MODE] mode=B epoch=1 probe=0 debug=1
+[DSRV/UA] paused=0 remainingMs=0 generation=7 complete=1 failed=0
+[DSRV/STATUS] spiHz=10000000 detail=0 core=1 free8=13000 largest8=9000 free32=16000 largest32=7000 reserve8=12000
+DSRV UA PAUSE 900
+[DSRV/UA] requested=PAUSE seconds=900 result=ACCEPTED
+DSRV UA RESUME
+[DSRV/UA] requested=RESUME result=ACCEPTED
+```
+
+Mode acknowledgement means **accepted request**, not completed physical STOP.
+Verify B/probe=0 (Idle), then near-zero packet traffic and continued PAD/SLS.
+A/C/D may take time to restore probe=4 (Observing). Missing/shared packet
+ownership, FM, replay or failed cleanup can return `UNSUPPORTED`. Do not force
+an audio/SLS STOP to work around an unsupported experiment. `DEBUG SPI STOP`
+is the separate probe control; it does not select MODE B.
+
+UA PAUSE returns `UNSUPPORTED` outside 30–900 seconds, during tune/service
+requests, FM/replay, an incomplete/failed scan or invalid inventory. It neither
+cancels initial discovery nor freezes a newly changed service/list. Expiry,
+RESUME and real inventory/context invalidation cancel it. Deadlines are
+millis-wrap-safe; there is no persistent UA-off setting. Query current remaining
+time with STATUS. Changing A–D does not itself imply UA RESUME.
+
+A–C and ordinary DEBUG use frozen interval reports, paced at 100 ms. Normal
+builds retain **other / dsrv / signal / UA** command rows: `other` sums every
+remaining opcode. `esp32dev_diag` preserves all 22 individual rows and costs
+2160 extra DRAM bytes. The ten action columns keep their previous meaning.
+All counters saturate. RATE's actual `ms` must be used for normalization;
+explicit STATUS freezes a report early, so do not poll it repeatedly during a
+30-second rate comparison. A mode change starts a fresh diagnostic window.
+
+MODE C still performs the independent complete-empty-Directory check (including
+CRC) and the read-path content hash. It is not a test with every parser disabled.
+D skips content hashes and automatic formatting; normal Core validation and
+small path counters continue. An explicit STATUS is intentionally not silent.
+
+The UART queue is **2048 bytes**, drained at the unchanged 64-byte service
+budget. Runtime writes never wait for hardware capacity. Diagnostic records
+use a 768-byte bounded formatter and require headroom; full records can be
+dropped rather than delaying radio work. Partial-write discarded tails are
+included in the saturating dropped-byte count. EPG framing/command thresholds
+remain unchanged; a client must continue waiting for whole ACK lines.
+
+`SLS/LOSS exact=1` means a LAST segment bounded the bitmap, **not** proven RF
+loss. `credibleInternal=1` requires segment zero and LAST, internal holes, the
+same diagnostic context/mode and no explicit switch/reset/recovery closure.
+`contextEpoch` and `modeEpoch` are start/end pairs. Even credible internal holes
+do not identify which layer lost a segment. Entering a carousel halfway through
+or missing LAST is not conclusive. D does not enqueue detailed bitmap records.
+
+### First CTS failure and recovery snapshot
+
+Without an extra SPI query, the first terminal timeout of a failure episode
+freezes `[DAB/CTS-FIRST]` plus `[DAB/CTS-STATE]`, even with DEBUG off. If UART is
+full, the snapshot remains pending. Repeated failures do not overwrite the
+first operation. On recovery it can be replayed as `[DAB/CTS-RECOVERY]`.
+`[DAB/WATCHDOG]` is also a bounded critical record independent of DEBUG.
+STATUS can request the retained snapshot again; it is not a new failure.
+
+- `atMs`, `op`, `command`, `args`, `argCount`: captured monotonic time, internal
+  operation, command byte and first **up to four** argument bytes (not a full
+  command dump). Only argCount bytes are meaningful. `result=-4` is Timeout.
+- `elapsedMs`: host command lifetime; `deadlineLatenessUs`: overdue service time;
+  `lastServiceGapUs`: last service interval. None proves when CTS first became ready.
+- `status=STATUS0,1,2,3`, `statusKnown`, `statusAgeMs`: last observed status;
+  ignore decoded flags when statusKnown=0. `sticky3` ORs observed low five error
+  bits in the current context, rather than adding a status read.
+- `DSPERR/REPOFERR/CMDOFERR/ARBERR/ERRNR`: last-status bit decodes, distinct from
+  sticky3. No new recovery policy is based on these diagnostic flags.
+- STATE includes generation, EPG epoch/reset count, actual interval, observed
+  queueMax, overflow total/delta, packet/PAD headers, separate heap capability
+  pools/largest blocks, stackMinBytes, core and EPG state.
+
+`BUFF_COUNT` remains a reported number, not a verified FW 6.0.9 FIFO capacity.
+The older AN649 specification describes remaining buffers but does not explain
+the observed value 19 on this firmware. Retain raw status for firmware-specific
+interpretation. The new records do not establish the cause of the 11A hang.
+
+Builds: `esp32dev` = normal 10 MHz; `esp32dev_spi5` changes only radio SPI to
+5 MHz; `esp32dev_diag` = full command diagnostics at 10 MHz. TFT VSPI stays
+27 MHz. A slower SPI build is an A/B measurement, not a proven fix. The service
+build may fail Core's original 12000-byte reserve on a tighter unit; never lower
+the reserve to make that RF experiment appear valid.
+
+See [the current Czech audit](docs/SI4684_CTS_DSRV_XPAD_RAM_AUDIT_2026-10-27_CZ.md)
+and [the Polish RF procedure](docs/TEST_SI4684_MUX11A_11B_CTS_DSRV_PL.md).
+The [26 October report](docs/SI4684_DSRV_SLS_DIAGNOSTICS_2026-10-26.md)
+describes the historical 4a4b2d2 diagnostics; its D-mode and memory details are
+superseded here.
 
 ### `DEBUG SLSV` or `DEBUG VERBOSE`
 
@@ -1314,7 +1402,7 @@ An answering command resets the failure window. It does not trip on idle time,
 a single delayed host service, or elapsed rendering time alone. Existing genuine
 CTS protection also remains. A trip gates new DAB commands and uses the existing
 sketch cold-recovery path, including shared tuner/TFT reset and its 60-second
-retry limit. No reset is issued inside a reply callback. On a DEBUG-visible trip,
+retry limit. No reset is issued inside a reply callback. On a trip,
 `[DAB/WATCHDOG]` prints the reason and relevant counters once. The last host gap
 is diagnostic evidence only; it is not the entire timeout and does not establish
 when CTS became ready. POLL and INTB use the same command-completion watchdog.

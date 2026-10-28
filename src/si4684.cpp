@@ -9,6 +9,8 @@
 
 #include "si4684.h"
 #include "dab_loss_diag.h"
+#include "dab_loss_diag_output.h"
+#include "dab_cts_evidence.h"
 #include "constants.h"
 #include "dab_scheduler_policy.h"
 #include "dab_user_application.h"
@@ -73,7 +75,10 @@ static constexpr int RADIO_SPI_SCK = 14;
 static constexpr int RADIO_SPI_MISO = 16;
 static constexpr int RADIO_SPI_MOSI = 13;
 static constexpr int RADIO_SPI_CS = 15;
-static constexpr uint32_t RADIO_SPI_HZ = 10000000UL;
+#ifndef RADIO_SPI_HZ
+#define RADIO_SPI_HZ 10000000UL
+#endif
+static_assert(RADIO_SPI_HZ==10000000UL || RADIO_SPI_HZ==5000000UL,"Unsupported radio SPI experiment");
 static SPIClass RadioSPI(HSPI);
 static bool radioSpiInitialized = false;
 static bool radioMemoryPrepareAttempted = false;
@@ -110,6 +115,8 @@ static uint32_t radioBootIrqEdgeCount = 0;
 static bool commandAwaitingCts = false;
 static bool commandStatusReadTriggeredByIrq = false;
 static uint32_t commandStartedUs = 0;
+static uint8_t lastCommandArgs[4]={},lastCommandArgCount=0;
+static dab_health::CtsEvidence ctsEvidence;
 static bool radioPowerUpCtsViaIrq = false;
 static bool radioAppTestCtsViaIrq = false;
 static bool radioDabRuntimeActive = false;
@@ -336,6 +343,8 @@ static void useRuntimePollingFallback(const char* reason) {
 
 static bool hostWriteCommand(void*, uint8_t command, const uint8_t* args, uint16_t length) {
   diagLastCommand = command;
+  lastCommandArgCount=length<sizeof(lastCommandArgs)?uint8_t(length):uint8_t(sizeof(lastCommandArgs));
+  for(unsigned i=0;i<lastCommandArgCount;++i)lastCommandArgs[i]=args[i];
   commandAwaitingCts = true;
   commandStatusReadTriggeredByIrq = false;
   commandStartedUs = micros();
@@ -425,6 +434,7 @@ static void hostIdle(void*) {
 
 static void statusChanged(void*, const si468x::Status& status) {
   lastStatus0 = status.status0;
+  if(radioDabRuntimeActive)ctsEvidence.status(status.status0,status.status1,status.status2,status.status3,millis());
   const bool irqTriggered = commandStatusReadTriggeredByIrq;
   // One callback corresponds to the status read caused by the most recent
   // service decision. Do not carry its trigger into a later safety poll.
@@ -717,6 +727,7 @@ bool DAB::begin(uint8_t SSpin, RadioMode requestedMode) {
   dabCommand = DabCommand::None;
   dabCommandRequestId = 0;
   dabGeneration = dab_scheduler::nextGeneration(dabGeneration);
+  ctsEvidence.context();dab_loss::evidence().contextChanged();
   dabProgress=dab_health::Watchdog{};
   dabCommandGeneration = dabGeneration;
   dabTuneRequestId = 0;
@@ -1402,6 +1413,7 @@ void DAB::onHardwareResetComplete(void) {
   const si468x::Result aborted = chip.abortCommand();
   if(dab_loss::evidence().active)dab_loss::evidence().terminal(unsigned(dabCommand),int(aborted));
   dabGeneration = dab_scheduler::nextGeneration(dabGeneration);
+  ctsEvidence.context();dab_loss::evidence().contextChanged();
   dabProgress=dab_health::Watchdog{};
   dabCommandGeneration = dabGeneration;
   dabCommand = DabCommand::None;
@@ -1463,11 +1475,64 @@ void DAB::invalidateDabAudioInfo(uint32_t notBeforeMs) {
   protectionlevel = 0;
 }
 
+void DAB::observeDabTerminal(uint8_t operation,int result,uint32_t generation) {
+  const bool timeout=result==int(si468x::Result::Timeout);
+  const bool answered=result==int(si468x::Result::Ok) || result==int(si468x::Result::DeviceError);
+  if(generation!=dabGeneration || !ctsEvidence.needsCapture(timeout,answered))return;
+  auto& f=ctsEvidence.first;f=dab_health::CtsSnapshot{};
+  const uint32_t now=millis();
+  f.operation=operation;f.command=diagLastCommand;f.argCount=lastCommandArgCount;
+  for(unsigned i=0;i<f.argCount;++i)f.args[i]=lastCommandArgs[i];
+  f.elapsedMs=uint32_t(micros()-commandStartedUs)/1000;
+  f.gapUs=chip.lastServiceGapUs();f.latenessUs=chip.lastDeadlineLatenessUs();
+  f.generation=generation;f.epoch=epg_diag::registry().epoch;f.resets=epg_diag::registry().totalResets;
+  const auto& d=dab_loss::evidence();f.intervalMs=now-d.reportAt;
+  f.queueMax=d.window.queueMax;f.overflow=diagDabDsrvOverflowCount;
+  f.overflowDelta=d.window.event[dab_loss::Overflow];f.packet=d.window.event[dab_loss::Source0];f.pad=d.window.event[dab_loss::Source1];
+  f.free8=heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+  f.largest8=heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+  f.free32=heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_32BIT|MALLOC_CAP_EXEC);
+  f.largest32=heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_32BIT|MALLOC_CAP_EXEC);
+  f.stackMinBytes=uxTaskGetStackHighWaterMark(nullptr);f.core=epg::runtime()!=nullptr;
+  f.epgState=uint8_t(epg::availability());ctsEvidence.freeze(now);
+}
+
+void DAB::serviceCtsEvidence(void) {
+  if(!ctsEvidence.valid || (!ctsEvidence.pending && !ctsEvidence.recoveryPending) || diagSerial.availableForWrite()<1536)return;
+  const auto& f=ctsEvidence.first;
+  dab_loss::emit(diagSerial,"[DAB/CTS-%s] atMs=%u op=%u command=%02X args=%02X,%02X,%02X,%02X argCount=%u result=-4 elapsedMs=%u deadlineLatenessUs=%u lastServiceGapUs=%u status=%02X,%02X,%02X,%02X statusKnown=%u statusAgeMs=%u sticky3=%02X DSPERR=%u REPOFERR=%u CMDOFERR=%u ARBERR=%u ERRNR=%u reason=%s\n",
+    ctsEvidence.recoveryPending?"RECOVERY":"FIRST",unsigned(f.atMs),f.operation,f.command,f.args[0],f.args[1],f.args[2],f.args[3],f.argCount,
+    unsigned(f.elapsedMs),unsigned(f.latenessUs),unsigned(f.gapUs),f.status[0],f.status[1],f.status[2],f.status[3],f.statusKnown,unsigned(f.statusAgeMs),f.sticky,
+    bool(f.status[3]&16),bool(f.status[3]&8),bool(f.status[3]&4),bool(f.status[3]&2),bool(f.status[3]&1),dab_health::name(dab_health::Stall(f.recoveryReason)));
+  dab_loss::emit(diagSerial,"[DAB/CTS-STATE] generation=%u epoch=%u resets=%u ms=%u queueMax=%u overflow=%u overflowDelta=%u packet=%u pad=%u free8=%u largest8=%u free32=%u largest32=%u stackMinBytes=%u core=%u state=%s\n",
+    unsigned(f.generation),unsigned(f.epoch),unsigned(f.resets),unsigned(f.intervalMs),unsigned(f.queueMax),unsigned(f.overflow),unsigned(f.overflowDelta),unsigned(f.packet),unsigned(f.pad),unsigned(f.free8),unsigned(f.largest8),unsigned(f.free32),unsigned(f.largest32),unsigned(f.stackMinBytes),f.core,epg::availabilityName(epg::Availability(f.epgState)));
+  ctsEvidence.pending=ctsEvidence.recoveryPending=false;
+}
+
+bool DAB::pausePeriodicUa(unsigned seconds) {
+  const bool complete=!isFm() && !epg::replayActive() && dabServiceListReady && dabUaInventoryValid && dabActiveServiceValid &&
+      !dabServiceRequestPending && !dabTuneRequestPending && !dabUaScan.failed &&
+      dabUaScan.functionalComplete(dabCommand==DabCommand::ComponentInfo);
+  return dabUaPause.pause(millis(),seconds,dabGeneration,complete);
+}
+void DAB::resumePeriodicUa(void) {dabUaPause.cancel();}
+
+void DAB::requestDsrvStatus(void) {
+  auto& d=dab_loss::evidence();d.reportRequested=true;d.stage=255;ctsEvidence.request();
+  const bool paused=dabUaPause.blocked(millis(),dabGeneration);
+  dab_loss::emit(diagSerial,"[DSRV/UA] paused=%u remainingMs=%u generation=%u complete=%u failed=%u\n",paused,paused?unsigned(dabUaPause.until-millis()):0,unsigned(dabGeneration),dabUaScan.functionalComplete(dabCommand==DabCommand::ComponentInfo),unsigned(dabUaScan.failed));
+  dab_loss::emit(diagSerial,"[DSRV/STATUS] spiHz=%u detail=%u core=%u free8=%u largest8=%u free32=%u largest32=%u reserve8=12000\n",
+    unsigned(RADIO_SPI_HZ),unsigned(SI4684_DIAG_DETAIL),epg::runtime()!=nullptr,
+    unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)),
+    unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_32BIT|MALLOC_CAP_EXEC)),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_32BIT|MALLOC_CAP_EXEC)));
+}
+
 void DAB::requestDabRecovery(dab_health::Stall reason) {
   if(dabTransportStalled)return;
   dabTransportStalled=true;dabStallReason=reason;++diagDabRecoveryRequestCount;
+  ctsEvidence.recovery(uint8_t(reason));serviceCtsEvidence();
   const uint32_t now=millis();
-  DIAG_PRINTF("[DAB/WATCHDOG] reason=%s failures=%u lastCtsAgeMs=%u known=%u inFlightAgeMs=%u op=%u hostGapUs=%u recovery=%u\n",
+  dab_loss::emit(diagSerial,"[DAB/WATCHDOG] reason=%s failures=%u lastCtsAgeMs=%u known=%u inFlightAgeMs=%u op=%u hostGapUs=%u recovery=%u\n",
     dab_health::name(reason),unsigned(dabProgress.failures),unsigned(now-dabProgress.lastSuccess),dabProgress.successKnown,
     dabProgress.inFlight?unsigned(now-dabProgress.inFlightSince):0,unsigned(dabProgress.operation),unsigned(chip.lastServiceGapUs()),unsigned(diagDabRecoveryRequestCount));
 }
@@ -2309,6 +2374,7 @@ void DAB::setFreq(uint8_t freq) {
   lastStatus0 = 0;
 
   dabGeneration = dab_scheduler::nextGeneration(dabGeneration);
+  ctsEvidence.context();dab_loss::evidence().contextChanged();
   dabProgress=dab_health::Watchdog{};
   if (dab_switch::transitionActive(dabSwitch.state))
     ++diagDabAbandonedSwitchCount;
@@ -3192,6 +3258,8 @@ void DAB::finishDabCommand(void) {
   dabCommand = DabCommand::None;
   finishCommandDiagnostics(result);
 
+  observeDabTerminal(uint8_t(completed),int(result),completedGeneration);
+
   // A device error proves an answer. Host-gap classification is diagnostic;
   // terminal failures independently guard communication progress.
   if(completedGeneration==dabGeneration){
@@ -3737,9 +3805,7 @@ void DAB::finishDabCommand(void) {
             const si468x::Result readResult = readDsrvPayload(static_cast<uint16_t>(24U + header.byteCount));
             finishCommandDiagnostics(readResult);
             if (readResult == si468x::Result::Ok) {
-              epg_diag::Registry observed;
-              observed.group(epg_diag::Path::Packet,SPIbuffer+25,header.byteCount,false,millis());
-              dab_loss::evidence().event(observed.at(epg_diag::Path::Packet).empty?dab_loss::PacketEmptyDir:dab_loss::PacketOther);
+              dab_loss::evidence().event(epg_diag::emptyDirectoryGroup(SPIbuffer+25,header.byteCount)?dab_loss::PacketEmptyDir:dab_loss::PacketOther);
               if(dab_loss::evidence().mode==dab_loss::Mode::NoParse)dab_loss::evidence().event(dab_loss::ParseSkipped);
               else epg::livePayload(SPIbuffer + 25, header.byteCount);
             }
@@ -4211,7 +4277,10 @@ bool DAB::setDsrvDiagnosticMode(char mode) {
     return d.mode==dab_loss::Mode::NoPacket;
   }
   d.mode=mode=='B'?dab_loss::Mode::NoPacket:mode=='C'?dab_loss::Mode::NoParse:mode=='D'?dab_loss::Mode::Quiet:dab_loss::Mode::Normal;
-  d.experiment=true;dab_loss::inc(d.modeEpoch);d.hashKnown=false;
+  d.experiment=mode!='D';dab_loss::inc(d.modeEpoch);d.hashKnown=false;
+  // A new measurement window cannot replay stale verbose rows after Quiet.
+  d.stage=255;d.reportRequested=false;d.reportAt=millis();d.window=dab_loss::Bank{};
+  d.windowEpoch=d.modeEpoch;d.lossCount=0;
   epgManualPending=false;
   epgProductionPaused=mode=='B';
   if(mode=='B')dabSpiProbe.stop(millis());
@@ -4624,6 +4693,7 @@ bool DAB::xpadSpiPresent(void) const {
 }
 
 void DAB::resetDabSpiDiscovery(bool preservePresence, bool logInventory) {
+  dabUaPause.cancel(); // real inventory/service changes override the experiment
   const uint16_t previousConfirmed = dabSpiDiscovery.confirmed;
   for (auto& identity : dabSpiIdentities) identity = dab_spi::Identity::Unqueried;
   dabUaRefresh.cancel();
@@ -4939,7 +5009,7 @@ void DAB::Update(bool allowNewWork) {
         (!dabSpiProbe.spi.valid || epgContinuous) &&
         (dabSwitch.state == dab_switch::State::Ready ||
          dabSwitch.state == dab_switch::State::AudioOnly);
-    if (dabUaRefresh.ready(now, uaRefreshEligible)) {
+    if (dabUaRefresh.ready(now, uaRefreshEligible) && !dabUaPause.blocked(now,dabGeneration)) {
       resetDabSpiDiscovery(true, false);
       dabUaNextQueryMs = now;
     }

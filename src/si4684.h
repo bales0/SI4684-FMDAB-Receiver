@@ -209,6 +209,10 @@ class DAB {
     // false no new metadata, DSRV or status command is scheduled.
     void Update(bool allowNewWork = true);
     bool setDsrvDiagnosticMode(char mode);
+    void requestDsrvStatus(void);
+    bool pausePeriodicUa(unsigned seconds);
+    void resumePeriodicUa(void);
+    void serviceCtsEvidence(void);
     uint8_t spiProbeState() const { return uint8_t(dabSpiProbe.state); }
     void vol(uint8_t vol);
     RadioMode mode(void) const { return activeMode; }
@@ -410,6 +414,7 @@ class DAB {
     uint8_t dabServiceTypeScanIndex = 0;
     // Separate diagnostic inventory: the public station table keeps only the
     // first component. 32 services x at most 14 components (AN649 NUM_COMP).
+    dab_spi::RefreshPause dabUaPause;
     struct UaService {
       uint32_t sid;
       uint16_t first;
@@ -492,6 +497,7 @@ class DAB {
     uint8_t dabConsecutiveCtsTimeouts = 0;
     bool dabTransportStalled = false;
     void requestDabRecovery(dab_health::Stall reason);
+    void observeDabTerminal(uint8_t operation, int result, uint32_t generation);
 
     // One RAM-only MOT buffer. Received segments are kept packed in ascending
     // SegmentNumber order, so all 51200 bytes are usable payload capacity even

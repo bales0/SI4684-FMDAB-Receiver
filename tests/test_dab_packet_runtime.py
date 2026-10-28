@@ -75,6 +75,7 @@ class DAB {
   DABService service[32] = {};
   uint8_t numberofservices = 0, ServiceIndex = 0;
   uint32_t serviceID = 0, componentID = 0, CurrentServiceID = 0;
+  dab_spi::RefreshPause dabUaPause;
   bool SlideShowAvailable=false,SlideShowInit=false;bool slideshowSignalled()const;
   bool ServiceStart=true,dabTuneRequestPending=false;bool isFm()const{return false;}
   dab_spi::Identity xpadSpiIdentity()const;bool xpadSpiPresent()const;

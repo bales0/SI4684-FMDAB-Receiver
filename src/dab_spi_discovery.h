@@ -26,6 +26,22 @@ struct RefreshCycle {
   }
 };
 
+// RAM-only experiment. Initial discovery and any real context invalidation
+// always remain eligible; only the periodic 60 s refresh checks this pause.
+struct RefreshPause {
+  uint32_t until=0,generation=0;
+  bool active=false;
+  void cancel(){active=false;}
+  bool pause(uint32_t now,unsigned seconds,uint32_t context,bool complete){
+    if(!complete || seconds<30 || seconds>900)return false;
+    until=now+seconds*1000U;generation=context;active=true;return true;
+  }
+  bool blocked(uint32_t now,uint32_t context){
+    if(active && (generation!=context || int32_t(now-until)>=0))active=false;
+    return active;
+  }
+};
+
 // Called only after the whole service-list structure has been validated.
 // Retain every wire CID, including the upper bits used by tuner commands.
 inline bool retainComponents(uint32_t* table, size_t capacity, size_t first,

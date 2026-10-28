@@ -244,6 +244,18 @@ int main(int argc,char** argv){
  const auto printed=diagSerial.output;testMillis+=1000;epg::poll();assert(diagSerial.output==printed);
  diagnosticDebug=false;epg::poll();assert(!timing.enabled);
  assert(allocationAttempt==allocatedAtStart && free8Bytes>=12000);
+ // Production MODE C still drains/ACKs full packets and SLS, but cannot feed Core.
+ configure();refreshPad(dab_spi::Identity::NotSpi);dab_loss::evidence().mode=dab_loss::Mode::NoParse;
+ const auto cFrames=c->stats.frames,fullReads=chip.reads;const auto cRevision=c->revision;
+ for(const auto& f:data)inject(f,0);
+ assert(chip.reads==fullReads+data.size() && c->stats.frames==cFrames && c->revision==cRevision && c->count()==0);
+ const auto modeCLegacy=radio.legacy;inject(Data{1,2,3},1,2);assert(radio.legacy==modeCLegacy+1);
+ assert(dab_loss::evidence().total.event[dab_loss::ParseSkipped]>=data.size());
+ assert(epg_diag::emptyDirectoryGroup(empty.data(),empty.size()));auto badEmpty=empty;badEmpty.back()^=1;
+ assert(!epg_diag::emptyDirectoryGroup(badEmpty.data(),badEmpty.size()));
+ dab_loss::evidence().mode=dab_loss::Mode::Normal;for(const auto& f:data){inject(f,0);while(c->busy())epg::poll();}
+ assert(c->count()==3 && c->stats.pi && c->stats.si);
+ std::puts("MODE C: actual full packet reads and SLS handoff continue, Core untouched; MODE A resumes PI/SI: PASS");
  std::puts("Production DSRV -> actual UA/route/owner -> exact payload -> Core -> cache/UI status: A-F PASS");
 }
 '''

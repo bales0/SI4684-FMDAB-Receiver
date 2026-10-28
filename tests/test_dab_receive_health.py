@@ -17,6 +17,9 @@ prefix=r'''
 #include "epg_transport_diag.h"
 #include "dab_scheduler_policy.h"
 #include "dab_receive_health.h"
+#include "dab_loss_diag_output.h"
+#include "dab_cts_evidence.h"
+static dab_health::CtsEvidence ctsEvidence;
 #include "vendor/si468x/Si468x.h"
 #include <cassert>
 #include <cstring>
@@ -35,7 +38,7 @@ static uint32_t diagDabCommandErrorCount=0,diagDabRecoveryRequestCount=0,diagDab
 struct Chip{si468x::Result result=si468x::Result::Timeout;unsigned gap=8500,headerCount=0;si468x::Result readCurrentReply(uint8_t* p,uint16_t){p[18]=uint8_t(headerCount);p[19]=uint8_t(headerCount>>8);return result;}si468x::Result lastResult(){return result;}unsigned lastServiceGapUs(){return gap;}}chip;
 void finishCommandDiagnostics(si468x::Result){}
 void SlideshowReceptionState(bool){}
-struct Monitor{unsigned availableForWrite(){return 4096;}}diagSerial;
+struct Monitor{int availableForWrite(){return 4096;}size_t write(const uint8_t*,size_t n){return n;}}diagSerial;
 uint8_t SPIbuffer[4096];
 struct DAB {
  const char* slsCloseReason="OTHER";si468x::Result readDsrvPayload(uint16_t);
@@ -43,6 +46,8 @@ struct DAB {
  bool dabTransportStalled=false;uint8_t dabConsecutiveCtsTimeouts=0;
  enum class DabCommand{None,StopService};DabCommand dabCommand=DabCommand::None;
  uint32_t dabCommandGeneration=1,dabGeneration=1;
+ void observeDabTerminal(uint8_t,int,uint32_t){}
+ void serviceCtsEvidence(){}
  void requestDabRecovery(dab_health::Stall);void finishDabCommand();void readGuard();void getServiceData();
  dab_scheduler::CtsTimeoutClass recordDabCtsResult(bool);
  bool transportStalled(){return dabTransportStalled;}
