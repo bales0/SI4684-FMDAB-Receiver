@@ -258,6 +258,10 @@ void processCommandLine(char* line) {
     if (strcmp(input,"DSRV UA RESUME")==0) {
       radio.resumePeriodicUa();diagSerial.println("[DSRV/UA] requested=RESUME result=ACCEPTED");return;
     }
+    if (strcmp(input,"DSRV QUEUE CLEAR")==0) {
+      const bool accepted=radio.clearDsrvQueue();
+      diagSerial.printf("[DSRV/QUEUE-CLEAR] result=%s counters=BOOT_RETAINED\n",accepted?"OK":"DISABLED");return;
+    }
     if (strcmp(input,"DSRV STATUS")==0) {
       diagSerial.printf("[DSRV/MODE] mode=%s epoch=%u probe=%u debug=%u\n",
           dab_loss::modeName(dab_loss::evidence().mode),unsigned(dab_loss::evidence().modeEpoch),

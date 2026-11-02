@@ -1793,14 +1793,20 @@ void loop(void) {
   // never to every radio pump. The reporter itself only enqueues paced lines.
   static uint32_t diagHealthAt=0,diagHeap=0,diagMinHeap=0,diagStack=0;
   const uint32_t diagNow=millis();
-  if(dab_loss::evidence().mode!=dab_loss::Mode::Quiet && (diagnosticDebug || dab_loss::evidence().experiment) && uint32_t(diagNow-diagHealthAt)>=30000U){
+  if((SI4684_DSRV_QUEUE_DIAG || (dab_loss::evidence().mode!=dab_loss::Mode::Quiet && (diagnosticDebug || dab_loss::evidence().experiment))) && uint32_t(diagNow-diagHealthAt)>=30000U){
     diagHealthAt=diagNow;diagHeap=ESP.getFreeHeap();diagMinHeap=ESP.getMinFreeHeap();
     diagStack=uxTaskGetStackHighWaterMark(nullptr);
+#if SI4684_DSRV_QUEUE_DIAG
+    radio.cacheDsrvQueueHealth();
+#endif
   }
   radio.serviceCtsEvidence();
   dab_loss::service(diagSerial,diagNow,diagnosticDebug,unsigned(radio.spiProbeState()),
       diagSerial.droppedBytes(),diagHeap,diagMinHeap,diagStack,
       radio.getRSSI(),radio.cnr,radio.fic,radio.signallock);
+#if SI4684_DSRV_QUEUE_DIAG
+  radio.serviceDsrvQueue();
+#endif
   diagSerial.service(64U);
   if (displayreset) ShowTuneModeCurrent();
   displayreset = false;

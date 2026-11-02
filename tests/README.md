@@ -590,3 +590,39 @@ Builds: `pio run -e esp32dev -e esp32dev_spi5 -e esp32dev_diag`.
 The first two differ only in radio SPI speed; the detail build retains all
 per-opcode statistics and requires additional DRAM. Never reduce the Core
 reserve to make an optional experiment pass. This task does not flash hardware.
+
+## DSRV RAW queue / first CTS evidence (2 November 2026)
+
+`run_epg_tests.py` now has 41 steps, including three queue-specific steps:
+
+- `test_dab_dsrv_queue.py`: actual SPI host framing, exact 24-byte API offsets,
+  all histogram boundaries, uint16/32 saturation, flags/states/combinations,
+  invalid/short/stale responses, actual retained-read overwrite/identity guards,
+  ring rollover, immutable first CTS capture, STATUS/CLEAR, raw hex fidelity,
+  UART pressure/CTS priority, maximal line widths and mixed-context windows.
+- `test_dab_cts_ua.py --queue`: actual first-CTS hook and completion-generation
+  fence, preserved RAW through successful response/recovery/context, manual-only
+  clear, real UART/parser. Without --queue it checks the compiled-off path too.
+- `test_epg_coexistence.py --queue`: actual full DSRV dispatch and production
+  Core under the additional 732-byte modeled DRAM pressure with reserve12000.
+  This host model does not establish actual free heap on ESP32.
+
+Build both `pio run -e esp32dev -e esp32dev_queue_diag`. Normal static RAM delta
+is 0; optional target delta is 736 B including alignment, Evidence sizeof732,
+with a static assertion ceiling768. The detail diagnostic environment is not
+used as its base. Host tests do not flash hardware.
+
+Read-only field evidence analysis:
+
+```text
+python tests/analyze_dsrv_queue_logs.py _usertesting/20261029/Dla_Alesa_d048c72_testy_11A_11B.zip --output .pio/queue_audit_20261102/log_analysis.json
+```
+
+This distinguishes a replay of the same CTS atMs and orders failures against
+actual mode ACKs. It does not infer RF causes from queue19 or invent missing log
+records. External tester ZIPs remain optional inputs, outside preserved fixtures.
+
+Results, exact local binary hashes and limitations are in the
+[Czech audit](../docs/SI4684_DSRV_QUEUE_RAW_CTS_AUDIT_2026-11-02_CZ.md).
+Physical Core/RAM acceptance and 11A/11B A/C/B/D measurements must follow the
+[Polish guide](../docs/TEST_SI4684_DSRV_QUEUE_INSTRUKCJA_PL.md).

@@ -2,7 +2,8 @@
 from pathlib import Path
 import subprocess, sys
 ROOT=Path(__file__).resolve().parents[1]
-out=ROOT/'.pio/cts_ua';out.mkdir(parents=True,exist_ok=True)
+queue_enabled='--queue' in sys.argv[2:]
+out=ROOT/('.pio/cts_ua_queue' if queue_enabled else '.pio/cts_ua');out.mkdir(parents=True,exist_ok=True)
 radio=(ROOT/'src/si4684.cpp').read_text(encoding='utf-8')
 header=(ROOT/'src/si4684.h').read_text(encoding='utf-8')
 comms=(ROOT/'src/comms.cpp').read_text(encoding='utf-8')
@@ -46,6 +47,7 @@ terminal=radio[start:radio.index('  // Reconcile physical probe ownership',start
 cpp=r'''
 #include "serial_monitor.h"
 #include "dab_cts_evidence.h"
+#include "dab_dsrv_queue_output.h"
 #include "dab_loss_diag_output.h"
 #include "dab_receive_health.h"
 #include "dab_spi_discovery.h"
@@ -70,6 +72,9 @@ unsigned uxTaskGetStackHighWaterMark(void*){return 3000;}
 HardwareSerial serial;
 NonBlockingSerialMonitor diagSerial(serial);
 static dab_health::CtsEvidence ctsEvidence;
+#if SI4684_DSRV_QUEUE_DIAG
+static dsrv_queue::Evidence dsrvQueue;
+#endif
 static dab_health::Watchdog dabProgress;
 static dab_health::Stall dabStallReason=dab_health::Stall::None;
 static uint32_t commandStartedUs=0;
@@ -104,7 +109,7 @@ struct DAB {
  dab_probe::State spiProbeState(){return dabSpiProbe.state;}
  dab_scheduler::CtsTimeoutClass recordDabCtsResult(bool){return dab_scheduler::CtsTimeoutClass::HostStarved;}
  void observeDabTerminal(uint8_t operation,int result,uint32_t generation);
- void serviceCtsEvidence();void requestDsrvStatus();
+ void serviceCtsEvidence();void requestDsrvStatus();bool clearDsrvQueue();
  void requestDabRecovery(dab_health::Stall reason);
  bool pausePeriodicUa(unsigned seconds);void resumePeriodicUa();
  bool setDsrvDiagnosticMode(char mode);void finishDabCommand();
@@ -113,6 +118,7 @@ struct DAB {
 for signature in [
     'void DAB::observeDabTerminal(uint8_t operation,int result,uint32_t generation)',
     'void DAB::serviceCtsEvidence(void)',
+    'bool DAB::clearDsrvQueue(void)',
     'void DAB::requestDabRecovery(dab_health::Stall reason)',
     'bool DAB::pausePeriodicUa(unsigned seconds)',
     'void DAB::resumePeriodicUa(void)',
@@ -143,6 +149,9 @@ int main(){
  assert(ctsEvidence.first.status[3]==0xdf && ctsEvidence.first.sticky==31 && ctsEvidence.first.statusAgeMs==3);
  assert(ctsEvidence.first.elapsedMs==1000 && ctsEvidence.first.core && ctsEvidence.pending);
  const auto initial=ctsEvidence.first;
+#if SI4684_DSRV_QUEUE_DIAG
+ const auto frozenTime=dsrvQueue.freezeAt;assert(dsrvQueue.frozen && frozenTime==initial.atMs);
+#endif
  radio.serviceCtsEvidence();assert(ctsEvidence.pending && !serial.output.size());
  for(unsigned i=1;i<8;++i){tick+=1000;us+=1000000;terminalTimeout(5);}
  assert(radio.dabTransportStalled && diagDabRecoveryRequestCount==1 && ctsEvidence.recoveryPending);
@@ -190,11 +199,23 @@ int main(){
  assert(dab_loss::evidence().reportRequested && !diagnosticDebug);
  assert(!chip.spiReads && !chip.spiWrites);
  std::puts("Actual modes A-D: safe STOP acceptance/completion, no cache changes, true Quiet and explicit STATUS: PASS");
+#if SI4684_DSRV_QUEUE_DIAG
+ assert(dsrvQueue.frozen && dsrvQueue.freezeAt==frozenTime); // CtsEvidence rearmed above; the RAW run did not.
+ const auto beforeStale=dsrvQueue.total.headers;
+ radio.dabCommand=DAB::DabCommand::DsrvHeader;radio.dabCommandGeneration=radio.dabGeneration-1;chip.result=si468x::Result::Ok;
+ radio.finishDabCommand();assert(dsrvQueue.total.value[dsrv_queue::StaleHeader]==1 && dsrvQueue.total.headers==beforeStale);
+ const auto rawTotal=dsrvQueue.total.headers;command("DSRV QUEUE CLEAR");
+ assert(!dsrvQueue.frozen && dsrvQueue.total.headers==rawTotal);
+ assert(serial.output.find("[DSRV/QUEUE-CLEAR] result=OK")!=std::string::npos);
+ std::puts("Actual first CTS hook: permanent RAW freeze survives rearm/context/status; explicit CLEAR alone rearms: PASS");
+#else
+ command("DSRV QUEUE CLEAR");assert(serial.output.find("result=DISABLED")!=std::string::npos);
+#endif
 }
 '''
 file=out/'cts_ua.cpp';file.write_text(cpp,encoding='utf-8');exe=out/'cts_ua.exe'
 cc=sys.argv[1] if len(sys.argv)>1 else 'C:/msys64/ucrt64/bin/g++.exe'
-subprocess.run([cc,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(out),'-I',str(ROOT/'src'),str(file),str(ROOT/'src/epg_core.cpp'),'-o',str(exe)],check=True)
+subprocess.run([cc,*(['-DSI4684_DSRV_QUEUE_DIAG=1'] if queue_enabled else []),'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(out),'-I',str(ROOT/'src'),str(file),str(ROOT/'src/epg_core.cpp'),'-o',str(exe)],check=True)
 subprocess.run([str(exe)],check=True)
 
 # Verify the exact production gates, not an independent copy of refresh logic.

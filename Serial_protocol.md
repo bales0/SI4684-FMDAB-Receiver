@@ -1491,3 +1491,111 @@ or scrolls detail text; ROT2 changes the list day or moves between detail
 programmes. ROT2 does not move the overview. MODE back from the list, or closing
 and reopening EPG, returns the overview to automatic NOW/NEXT. Menu/volume
 suspension keeps the selected view.
+
+### DSRV RAW queue evidence — optional build (2 November 2026)
+
+This instrumentation is compiled only in `esp32dev_queue_diag`, which extends
+`esp32dev` with `SI4684_DSRV_QUEUE_DIAG=1`. The default is 0: normal builds have
+no queue evidence object or periodic queue output. Queue detail is separate
+from `SI4684_DIAG_DETAIL`; this environment retains detail=0, 10 MHz radio SPI,
+the original partitions, four-command burst, ACK and timing policies.
+
+`DSRV STATUS` also requests a deferred, read-only replay of the retained queue
+capture in this build. It does not create a new capture, clear counters or
+change the receiver. Repeating STATUS can replay the same CTS `atMs`; that is
+not another timeout. Before a freeze it reports BOOT counters and the first
+over8 raw sample if available; it does not expose a moving ring as frozen data.
+
+New exact command (case-insensitive, CR/LF/CRLF accepted):
+
+```text
+DSRV QUEUE CLEAR
+[DSRV/QUEUE-CLEAR] result=OK counters=BOOT_RETAINED
+```
+
+This manually invalidates/rearms only the RAW capture, including its first-over8
+sample, and increments `capture`. BOOT and WINDOW counters/timestamps remain;
+the original CTS evidence, radio state and NVS are untouched. There is no
+automatic clear on tune or Si4684/TFT recovery. On normal builds the same command
+replies `result=DISABLED counters=BOOT_RETAINED` and performs no clear.
+
+The first actually captured CTS-FIRST freezes up to 12 original 24-byte headers,
+first-over8, context, ages and counters. Further CTS episodes, successful replies
+and cold recovery do not replace this snapshot. Every raw row has its own
+monotonic `atMs`, `gen` and `mode`. A ring can span contexts: do not associate an
+old row with the current tuning or a later CTS. Freeze metadata links the capture
+to the original CTS time. An ESP32 reboot or explicit CLEAR starts a new capture.
+
+All rows use the existing nonblocking `diagSerial`. The reporter waits for
+pending CTS-FIRST/STATE/RECOVERY, then sends at most one bounded record per
+100 ms with at least 512 B UART space. A full UART postpones output, preserving
+the cursor and snapshot. There are no additional SPI reads, heap allocations,
+per-header formatting or hot-path heap queries. The 448 B formatting buffer is
+on the stack; the existing UART queue remains 2048 B.
+
+Queue-build output remains available with DEBUG OFF and in mode D. This is a
+specific exception to the otherwise quiet D output: one WINDOW line after at
+least 30 seconds, a one-time short over8 notice, and deferred/explicit captures.
+Other D logging and A/B/C/D meanings are unchanged. A/B/C enable DEBUG; `DEBUG`
+is a toggle used to turn it off after checking the response, not `DEBUG OFF`.
+
+| Row / field | Meaning |
+|---|---|
+| `[DSRV/QUEUE] scope=WINDOW ms=...` | Actual interval since previous successfully queued summary, potentially longer than 30 s. STATUS does not reset it. |
+| mode, gen, firstGen, mixed | Current context and first observed generation; mixed=1 if mode/generation changed within the window, including a change with no new header. |
+| headers, qmaxRaw, over8, intsrcOvf, state2, phy | Successful current-generation API headers, unmodified raw maximum, and independent event counts in that window. |
+| hist | Eight bins: 0; 1; 2–3; 4–7; 8; 9–15; 16–31; 32–255. |
+| readFailBoot | Existing boot full-reply read-failure count, not another interval counter or new double count. |
+| serialDrop, queued | Existing UART dropped bytes and pending bytes. They do not measure RF loss. |
+| core, free8Cached | Core pointer exists; INTERNAL/8BIT free heap cached every 30 s. Use DSRV STATUS/EPG HEALTH for fresh full memory checks. |
+| suppressed, reportDrop | Saturating counters: postponed reporter attempts for UART headroom; oversized/failed record writes. |
+| frozen, sat | Capture latched; at least one counter in this Stats scope reached its limit. |
+| `[DSRV/QUEUE-OVER8] ... rawSaved=1` | One brief notification; full first-over8 raw is retained for CTS or STATUS. No per-anomaly hex stream. |
+| `[DSRV/QUEUE-FROZEN]` | capture, CTS atMs/reason/count/gen/mode/op/command, first-over8 time and known flags/ages of last over8/INTSRC overflow/state2, boot qmaxRaw at CTS. |
+| `[DSRV/QUEUE-COUNTS] scope=FROZEN/BOOT` | headers, data, empty, qmaxRaw, packetMax/padMax, over8, hist, sat. packetMax/padMax mean raw DATA_SRC0/1, not validated EPG ownership. |
+| `[DSRV/QUEUE-FLAGS] scope=FROZEN/BOOT` | ready, intsrcOvf, phy, state2/1/4/Other and over8NoOvf/state2NoOvf/over8Ovf/over8State2 combinations. StateOther excludes 0,1,2,3,4. |
+| `[DSRV/QUEUE-ERRORS] scope=FROZEN/BOOT` | headerErrors/short/stale; separate cmdTimeout/Transport/Device/Other; noCts/errCmd/status3; sidCidChanged/byteCountChanged/replyHeaderChanged; sat. |
+| `[DSRV/QUEUE-RAW]` | Ordered retained rows: capture, seq, atMs, gen, mode, read=HEADER, cts, errCmd, raw status3/intsrc hex, buffRaw, srvState, src, byteCount, SID/CID hex, raw24. |
+| `[DSRV/QUEUE-FIRST-OVER8]` | Same raw format, reserved seq=0 for the out-of-band first sample of this capture. |
+| `[DSRV/QUEUE-TIMES] scope=BOOT` | capture, over8Known/FirstAtMs/LastAtMs, state2Known/LastAtMs, ovfKnown/LastAtMs. These boot times survive manual CLEAR. |
+
+`raw24` is exactly 48 hexadecimal characters: logical STATUS0 starts at offset0,
+INTSRC at4, BUFF_COUNT at5, SRV_STATE at6, DATA_SRC/type at7, little-endian SID at8,
+CID at12 and BYTE_COUNT at18. All remaining bytes are preserved, including RFU.
+The physical SPI framing byte and legacy SPIbuffer[0] prefix are excluded.
+`read=HEADER` always identifies the existing first 24-byte reply, captured before
+an existing full read can overwrite it; full-read headers are not appended.
+
+`headers` does not assert semantic correctness of every byte: the vendor parser
+checks length/pointer only. Timeout/transport/device errors and stale generations
+do not insert stale buffer contents as RAW samples. `status3` error counts inspect
+low five bits while raw STATUS3 remains unmasked. There is no BUFF_COUNT clamp,
+mask, inferred FIFO size or new recovery trigger. AN649's eight-buffer statement
+has not been physically reconciled with FW6.0.9 raw19.
+
+INTSRC bit02 and SRV_STATE2 are separate evidence. State2 is not added to the
+original INTSRC overflow counter. Existing retained full reads compare SID/CID
+and BYTE_COUNT; their original guards count a single rejection reason in order.
+`replyHeaderChanged` is their sum; changing status/remaining is permitted and
+not diagnosed as corruption. Existing ReadOk/ReadFail counters retain their meaning.
+
+BOOT statistics are live at each emitted row; a multipart BOOT replay is not an
+atomic snapshot. FROZEN statistics are immutable boot totals at the first CTS;
+WINDOW statistics cover only the last actual interval. Detailed combinations and
+command errors are emitted in BOOT/FROZEN, not every short WINDOW line. `headers`
+saturates at UINT32_MAX; detailed counters/histogram at UINT16_MAX. `sat=1` marks a
+scope reaching a limit; such values are lower bounds. suppressed/reportDrop/capture
+also saturate at UINT16_MAX. Ring seq follows boot header count (a lower-bound
+identity after saturation); seq=0 is reserved for FIRST-OVER8.
+
+FIRST-OVER8 raw/firstOver8Ms refers to this capture; BOOT first/last timestamps
+and frozen ages can refer to earlier captures/generations after manual CLEAR.
+Always inspect gen/mode and known flags. Time0 can be valid. Ages use uint32_t
+subtraction across millis rollover, not wall-clock time.
+
+Static Evidence is 732 B; measured target DRAM delta including alignment is
+736 B (hard ceiling768), and normal build delta0. There is no PSRAM dependency.
+A forecast from older hardware measurements is not physical acceptance: verify
+core=1, free8>=12000, reserve8=12000, largest8/free32/largest32 and stackMinBytes
+before evaluating RF. Use [the Polish test guide](docs/TEST_SI4684_DSRV_QUEUE_INSTRUKCJA_PL.md)
+and [the Czech audit](docs/SI4684_DSRV_QUEUE_RAW_CTS_AUDIT_2026-11-02_CZ.md).

@@ -32,6 +32,7 @@
 #include "dab_diagnostics.h"
 #include "i2s_audio.h"
 #include "epg_time.h"
+#include "dab_dsrv_queue_diag.h"
 #include "dab_clock_refresh.h"
 
 namespace si468x { enum class Result : int8_t; }
@@ -213,6 +214,9 @@ class DAB {
     bool pausePeriodicUa(unsigned seconds);
     void resumePeriodicUa(void);
     void serviceCtsEvidence(void);
+    void serviceDsrvQueue(void);
+    void cacheDsrvQueueHealth(void);
+    bool clearDsrvQueue(void);
     uint8_t spiProbeState() const { return uint8_t(dabSpiProbe.state); }
     void vol(uint8_t vol);
     RadioMode mode(void) const { return activeMode; }

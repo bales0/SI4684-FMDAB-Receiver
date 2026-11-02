@@ -11,6 +11,10 @@
 #include "dab_loss_diag.h"
 #include "dab_loss_diag_output.h"
 #include "dab_cts_evidence.h"
+#if SI4684_DSRV_QUEUE_DIAG
+#include "dab_dsrv_queue_output.h"
+static dsrv_queue::Evidence dsrvQueue;
+#endif
 #include "constants.h"
 #include "dab_scheduler_policy.h"
 #include "dab_user_application.h"
@@ -1481,6 +1485,9 @@ void DAB::observeDabTerminal(uint8_t operation,int result,uint32_t generation) {
   if(generation!=dabGeneration || !ctsEvidence.needsCapture(timeout,answered))return;
   auto& f=ctsEvidence.first;f=dab_health::CtsSnapshot{};
   const uint32_t now=millis();
+#if SI4684_DSRV_QUEUE_DIAG
+  dsrvQueue.freeze(now,generation,uint8_t(dab_loss::evidence().mode),operation,diagLastCommand);
+#endif
   f.operation=operation;f.command=diagLastCommand;f.argCount=lastCommandArgCount;
   for(unsigned i=0;i<f.argCount;++i)f.args[i]=lastCommandArgs[i];
   f.elapsedMs=uint32_t(micros()-commandStartedUs)/1000;
@@ -1509,6 +1516,25 @@ void DAB::serviceCtsEvidence(void) {
   ctsEvidence.pending=ctsEvidence.recoveryPending=false;
 }
 
+void DAB::cacheDsrvQueueHealth(void) {
+#if SI4684_DSRV_QUEUE_DIAG
+  dsrvQueue.cachedFree8=heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+#endif
+}
+void DAB::serviceDsrvQueue(void) {
+#if SI4684_DSRV_QUEUE_DIAG
+  dsrv_queue::service(dsrvQueue,diagSerial,millis(),dabGeneration,uint8_t(dab_loss::evidence().mode),ctsEvidence.pending || ctsEvidence.recoveryPending,
+      epg::runtime()!=nullptr,dab_loss::evidence().total.event[dab_loss::ReadFail],diagSerial.droppedBytes(),unsigned(diagSerial.queuedBytes()));
+#endif
+}
+bool DAB::clearDsrvQueue(void) {
+#if SI4684_DSRV_QUEUE_DIAG
+  dsrvQueue.clear(millis());return true;
+#else
+  return false;
+#endif
+}
+
 bool DAB::pausePeriodicUa(unsigned seconds) {
   const bool complete=!isFm() && !epg::replayActive() && dabServiceListReady && dabUaInventoryValid && dabActiveServiceValid &&
       !dabServiceRequestPending && !dabTuneRequestPending && !dabUaScan.failed &&
@@ -1519,6 +1545,9 @@ void DAB::resumePeriodicUa(void) {dabUaPause.cancel();}
 
 void DAB::requestDsrvStatus(void) {
   auto& d=dab_loss::evidence();d.reportRequested=true;d.stage=255;ctsEvidence.request();
+#if SI4684_DSRV_QUEUE_DIAG
+  dsrvQueue.request();
+#endif
   const bool paused=dabUaPause.blocked(millis(),dabGeneration);
   dab_loss::emit(diagSerial,"[DSRV/UA] paused=%u remainingMs=%u generation=%u complete=%u failed=%u\n",paused,paused?unsigned(dabUaPause.until-millis()):0,unsigned(dabGeneration),dabUaScan.functionalComplete(dabCommand==DabCommand::ComponentInfo),unsigned(dabUaScan.failed));
   dab_loss::emit(diagSerial,"[DSRV/STATUS] spiHz=%u detail=%u core=%u free8=%u largest8=%u free32=%u largest32=%u reserve8=12000\n",
@@ -1766,9 +1795,15 @@ si468x::Result DAB::readDsrvPayload(uint16_t length) {
   d.event(dab_loss::ReadOk);
   const unsigned count=unsigned(SPIbuffer[19])+(unsigned(SPIbuffer[20])<<8);
   if(si468x::readLe32(SPIbuffer+9)!=sid || si468x::readLe32(SPIbuffer+13)!=cid){
+#if SI4684_DSRV_QUEUE_DIAG
+    dsrvQueue.metric(dsrv_queue::SidCidChanged);
+#endif
     d.event(dab_loss::HeaderIdentity);return si468x::Result::MalformedReply;
   }
   if(count+24U!=length){
+#if SI4684_DSRV_QUEUE_DIAG
+    dsrvQueue.metric(dsrv_queue::ByteCountChanged);
+#endif
     d.event(dab_loss::LengthMismatch);return si468x::Result::MalformedReply;
   }
   d.payload(sid,cid,dabGeneration,SPIbuffer+25,count);
@@ -3255,6 +3290,12 @@ void DAB::finishDabCommand(void) {
   const si468x::Result result = chip.lastResult();
   const uint32_t completedGeneration = dabCommandGeneration;
   dab_loss::evidence().terminal(unsigned(completed),int(result));
+#if SI4684_DSRV_QUEUE_DIAG
+  if(completed==DabCommand::DsrvHeader) {
+    if(completedGeneration!=dabGeneration)dsrvQueue.metric(dsrv_queue::StaleHeader);
+    else if(result!=si468x::Result::Ok)dsrvQueue.commandError(int(result),completedGeneration,uint8_t(dab_loss::evidence().mode));
+  }
+#endif
   dabCommand = DabCommand::None;
   finishCommandDiagnostics(result);
 
@@ -3680,11 +3721,19 @@ void DAB::finishDabCommand(void) {
       const si468x::Result parseResult = si468x::Si468x::parseDsrvHeader(
           SPIbuffer + 1, 24, header);
       if (!parseOk(parseResult)) {
+#if SI4684_DSRV_QUEUE_DIAG
+        dsrvQueue.metric(dsrv_queue::HeaderError);
+#endif
         ++diagDabCommandErrorCount;
         epg_diag::increment(epg_diag::registry().headerErrors);
         dabDsrvEvents.finish(millis(),0,0,false);dabDsrvPending=dabDsrvEvents.pending;if(dabDsrvPending)dab_loss::evidence().pending(millis());
         break;
       }
+#if SI4684_DSRV_QUEUE_DIAG
+      // Completed Ok, current generation, 24 logical bytes starting at STATUS0.
+      // Record before any legacy/packet full reply can overwrite SPIbuffer.
+      dsrvQueue.header(SPIbuffer+1,24,true,completedGeneration,dabGeneration,uint8_t(dab_loss::evidence().mode),millis());
+#endif
       if (header.interruptSource & 0x02U) {++diagDabDsrvOverflowCount;dab_loss::evidence().event(dab_loss::Overflow);}
       const dab_probe::Endpoint audio(dabActiveServiceId, dabActiveComponentId,
                                       dabActiveServiceValid);

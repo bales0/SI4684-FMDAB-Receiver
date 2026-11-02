@@ -3,7 +3,7 @@ Only chip I/O, clock, TFT boundary and allocator are mocked. No replacement owne
 """
 from pathlib import Path
 import ast,subprocess,sys,json,re
-ROOT=Path(__file__).resolve().parents[1];out=ROOT/'.pio/epg_coexistence';out.mkdir(exist_ok=True)
+ROOT=Path(__file__).resolve().parents[1];queue_enabled='--queue' in sys.argv[2:];out=ROOT/('.pio/epg_coexistence_queue' if queue_enabled else '.pio/epg_coexistence');out.mkdir(exist_ok=True)
 def literal(path,name):
  tree=ast.parse((ROOT/path).read_text(encoding='utf-8-sig'))
  return next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id==name for t in n.targets))
@@ -15,6 +15,10 @@ def method(sig):
 prefix=literal('tests/test_epg_runtime.py','prefix').split('struct Radio {')[0]
 prefix=prefix.replace('struct Monitor {','static int uartRoom=4096;\nstruct Monitor {').replace('int availableForWrite() { return 4096; }','int availableForWrite() { return uartRoom; }')
 prefix+='''\n#include "dab_receive_health.h"
+#include "dab_dsrv_queue_diag.h"
+#if SI4684_DSRV_QUEUE_DIAG
+static dsrv_queue::Evidence dsrvQueue;
+#endif
 #include "epg_ingress.h"\n#include "dab_spi_discovery.h"\n#include "dab_service_switch_policy.h"\n#include "dab_diagnostics.h"\n#include "vendor/si468x/Si468x.h"\n#include <iostream>\n#define DIAG_PRINTF(...) diagSerial.printf(__VA_ARGS__)\nstatic bool epgContinuous=true;\nuint8_t SPIbuffer[4096];
 static dab_health::Dsrv dabDsrvEvents;
 static dab_health::Watchdog dabProgress;
@@ -108,7 +112,7 @@ static void result(const char* name,uint32_t baseline,unsigned expected){
 static void refreshPad(dab_spi::Identity identity){radio.dabSpiIdentities[0]=identity;completeScan();radio.refreshDabSpiDiscovery();}
 int main(int argc,char** argv){
  (void)object;
- assert(argc==4);free8Bytes-=1024;heapBytes-=1024;largestBytes-=1024;assert(epg::ensure());const auto allocatedAtStart=allocationAttempt;auto* c=epg::runtime();auto data=readGroups(argv[1]);
+ assert(argc==4);const unsigned pressure=SI4684_DSRV_QUEUE_DIAG?sizeof(dsrv_queue::Evidence):1024;free8Bytes-=pressure;heapBytes-=pressure;largestBytes-=pressure;assert(epg::ensure());std::printf("COEX_RAM pressure=%u reserve8=12000 remaining8=%u\n",pressure,free8Bytes);const auto allocatedAtStart=allocationAttempt;auto* c=epg::runtime();auto data=readGroups(argv[1]);
  // Intentionally collide PAD directory TID with captured packet directory TID.
  data[0][5]=0x8c;data[0][6]=0xc2;const auto crc=epg::crc16(data[0].data(),data[0].size()-2);data[0][data[0].size()-2]=uint8_t(crc>>8);data[0].back()=uint8_t(crc);
  std::ifstream file(argv[2],std::ios::binary);Data empty((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());assert(empty.size()==27);
@@ -256,13 +260,18 @@ int main(int argc,char** argv){
  dab_loss::evidence().mode=dab_loss::Mode::Normal;for(const auto& f:data){inject(f,0);while(c->busy())epg::poll();}
  assert(c->count()==3 && c->stats.pi && c->stats.si);
  std::puts("MODE C: actual full packet reads and SLS handoff continue, Core untouched; MODE A resumes PI/SI: PASS");
+#if SI4684_DSRV_QUEUE_DIAG
+ assert(dsrvQueue.total.headers && dsrvQueue.count==12);
+ assert(dsrvQueue.oldest(11).generation()==radio.dabGeneration && dsrvQueue.oldest(11).raw[0]==128);
+ std::puts("Actual complete DSRV header -> RAW ring before full overwrite, with unchanged PAD/packet/Core reception: PASS");
+#endif
  std::puts("Production DSRV -> actual UA/route/owner -> exact payload -> Core -> cache/UI status: A-F PASS");
 }
 '''
 
-source=out/'coexistence.cpp';source.write_text(prefix+runtime+'\n'+method('si468x::Result DAB::readDsrvPayload(uint16_t length)')+'\n'+method('void DAB::logEpgTransportPage(uint8_t page)')+'\n'+method('dab_spi::Identity DAB::xpadSpiIdentity(void) const')+'\n'+method('bool DAB::xpadSpiPresent(void) const')+'\n'+method('void DAB::refreshDabSpiDiscovery(void)')+'\nvoid DAB::dsrv(){switch(DabCommand::DsrvHeader){\n'+case+'default:break;}}\n'+fixture+main,encoding='utf-8')
+source=out/'coexistence.cpp';source.write_text(prefix+runtime+'\n'+method('si468x::Result DAB::readDsrvPayload(uint16_t length)')+'\n'+method('void DAB::logEpgTransportPage(uint8_t page)')+'\n'+method('dab_spi::Identity DAB::xpadSpiIdentity(void) const')+'\n'+method('bool DAB::xpadSpiPresent(void) const')+'\n'+method('void DAB::refreshDabSpiDiscovery(void)')+'\nvoid DAB::dsrv(){const auto completedGeneration=dabGeneration;(void)completedGeneration;switch(DabCommand::DsrvHeader){\n'+case+'default:break;}}\n'+fixture+main,encoding='utf-8')
 exe=out/'coexistence.exe'
-subprocess.run([sys.argv[1] if len(sys.argv)>1 else 'C:/msys64/ucrt64/bin/g++.exe','-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(ROOT/'src'),str(source),str(ROOT/'src/epg_core.cpp'),str(ROOT/'src/epg_uart.cpp'),'-o',str(exe)],check=True)
+subprocess.run([sys.argv[1] if len(sys.argv)>1 else 'C:/msys64/ucrt64/bin/g++.exe',*(['-DSI4684_DSRV_QUEUE_DIAG=1'] if queue_enabled else []),'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(ROOT/'src'),str(source),str(ROOT/'src/epg_core.cpp'),str(ROOT/'src/epg_uart.cpp'),'-o',str(exe)],check=True)
 result=subprocess.run([str(exe),str(ROOT/'tests/fixtures/epg/synthetic_programme_groups_v2.bin'),str(ROOT/'tests/fixtures/epg/mux11a_empty_group.bin'),str(ROOT/'tests/fixtures/epg/synthetic_logo_1_groups_v2.bin')],capture_output=True,text=True)
 print(result.stdout+result.stderr,end='');rows=[json.loads(line[5:]) for line in result.stdout.splitlines() if line.startswith('COEX ')]
 diagnostic=(ROOT/'src/epg_transport_diag.h').read_text(encoding='utf-8')
@@ -270,5 +279,5 @@ def names(function):
  body=re.search(function+r'.*?names\[\]=\{([^}]+)',diagnostic,re.S)[1]
  return re.findall(r'"([^"]+)"',body)
 snapshot=re.search(r'SNAPSHOT A BEGIN\n(.*?)SNAPSHOT A END',result.stdout,re.S)
-(out/'results.json').write_text(json.dumps({'kind':'host full production DSRV/runtime/Core, not RF','pass':result.returncode==0,'unexpectedResets':0 if result.returncode==0 else None,'mockExtraDramPressure':1024,'physical_hardware_tested':False,'resetReasonNames':names('resetName'),'padRejectNames':names('rejectName'),'cases':rows,'synthetic_snapshot':snapshot[1] if snapshot else '', 'stderr':result.stderr},indent=2)+'\n',encoding='utf-8')
+(out/'results.json').write_text(json.dumps({'kind':'host full production DSRV/runtime/Core, not RF','pass':result.returncode==0,'unexpectedResets':0 if result.returncode==0 else None,'mockExtraDramPressure':int(re.search(r'COEX_RAM pressure=(\d+)',result.stdout)[1]) if result.returncode==0 else None,'physical_hardware_tested':False,'resetReasonNames':names('resetName'),'padRejectNames':names('rejectName'),'cases':rows,'synthetic_snapshot':snapshot[1] if snapshot else '', 'stderr':result.stderr},indent=2)+'\n',encoding='utf-8')
 result.check_returncode()
