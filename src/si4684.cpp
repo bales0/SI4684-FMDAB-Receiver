@@ -19,6 +19,7 @@ static dsrv_queue::Evidence dsrvQueue;
 #include "dab_scheduler_policy.h"
 #include "dab_user_application.h"
 #include "epg_runtime.h"
+#include "epg_auto_suspend.h"
 #include "epg_ingress.h"
 #include "esp_heap_caps.h"
 
@@ -3317,10 +3318,12 @@ void DAB::finishDabCommand(void) {
   // active SID/CID fields. An unanswered START is conservatively followed by STOP.
   if (completed == DabCommand::SpiProbeStart || completed == DabCommand::SpiProbeStop) {
     const uint32_t now = millis();
+    syncEpgAuto(now);
     const bool stopAbsent = completed == DabCommand::SpiProbeStop &&
         result == si468x::Result::DeviceError && chip.lastDeviceError() == 0x03U;
     if (result != si468x::Result::Ok && !stopAbsent) ++diagDabCommandErrorCount;
     if (completed == DabCommand::SpiProbeStart) {
+      if(completedGeneration==dabGeneration)epg_auto::policy().started(now,result==si468x::Result::Ok,result==si468x::Result::Timeout);
       dabSpiProbe.started(now, result == si468x::Result::Ok,
                           result == si468x::Result::Timeout);
       if (result == si468x::Result::Ok) {
@@ -3330,6 +3333,7 @@ void DAB::finishDabCommand(void) {
       DIAG_PRINTF("[DAB/SPI/TEST] START result=%d reason=%02X; no SLS STOP issued\n",
                   static_cast<int>(result), static_cast<unsigned>(chip.lastDeviceError()));
     } else {
+      if(completedGeneration==dabGeneration)epg_auto::policy().stopped(now,result==si468x::Result::Ok || stopAbsent);
       dabSpiProbe.stopped(now, result == si468x::Result::Ok || stopAbsent);
       DIAG_PRINTF("[DAB/SPI/TEST] STOP result=%d reason=%02X attempt=%u\n",
                   static_cast<int>(result), static_cast<unsigned>(chip.lastDeviceError()),
@@ -3856,7 +3860,10 @@ void DAB::finishDabCommand(void) {
             if (readResult == si468x::Result::Ok) {
               dab_loss::evidence().event(epg_diag::emptyDirectoryGroup(SPIbuffer+25,header.byteCount)?dab_loss::PacketEmptyDir:dab_loss::PacketOther);
               if(dab_loss::evidence().mode==dab_loss::Mode::NoParse)dab_loss::evidence().event(dab_loss::ParseSkipped);
-              else epg::livePayload(SPIbuffer + 25, header.byteCount);
+              else {
+                syncEpgAuto(millis());
+                epg::livePayload(SPIbuffer + 25, header.byteCount);
+              }
             }
             else {++diagDabCommandErrorCount;epg_diag::registry().reject(epg_diag::Path::Packet,epg_diag::Reject::Read);}
           } else epg_diag::registry().reject(epg_diag::Path::Packet,epg::replayActive()?epg_diag::Reject::Replay:header.byteCount>sizeof(SPIbuffer)-25U?epg_diag::Reject::Length:epg_diag::Reject::Inactive);
@@ -4322,8 +4329,9 @@ bool DAB::setDsrvDiagnosticMode(char mode) {
   if(mode=='B' && (!dabSpiProbe.spi.valid || !epgContinuous || !dabSpiProbe.audio.valid ||
       dabSpiProbe.audio.matches(dabSpiProbe.spi.sid,dabSpiProbe.spi.cid) ||
       dabSpiProbe.sls.matches(dabSpiProbe.spi.sid,dabSpiProbe.spi.cid))) {
-    // Repeating B is safe, but never claim an unsupported STOP was applied.
-    return d.mode==dab_loss::Mode::NoPacket;
+    // A confirmed AUTO stop can be pinned manually without another chip command.
+    if(epg_auto::policy().state!=epg_auto::State::Cooldown || !epg_auto::policy().eligible)
+      return d.mode==dab_loss::Mode::NoPacket;
   }
   d.mode=mode=='B'?dab_loss::Mode::NoPacket:mode=='C'?dab_loss::Mode::NoParse:mode=='D'?dab_loss::Mode::Quiet:dab_loss::Mode::Normal;
   d.experiment=mode!='D';dab_loss::inc(d.modeEpoch);d.hashKnown=false;
@@ -4337,6 +4345,62 @@ bool DAB::setDsrvDiagnosticMode(char mode) {
   return true;
 }
 
+void DAB::syncEpgAuto(uint32_t now) {
+  auto& p=epg_auto::policy();
+  epg_auto::Context c;
+  c.generation=dabGeneration;c.request=dabSwitch.requestId;
+  c.audioSid=dabActiveServiceId;c.audioCid=dabActiveComponentId;
+  c.sid=dabSpiDiscovery.serviceId;c.cid=dabSpiDiscovery.componentId;
+  const bool pendingDiscovery=dabUaInventoryValid && dabSpiDiscovery.status==dab_spi::Status::Pending &&
+      !dabSpiProbe.spi.valid && (p.state==epg_auto::State::Cooldown || p.state==epg_auto::State::Error);
+  if(pendingDiscovery){c.sid=p.context.sid;c.cid=p.context.cid;}
+  c.sls=dabActiveDataServiceValid;c.slsSid=dabActiveDataServiceId;c.slsCid=dabActiveDataComponentId;
+  c.mode=uint8_t(dab_loss::evidence().mode);
+  const bool distinct=dabActiveServiceValid &&
+      !(c.audioSid==c.sid && c.audioCid==c.cid) &&
+      !(c.sls && c.slsSid==c.sid && c.slsCid==c.cid);
+  const bool tracked=!dabSpiProbe.spi.valid ||
+      (dabSpiProbe.spi.matches(c.sid,c.cid) && dabSpiProbe.requestId==c.request &&
+       dabSpiProbe.audio.matches(c.audioSid,c.audioCid) && dabSpiProbe.sls.valid==c.sls &&
+       (!c.sls || dabSpiProbe.sls.matches(c.slsSid,c.slsCid)));
+  const bool usable=!isFm() && ServiceStart && signallock && epg::livePacketOwner() &&
+      !dabTransportStalled && !dabServiceRequestPending && !dabTuneRequestPending &&
+      (dabSwitch.state==dab_switch::State::Ready || dabSwitch.state==dab_switch::State::AudioOnly) &&
+      distinct && tracked && !epgProductionPaused && !epgManualPending &&
+      dab_loss::evidence().mode==dab_loss::Mode::Normal &&
+      (dabSpiProbe.state==dab_probe::State::Idle || epgContinuous);
+  p.sync(c,usable && dabSpiDiscovery.available(),usable && pendingDiscovery);
+  // Emit only transitions, with the bounded existing UART queue. Quiet stays quiet.
+  static uint8_t reported=255;
+  if(reported!=uint8_t(p.state) && dab_loss::evidence().mode!=dab_loss::Mode::Quiet && diagSerial.availableForWrite()>=160){
+    diagSerial.printf("[EPG/AUTO] atMs=%u state=%s reason=%s result=%s nextCheckMs=%u\n",unsigned(now),epg_auto::name(p.state),p.reason,epg_auto::name(p.result),unsigned(p.next));
+    reported=uint8_t(p.state);
+  }
+}
+
+bool DAB::epgAutoCommand(char* input) {
+  if(strncmp(input,"EPG AUTO ",9))return false;
+  auto& p=epg_auto::policy();
+  if(!strcmp(input+9,"ON") || !strcmp(input+9,"OFF")){
+    p.enable(!strcmp(input+9,"ON"));syncEpgAuto(millis());
+    diagSerial.printf("EPG AUTO ACK enabled=%u atMs=%u\n",p.enabled,unsigned(millis()));return true;
+  }
+  if(strcmp(input+9,"STATUS")){diagSerial.println("EPG AUTO ERROR use STATUS/ON/OFF");return true;}
+  syncEpgAuto(millis());
+  diagSerial.printf("EPG AUTO enabled=%u eligible=%u state=%s mode=%u SID=%08X CID=%08X generation=%u request=%u audioDistinct=%u slsDistinct=%u ownerPacket=%u ownerPad=%u core=%u\n",
+    p.enabled,p.eligible,epg_auto::name(p.state),unsigned(p.context.mode),unsigned(p.context.sid),unsigned(p.context.cid),unsigned(p.context.generation),unsigned(p.context.request),
+    !(p.context.audioSid==p.context.sid && p.context.audioCid==p.context.cid),!(p.context.sls && p.context.slsSid==p.context.sid && p.context.slsCid==p.context.cid),epg::livePacketOwner(),epg::liveEnabled() && !epg::livePacketOwner(),epg::runtime()!=nullptr);
+  diagSerial.printf("EPG AUTO emptyValid=%u nonEmptyValid=%u emptyRepeat=%u emptyTid=%04X hash=%08X firstEmptyAtMs=%u lastEmptyAtMs=%u startCount=%u stopCount=%u stopConfirmedCount=%u stopError=%u\n",
+    unsigned(p.emptyValid),unsigned(p.nonEmptyValid),unsigned(p.repeat),unsigned(p.tid),unsigned(p.hash),unsigned(p.first),unsigned(p.last),unsigned(p.startCount),unsigned(p.stopCount),unsigned(p.confirmedCount),unsigned(p.stopError));
+  diagSerial.printf("EPG AUTO recheckCount=%u recheckResult=%s nextCheckMs=%u remainingMs=%u lastReason=%s cooldown=%u CTS=%u overflow=%u UARTdrop=%u\n",
+    unsigned(p.recheckCount),epg_auto::name(p.result),unsigned(p.next),unsigned(p.remaining(millis())),p.reason,p.state==epg_auto::State::Cooldown,unsigned(diagDabCtsTimeoutCount),unsigned(diagDabDsrvOverflowCount),unsigned(diagSerial.droppedBytes()));
+#if SI4684_DSRV_QUEUE_DIAG
+  // Full RAW evidence remains in the existing DSRV STATUS report.
+  diagSerial.printf("EPG AUTO qmaxRaw=%u\n",unsigned(dsrvQueue.total.qmax));
+#endif
+  return true;
+}
+
 void DAB::maintainDabClock(void) {
   const bool fresh=dabClockRefresh.observe(dabGeneration,!isFm() && signallock && !dabTuneRequestPending,millis(),dabEpgClock);
   if(!dabClockRefresh.active())dabUtcRefreshPending=dabClockConfirmPending=false;
@@ -4345,6 +4409,7 @@ void DAB::maintainDabClock(void) {
 
 void DAB::scheduleNextDabCommand(void) {
   maintainDabClock();
+  syncEpgAuto(millis());
   if (chip.busy() || dabCommand != DabCommand::None || dabTransportStalled)
     return;
 
@@ -4354,7 +4419,7 @@ void DAB::scheduleNextDabCommand(void) {
   if (dabSpiProbe.state == dab_probe::State::Idle) {
     epgContinuous = false;
     if (epgManualPending) { epgManualPending = false; requestSpiProbe(); }
-    else if (!epgProductionPaused && epg::liveEnabled() && !epg::replayActive() &&
+    else if (!epgProductionPaused && epg_auto::policy().allowStart(now) && epg::liveEnabled() && !epg::replayActive() &&
              dabSpiDiscovery.available() && requestSpiProbe(true)) { epgContinuous = true; }
   }
   const bool sameProbeContext = (epgContinuous || diagnosticDebug) &&
@@ -4365,6 +4430,8 @@ void DAB::scheduleNextDabCommand(void) {
       dabSpiProbe.sls.valid == dabActiveDataServiceValid &&
       (!dabActiveDataServiceValid ||
        dabSpiProbe.sls.matches(dabActiveDataServiceId, dabActiveDataComponentId));
+  if(epgContinuous && sameProbeContext && epg_auto::policy().stopDue(now,
+      dabSpiProbe.state==dab_probe::State::Observing))dabSpiProbe.stop(now);
   // Continuous reception has no observation deadline. Context changes still
   // take the same bounded STOP/cleanup path, before any tune/service teardown.
   if (!(epgContinuous && sameProbeContext && dabSpiProbe.state == dab_probe::State::Observing))
@@ -4379,6 +4446,7 @@ void DAB::scheduleNextDabCommand(void) {
     if (!startDabCommand(DabCommand::SpiProbeStop,
                          static_cast<uint8_t>(si468x::Command::STOP_DIGITAL_SERVICE),
                          args, sizeof(args))) {
+      epg_auto::policy().stopped(now,false);
       dabSpiProbe.stopped(now, false);
       if (!dabSpiProbe.running()) logSpiProbeSummary("cleanup uncertain");
     }
@@ -4601,6 +4669,7 @@ void DAB::scheduleNextDabCommand(void) {
     if (!startDabCommand(DabCommand::SpiProbeStart,
                          static_cast<uint8_t>(si468x::Command::START_DIGITAL_SERVICE),
                          args, sizeof(args))) {
+      epg_auto::policy().started(now,false,true);
       dabSpiProbe.started(now, false, true);
       DIAG_PRINTLN("[DAB/SPI/TEST] START submission failed; conservative STOP scheduled");
     } else dabLastLowPriorityCommandMs = now;
@@ -4641,6 +4710,7 @@ void DAB::scheduleNextDabCommand(void) {
 }
 
 bool DAB::requestSpiProbe(bool production) {
+  if(!production)epg_auto::policy().reset();
   if(dab_loss::evidence().mode==dab_loss::Mode::NoPacket) return false;
   if (epg::replayActive() || dabSpiProbe.state == dab_probe::State::CleanupFailed) return false;
   if (epgContinuous && dabSpiProbe.spi.valid) {

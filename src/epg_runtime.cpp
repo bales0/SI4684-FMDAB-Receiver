@@ -3,6 +3,7 @@
 #include "epg_ui.h"
 #include "epg_demo.h"
 #include "epg_ingress.h"
+#include "epg_auto_suspend.h"
 #include "vendor/si468x/Si468x.h"
 #include "gui.h"
 #include "serial_monitor.h"
@@ -15,6 +16,10 @@ namespace epg {
 static Core* core=nullptr;
 static UartReceiver receiver;
 static bool replay=false, demo=false;
+static bool packetFeeding=false;
+static void directoryReady(void*,uint16_t tid,uint32_t hash,uint16_t objects,uint32_t cycle) {
+  if(packetFeeding && !replay)epg_auto::policy().directory(millis(),tid,hash,objects,cycle);
+}
 static ResolvedClock liveClock;
 static bool clockLost=false;
 static uint32_t lostClockGeneration=0;
@@ -65,6 +70,7 @@ static Feed injectedDsrv(const uint8_t* data,size_t n,uint32_t now) {
   ++injectRejected; return Feed::Rejected;
 }
 static void objectReady(void*,uint16_t tid,uint8_t type,Bytes data,size_t n) {
+  if(!replay && !padSid && type==4)epg_auto::policy().content(millis());
   if(!replay && type==6)epg_acq::trace().mark(padSid?1:0,5,millis());
   if(!replay) epg_diag::registry().object(padSid?epg_diag::Path::Pad:epg_diag::Path::Packet,tid,type,data,n,core->stats.programmes);
   if(diagSerial.availableForWrite()<192) return;
@@ -146,6 +152,7 @@ IndicatorState indicatorState() {
 }
 
 bool liveEnabled() { return core && !replay; }
+bool livePacketOwner() { return core && !replay && !padSid; }
 static const unsigned byteCaps=MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT;
 // EXEC selects the classic ESP32 IRAM heap, avoiding consumption of DRAM.
 // The memory contains data only; every access goes through Bytes/Buffer.
@@ -169,7 +176,7 @@ bool ensure(bool reportFailure) {
     allocationReported=true;
     diagSerial.printf("EPG ERROR MEMORY need8=%u free8=%u largest8=%u need32=%u free32=%u largest32=%u\n",unsigned(sizeof(Core)),unsigned(free8),unsigned(largest8),unsigned(Core::bufferBytes()),unsigned(free32),unsigned(largest32));
   }
-  if(core) core->observer.object=objectReady;
+  if(core) {core->observer.object=objectReady;core->observer.directory=directoryReady;}
   return core!=nullptr;
 }
 static void resetLiveCore(epg_diag::Reset reason) {
@@ -177,6 +184,7 @@ static void resetLiveCore(epg_diag::Reset reason) {
   if(core) { epg_diag::registry().reset(reason);core->reset(); core->setLive(true); core->setClockTrusted(false); core->select(0,0,0); EpgInvalidate(); }
 }
 void liveReset() {
+  epg_auto::policy().reset();
   resetIndicatorClock();
   epg_acq::trace().reset();
   clearInjection();clockLost=false;liveClock=ResolvedClock{};
@@ -222,7 +230,9 @@ static void liveGroup(epg_diag::Path path,const uint8_t* data,size_t n,bool owns
   if(replay){diagnostic.reject(path,epg_diag::Reject::Replay);return;}
   if(!owns){epg_diag::increment(counters.blocked);diagnostic.reject(path,epg_diag::Reject::Owner);return;}
   if(!core){diagnostic.reject(path,epg_diag::Reject::NoEndpoint);return;}
+  packetFeeding=path==epg_diag::Path::Packet;
   const auto result=core->feed(data,n,millis());
+  packetFeeding=false;
   if(result==Feed::Accepted)epg_diag::increment(counters.admitted);
   else diagnostic.reject(path,result==Feed::Busy?epg_diag::Reject::Busy:epg_diag::Reject::Data);
 }

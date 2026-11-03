@@ -22,6 +22,7 @@ start_packet=s[a:b]
 
 prefix=r'''
 #include "dab_spi_probe.h"
+#include "epg_auto_suspend.h"
 #include "dab_receive_health.h"
 #include "epg_ingress.h"
 #include "epg_transport_diag.h"
@@ -46,6 +47,7 @@ bool replay=false,enabled=true;
 bool replayActive(){return replay;} bool liveEnabled(){return enabled && !replay;}
 std::vector<uint8_t> received;
 void livePayload(const uint8_t* p,size_t n){received.assign(p,p+n);}
+void liveEndpoint(uint32_t,uint32_t){}
 void livePadEndpoint(uint32_t,uint32_t){}
 void livePadPayload(const uint8_t* p,size_t n){received.assign(p,p+n);}
 void livePadData(uint32_t sid,uint32_t cid,const uint8_t* p,size_t n){livePadEndpoint(sid,cid);livePadPayload(p,n);}
@@ -54,6 +56,7 @@ struct Monitor { uint32_t droppedBytes(){return 0;} } diagSerial;
 
 uint8_t SPIbuffer[4096];
 struct Chip {
+ uint8_t reason=0;uint8_t lastDeviceError(){return reason;}
  unsigned reads=0,length=0;si468x::Result result=si468x::Result::Ok;
  si468x::Result readCurrentReply(uint8_t* out,uint16_t n){++reads;length=n;for(unsigned i=0;i<n;++i)out[i]=uint8_t(i);memset(out+8,0,8);out[18]=uint8_t(n-24);out[19]=uint8_t((n-24)>>8);return result;}
 } chip;
@@ -84,14 +87,54 @@ class DAB { public:
  si468x::Command submitted=si468x::Command::GET_SYS_STATE;uint32_t submittedSid=0,submittedCid=0;
  bool startDabCommand(DabCommand,uint8_t cmd,const uint8_t* args,unsigned n){assert(n==11);++submits;submitted=si468x::Command(cmd);submittedSid=si468x::readLe32(args+3);submittedCid=si468x::readLe32(args+7);return submitOk;}
  void logSpiProbeSummary(const char*){}
- void cleanup();void startPacket();void modes();
+ void cleanup();void startPacket();void modes();void autoCycle();
+ void complete(DabCommand,si468x::Result,uint32_t);
+ void syncEpgAuto(uint32_t){}
  void advance();
  void handle(const si468x::DsrvHeader& header,dab_probe::Route target,bool feedLegacy);
  void getServiceData(){++legacy;}
 };
 '''
+a=s.index('  if (completed == DabCommand::SpiProbeStart || completed == DabCommand::SpiProbeStop) {')
+b=s.index('  if (!dab_scheduler::generationMatches',a)
+completion=s[a:b]
 suffix=r'''
 
+void DAB::autoCycle(){
+ using namespace epg_auto;epgContinuous=false;epgProductionPaused=false;epgManualPending=false;
+ dab_loss::evidence()=dab_loss::Evidence{};chip.reason=0;clockMs=100;DAB r;
+ auto& p=policy();p=Policy{};p.sync(Context{},true);
+ r.advance();clockMs+=500;r.advance();r.startPacket();r.complete(DabCommand::SpiProbeStart,si468x::Result::Ok,r.dabGeneration);
+ assert(p.startCount==1 && r.dabSpiProbe.state==dab_probe::State::Observing);
+ auto empties=[&](){p.directory(clockMs,42,7,0,1);clockMs+=1000;p.directory(clockMs,42,7,0,2);clockMs+=1000;p.directory(clockMs,42,7,0,3);};
+ empties();r.advance();assert(p.state==State::StopPending);r.cleanup();assert(r.submitted==si468x::Command::STOP_DIGITAL_SERVICE && r.submits==2);
+ for(unsigned i=0;i<10;++i){r.advance();assert(r.submits==2);}
+ r.complete(DabCommand::SpiProbeStop,si468x::Result::Timeout,r.dabGeneration);assert(p.state==State::StopPending && p.stopError==1);
+ clockMs+=500;r.cleanup();chip.reason=3;r.complete(DabCommand::SpiProbeStop,si468x::Result::DeviceError,r.dabGeneration);
+ assert(p.state==State::Cooldown && p.confirmedCount==1 && !r.dabSpiProbe.spi.valid);
+ const auto cooldown=clockMs;clockMs+=299999;r.advance();assert(r.dabSpiProbe.state==dab_probe::State::Idle && r.submits==3);
+ ++clockMs;r.advance();assert(p.state==State::RecheckStart && r.dabSpiProbe.state==dab_probe::State::Baseline);
+ clockMs+=500;r.advance();r.startPacket();chip.reason=0;r.complete(DabCommand::SpiProbeStart,si468x::Result::Ok,r.dabGeneration);
+ assert(p.state==State::RecheckActive && p.recheckCount==1 && r.submits==4);
+ clockMs+=30000;r.advance();assert(p.result==Result::Inconclusive && r.dabSpiProbe.state==dab_probe::State::StopRequested);
+ r.cleanup();r.complete(DabCommand::SpiProbeStop,si468x::Result::Ok,r.dabGeneration);assert(p.state==State::Cooldown);
+ // MODE B pins an already confirmed AUTO stop and blocks even overdue timers.
+ assert(r.setDsrvDiagnosticMode('B'));clockMs+=900000;r.advance();assert(r.dabSpiProbe.state==dab_probe::State::Idle && r.submits==5);
+ assert(r.setDsrvDiagnosticMode('A'));p.reset();r.advance();clockMs+=500;r.advance();r.startPacket();r.complete(DabCommand::SpiProbeStart,si468x::Result::Ok,r.dabGeneration);
+ assert(clockMs>cooldown && r.dabSpiProbe.state==dab_probe::State::Observing);
+ // Stale completion may reconcile physical ownership but cannot confirm AUTO.
+ p.sync(Context{},true);empties();r.advance();r.cleanup();r.complete(DabCommand::SpiProbeStop,si468x::Result::Ok,r.dabGeneration-1);assert(p.state==State::StopPending);
+ // An unanswered START retains the packet owner and uses the same cleanup;
+ // three failed STOP attempts quarantine it rather than restart.
+ p=Policy{};p.sync(Context{},true);epgContinuous=false;r.advance();clockMs+=500;r.advance();r.startPacket();
+ r.complete(DabCommand::SpiProbeStart,si468x::Result::Timeout,r.dabGeneration);
+ assert(p.state==State::StopPending && r.dabSpiProbe.state==dab_probe::State::StopRequested && r.dabSpiProbe.spi.valid);
+ for(unsigned i=0;i<3;++i){r.cleanup();r.complete(DabCommand::SpiProbeStop,si468x::Result::Timeout,r.dabGeneration);clockMs+=500;}
+ assert(r.dabSpiProbe.state==dab_probe::State::CleanupFailed && p.state==State::StopPending);
+ const auto submits=r.submits;clockMs+=900000;r.advance();assert(r.submits==submits && r.dabSpiProbe.spi.valid);
+ p=Policy{};epgContinuous=false;epgProductionPaused=false;
+ std::puts("AUTO actual scheduler/START/STOP completion: packet IDs, timeout retry, NOT_AVAILABLE, cooldown gate, one recheck, hard 30s limit, B pin, stale generation: PASS");
+}
 void DAB::modes(){
  using namespace dab_loss;
  evidence()=Evidence{};epgContinuous=false;epgManualPending=false;epgProductionPaused=false;
@@ -170,11 +213,12 @@ int main(){
  radio.handle(h,dab_probe::Route::Audio,true);assert(radio.legacy==1);
  radio.handle(h,dab_probe::Route::Ignored,false);assert(radio.diagDabStaleMotCount==1);
  radio.modes();
+ radio.autoCycle();
  std::puts("Actual SPI production/manual windows, replay/lock cleanup, quarantine, full DSRV read/bounds/legacy isolation: PASS");
 }
 '''
 out=ROOT/'.pio/epg_transport_test';out.mkdir(parents=True,exist_ok=True)
-cpp=out/'transport.cpp';cpp.write_text(prefix+function('si468x::Result DAB::readDsrvPayload(uint16_t length)')+'\n'+function('bool DAB::setDsrvDiagnosticMode(char mode)')+'\n'+function('bool DAB::requestSpiProbe(bool production)')+'\nvoid DAB::cleanup(){const uint32_t now=millis();\n'+cleanup+'}\nvoid DAB::startPacket(){const uint32_t now=millis();\n'+start_packet+'}\nvoid DAB::advance(){\n'+schedule+'}\nvoid DAB::handle(const si468x::DsrvHeader& header,dab_probe::Route target,bool feedLegacy){\n'+payload+'}\n'+suffix,encoding='utf-8')
+cpp=out/'transport.cpp';cpp.write_text(prefix+'\nvoid DAB::complete(DabCommand completed,si468x::Result result,uint32_t completedGeneration){\n'+completion+'}\n'+function('si468x::Result DAB::readDsrvPayload(uint16_t length)')+'\n'+function('bool DAB::setDsrvDiagnosticMode(char mode)')+'\n'+function('bool DAB::requestSpiProbe(bool production)')+'\nvoid DAB::cleanup(){const uint32_t now=millis();\n'+cleanup+'}\nvoid DAB::startPacket(){const uint32_t now=millis();\n'+start_packet+'}\nvoid DAB::advance(){\n'+schedule+'}\nvoid DAB::handle(const si468x::DsrvHeader& header,dab_probe::Route target,bool feedLegacy){\n'+payload+'}\n'+suffix,encoding='utf-8')
 exe=out/'transport.exe'
 subprocess.run([(sys.argv[1] if len(sys.argv)>1 else 'g++'),'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(ROOT/'src'),str(cpp),str(ROOT/'src/epg_core.cpp'),'-o',str(exe)],check=True)
 subprocess.run([str(exe)],check=True)

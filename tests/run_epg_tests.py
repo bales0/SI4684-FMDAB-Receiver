@@ -29,6 +29,9 @@ for name in ('dab_spi_discovery','dab_packet_inventory'):
  exe=out/(name+'.exe')
  run('compile '+name,[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_'+name+'.cpp','-o',str(exe)])
  run(name,[str(exe)])
+exe=out/'epg_auto.exe'
+run('compile EPG auto suspend',[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_epg_auto_suspend.cpp','src/epg_core.cpp','-o',str(exe)])
+run('EPG auto suspend',[str(exe)])
 run('DAB clock contract',[sys.executable,'tests/test_dab_clock.py',a.compiler])
 run('compile scheduler',[a.compiler,'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','tests/test_scheduler.cpp','-o',str(out/'scheduler.exe')])
 run('scheduler',[str(out/'scheduler.exe')])

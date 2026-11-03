@@ -12,6 +12,7 @@ enum class IndicatorState : uint8_t { Absent, Loading, Unavailable, Ready };
 constexpr uint32_t kIndicatorWaitMs=120000U; // UI only; never expires MOT/cache.
 IndicatorState indicatorState();
 bool liveEnabled();
+bool livePacketOwner();
 void liveReset();
 void liveServiceChanged();
 void livePadRevoked();

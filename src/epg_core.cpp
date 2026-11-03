@@ -350,7 +350,7 @@ bool Core::header(Bytes p, size_t n, Entry& e, size_t& used) const {
   }
   used=hs; return true;
 }
-bool Core::directory(Bytes p, size_t n) {
+bool Core::directory(Bytes p, size_t n, uint32_t cycle) {
   if(n<13 || (p[0]&0xc0) || (be32(p)&0x3fffffff)!=n || (p[9]&0x80)) return false;
   const size_t count=be16(p+4), extension=be16(p+11);
   if(count>kMaxEntries || extension>n-13) return false;
@@ -361,6 +361,7 @@ bool Core::directory(Bytes p, size_t n) {
   for(size_t i=0;i<count;++i) { if(pos+2>n) return false; ids[i]=be16(p+pos); for(size_t j=0;j<i;++j) if(ids[j]==ids[i]) return false; Entry e; size_t used=0; if(!header(p+pos+2,n-pos-2,e,used)) return false; if(e.name[0]) { names[i]=crc32(reinterpret_cast<const uint8_t*>(e.name),strlen(e.name)); for(size_t j=0;j<i;++j) if(names[j]==names[i]) return false; } pos+=2+used; }
   if(pos!=n) return false;
   const uint32_t hash=crc32(p,n);
+  if(observer.directory) observer.directory(observer.user,dirAssembly_.tid,hash,uint16_t(count),cycle);
   if(hash==directoryHash_) return true;
   directoryHash_=hash; entryCount_=count; serviceCount_=0; resetBodies(); clearCache();
   pos=13+extension;
@@ -504,7 +505,7 @@ Feed Core::feed(Bytes p, size_t n, uint32_t now) {
     const int result=dirAssembly_.add(h.tid,h.segment&32767,(h.segment&32768)!=0,p+h.offset,uint16_t(h.length),directory_,kDirectoryBytes,now,stats);
     if(result<0)return Feed::Rejected;
     if(!result)return Feed::Accepted;
-    const bool ok=directory(directory_,dirAssembly_.size());dirAssembly_.reset();
+    const bool ok=directory(directory_,dirAssembly_.size(),(uint32_t(h.tid)<<16)|(uint32_t(p[1])<<8)|h.repetition);dirAssembly_.reset();
     if(!ok){++stats.invalid;return Feed::Rejected;}return Feed::Accepted;
   }
   size_t index=0;while(index<entryCount_ && entries_[index].tid!=h.tid)++index;

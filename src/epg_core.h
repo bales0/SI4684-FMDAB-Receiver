@@ -116,6 +116,8 @@ struct Observer {
   void (*programme)(void*, uint16_t, const Programme&)=nullptr;
   void (*service)(void*, uint16_t, const Service&)=nullptr;
   void (*object)(void*, uint16_t, uint8_t, Bytes, size_t)=nullptr;
+  // Every fully validated directory, including unchanged content; never segments.
+  void (*directory)(void*, uint16_t, uint32_t, uint16_t, uint32_t)=nullptr;
 };
 enum class Availability : uint8_t {
   NoSpi, WaitDirectory, DirectoryEmpty, PendingIdentity, SiOnly,
@@ -256,7 +258,7 @@ class Core {
   Service service_;
   uint8_t programmeDepth_=0;
   bool rootService_=false;
-  bool directory(Bytes p, size_t n);
+  bool directory(Bytes p, size_t n, uint32_t cycle);
   bool header(Bytes p, size_t n, Entry& entry, size_t& used) const;
   void clearCache();
   void activateContext();

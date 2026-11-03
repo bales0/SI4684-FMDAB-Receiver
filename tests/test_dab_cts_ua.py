@@ -52,6 +52,7 @@ cpp=r'''
 #include "dab_receive_health.h"
 #include "dab_spi_discovery.h"
 #include "dab_spi_probe.h"
+#include "epg_auto_suspend.h"
 #include "dab_scheduler_policy.h"
 #include "epg_core.h"
 #include "epg_transport_diag.h"

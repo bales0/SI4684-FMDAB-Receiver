@@ -210,6 +210,8 @@ class DAB {
     // false no new metadata, DSRV or status command is scheduled.
     void Update(bool allowNewWork = true);
     bool setDsrvDiagnosticMode(char mode);
+    void syncEpgAuto(uint32_t now);
+    bool epgAutoCommand(char* input);
     void requestDsrvStatus(void);
     bool pausePeriodicUa(unsigned seconds);
     void resumePeriodicUa(void);

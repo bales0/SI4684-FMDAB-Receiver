@@ -243,6 +243,7 @@ void doEnableConnection() {
 void processCommandLine(char* line) {
   char* input = trimInPlace(line);
   if (!input || *input == '\0') return;
+  if (radio.epgAutoCommand(input)) return;
   if (epg::command(input)) return;
 
   char* equals = strchr(input, '=');

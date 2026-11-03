@@ -19,7 +19,8 @@ prefix+='''\n#include "dab_receive_health.h"
 #if SI4684_DSRV_QUEUE_DIAG
 static dsrv_queue::Evidence dsrvQueue;
 #endif
-#include "epg_ingress.h"\n#include "dab_spi_discovery.h"\n#include "dab_service_switch_policy.h"\n#include "dab_diagnostics.h"\n#include "vendor/si468x/Si468x.h"\n#include <iostream>\n#define DIAG_PRINTF(...) diagSerial.printf(__VA_ARGS__)\nstatic bool epgContinuous=true;\nuint8_t SPIbuffer[4096];
+#include "epg_auto_suspend.h"
+#include "epg_ingress.h"\n#include "dab_spi_discovery.h"\n#include "dab_service_switch_policy.h"\n#include "dab_diagnostics.h"\n#include "vendor/si468x/Si468x.h"\n#include <iostream>\n#define DIAG_PRINTF(...) diagSerial.printf(__VA_ARGS__)\nstatic bool epgContinuous=true,epgProductionPaused=false,epgManualPending=false;\nuint8_t SPIbuffer[4096];
 static dab_health::Dsrv dabDsrvEvents;
 static dab_health::Watchdog dabProgress;
 static dab_health::Stall dabStallReason=dab_health::Stall::None;
@@ -40,7 +41,7 @@ struct DAB {
  epg::BroadcastClockSample clock;const epg::BroadcastClockSample& broadcastClock()const{return clock;}
  bool isFm()const{return fm;}bool spiPresent(){return dabSpiPresent;}
  uint32_t dabActiveServiceId=0x3201,dabActiveComponentId=0x01fe0005,dabActiveDataServiceId=0,dabActiveDataComponentId=0;
- struct Switch{dab_switch::State state=dab_switch::State::Ready;}dabSwitch;
+ struct Switch{uint32_t requestId=1;dab_switch::State state=dab_switch::State::Ready;}dabSwitch;
  struct UaService{uint32_t sid;uint16_t first;uint8_t count;};
  UaService dabUaServices[2]={{0x3201,0,1},{0xe23153fe,1,1}};uint8_t dabUaServiceCount=2;
  uint32_t dabUaComponents[2]={0x01fe0005,0x01f2c00c};uint16_t dabUaComponentCount=2;
@@ -55,6 +56,8 @@ struct DAB {
  dab_spi::Identity xpadSpiIdentity()const;bool xpadSpiPresent()const;void refreshDabSpiDiscovery();void dsrv();
  const dab_spi::Result& spiDiscovery()const{return dabSpiDiscovery;}
  bool epgContextStable()const{return ServiceStart && dabActiveServiceValid && !dabServiceRequestPending && !dabTuneRequestPending;}
+ bool epgAutoCommand(char*);
+ void syncEpgAuto(uint32_t);
  void logEpgTransportPage(uint8_t);
  uint8_t dabRequestedFrequency=24;dab_diag::XpadReadback dabXpad;unsigned diagDabCtsTimeoutCount=0;
  uint32_t getFreq(uint8_t){return 216928;}
@@ -248,6 +251,51 @@ int main(int argc,char** argv){
  const auto printed=diagSerial.output;testMillis+=1000;epg::poll();assert(diagSerial.output==printed);
  diagnosticDebug=false;epg::poll();assert(!timing.enabled);
  assert(allocationAttempt==allocatedAtStart && free8Bytes>=12000);
+ // Serial AUTO commands coexist with EPG TEST; no NVS or second STOP path.
+ char statusCommand[]="EPG AUTO STATUS",offCommand[]="EPG AUTO OFF",onCommand[]="EPG AUTO ON",testCommand[]="EPG TEST STATUS";
+ assert(!radio.epgAutoCommand(testCommand));assert(radio.epgAutoCommand(offCommand) && !epg_auto::policy().enabled);
+ assert(diagSerial.output.find("EPG AUTO ACK enabled=0 atMs=")!=std::string::npos);
+ assert(radio.epgAutoCommand(onCommand) && epg_auto::policy().enabled);diagSerial.output.clear();
+ assert(radio.epgAutoCommand(statusCommand) && diagSerial.output.find("emptyRepeat=")!=std::string::npos && diagSerial.output.find("stopConfirmedCount=")!=std::string::npos);
+ // AUTO receives only the actual packet-owner Core completion path.
+ configure();refreshPad(dab_spi::Identity::NotSpi);auto& automatic=epg_auto::policy();
+ const auto validBefore=automatic.emptyValid;
+ auto sendEmpty=[&](unsigned continuity){auto frame=empty;frame[1]=uint8_t(continuity<<4);const auto sum=epg::crc16(frame.data(),frame.size()-2);frame[frame.size()-2]=uint8_t(sum>>8);frame.back()=uint8_t(sum);testMillis+=1000;inject(frame,0);};
+ sendEmpty(1);assert(automatic.eligible && automatic.repeat==1 && !automatic.stopDue(testMillis,true));
+ inject(empty,0,0,0x12345678);assert(automatic.repeat==1); // foreign SID never reaches Core
+ auto corrupt=empty;corrupt.back()^=1;inject(corrupt,0);assert(automatic.repeat==1);
+ inject(Data{},0);assert(automatic.repeat==1);
+ sendEmpty(2);assert(!automatic.stopDue(testMillis,true));sendEmpty(3);
+ assert(automatic.emptyValid==validBefore+3 && automatic.stopDue(testMillis,true));
+ automatic.stopped(testMillis,true);radio.dabSpiProbe.stopped(testMillis,true);const auto coreRevision=c->revision;const auto resetCount=epg_diag::registry().totalResets;
+ epg::liveEndpoint(radio.dabSpiProbe.spi.sid,radio.dabSpiProbe.spi.cid);
+ assert(c->revision==coreRevision && epg_diag::registry().totalResets==resetCount);
+ assert(!automatic.allowStart(testMillis+299999));
+ // Routine 60s UA refresh must not erase the 5min cooldown. No action while
+ // selection is withdrawn; same verified endpoint restores the same deadline.
+ const auto selected=radio.dabSpiDiscovery;const auto deadline=automatic.next;
+ radio.dabSpiDiscovery=dab_spi::Result{};testMillis+=60000;radio.syncEpgAuto(testMillis);
+ assert(automatic.state==epg_auto::State::Cooldown && !automatic.eligible && automatic.next==deadline && !automatic.allowStart(testMillis));
+ radio.dabSpiDiscovery=selected;radio.syncEpgAuto(testMillis);
+ assert(automatic.state==epg_auto::State::Cooldown && automatic.eligible && automatic.next==deadline && !automatic.allowStart(testMillis));
+ // PAD ownership and loss of context invalidate AUTO even with a tracked packet.
+ epg::livePadEndpoint(radio.dabActiveServiceId,radio.dabActiveComponentId);radio.syncEpgAuto(testMillis);
+ assert(!automatic.eligible && automatic.state==epg_auto::State::Ineligible);
+ configure();refreshPad(dab_spi::Identity::NotSpi);sendEmpty(4);++radio.dabGeneration;radio.syncEpgAuto(testMillis);
+ assert(automatic.repeat==0 && !automatic.stopDue(testMillis,true));
+ const auto selectedSid=radio.dabSpiDiscovery.serviceId,selectedCid=radio.dabSpiDiscovery.componentId;
+ radio.dabActiveDataServiceValid=true;radio.dabActiveDataServiceId=selectedSid;radio.dabActiveDataComponentId=selectedCid;
+ radio.syncEpgAuto(testMillis);assert(!automatic.eligible);radio.dabActiveDataServiceValid=false;
+ const auto audioSid=radio.dabActiveServiceId,audioCid=radio.dabActiveComponentId;
+ radio.dabActiveServiceId=selectedSid;radio.dabActiveComponentId=selectedCid;radio.syncEpgAuto(testMillis);assert(!automatic.eligible);
+ radio.dabActiveServiceId=audioSid;radio.dabActiveComponentId=audioCid;
+ radio.dabSpiDiscovery.status=dab_spi::Status::Ambiguous;radio.syncEpgAuto(testMillis);assert(!automatic.eligible);
+ radio.dabSpiDiscovery.status=dab_spi::Status::SelectedEnsemble;
+ radio.signallock=false;radio.syncEpgAuto(testMillis);assert(!automatic.eligible);
+ radio.signallock=true;dab_loss::evidence().mode=dab_loss::Mode::NoParse;radio.syncEpgAuto(testMillis);assert(!automatic.eligible);
+ dab_loss::evidence().mode=dab_loss::Mode::Quiet;diagSerial.output.clear();radio.syncEpgAuto(testMillis);assert(diagSerial.output.empty() && !automatic.eligible);
+ dab_loss::evidence().mode=dab_loss::Mode::Normal;
+ std::puts("AUTO actual DSRV/Core owner, CRC/foreign SID/empty reply rejection, unchanged endpoint/cache, PAD/generation/lock/C/D guards: PASS");
  // Production MODE C still drains/ACKs full packets and SLS, but cannot feed Core.
  configure();refreshPad(dab_spi::Identity::NotSpi);dab_loss::evidence().mode=dab_loss::Mode::NoParse;
  const auto cFrames=c->stats.frames,fullReads=chip.reads;const auto cRevision=c->revision;
@@ -269,7 +317,7 @@ int main(int argc,char** argv){
 }
 '''
 
-source=out/'coexistence.cpp';source.write_text(prefix+runtime+'\n'+method('si468x::Result DAB::readDsrvPayload(uint16_t length)')+'\n'+method('void DAB::logEpgTransportPage(uint8_t page)')+'\n'+method('dab_spi::Identity DAB::xpadSpiIdentity(void) const')+'\n'+method('bool DAB::xpadSpiPresent(void) const')+'\n'+method('void DAB::refreshDabSpiDiscovery(void)')+'\nvoid DAB::dsrv(){const auto completedGeneration=dabGeneration;(void)completedGeneration;switch(DabCommand::DsrvHeader){\n'+case+'default:break;}}\n'+fixture+main,encoding='utf-8')
+source=out/'coexistence.cpp';source.write_text(prefix+runtime+'\n'+method('void DAB::syncEpgAuto(uint32_t now)')+'\n'+method('bool DAB::epgAutoCommand(char* input)')+'\n'+method('si468x::Result DAB::readDsrvPayload(uint16_t length)')+'\n'+method('void DAB::logEpgTransportPage(uint8_t page)')+'\n'+method('dab_spi::Identity DAB::xpadSpiIdentity(void) const')+'\n'+method('bool DAB::xpadSpiPresent(void) const')+'\n'+method('void DAB::refreshDabSpiDiscovery(void)')+'\nvoid DAB::dsrv(){const auto completedGeneration=dabGeneration;(void)completedGeneration;switch(DabCommand::DsrvHeader){\n'+case+'default:break;}}\n'+fixture+main,encoding='utf-8')
 exe=out/'coexistence.exe'
 subprocess.run([sys.argv[1] if len(sys.argv)>1 else 'C:/msys64/ucrt64/bin/g++.exe',*(['-DSI4684_DSRV_QUEUE_DIAG=1'] if queue_enabled else []),'-std=c++11','-Wall','-Wextra','-Werror','-pedantic','-I',str(ROOT/'src'),str(source),str(ROOT/'src/epg_core.cpp'),str(ROOT/'src/epg_uart.cpp'),'-o',str(exe)],check=True)
 result=subprocess.run([str(exe),str(ROOT/'tests/fixtures/epg/synthetic_programme_groups_v2.bin'),str(ROOT/'tests/fixtures/epg/mux11a_empty_group.bin'),str(ROOT/'tests/fixtures/epg/synthetic_logo_1_groups_v2.bin')],capture_output=True,text=True)
